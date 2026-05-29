@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "trade-lab"
+version = "0.1.0"
+description = "Deterministic backend foundation for the Trade-Lab NQ workstation."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "fastapi>=0.115",
+  "httpx>=0.28",
+  "orjson>=3.10",
+  "pyarrow>=18.0",
+  "pydantic>=2.10",
+  "pydantic-settings>=2.6",
+  "uvicorn[standard]>=0.32",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3",
+  "ruff>=0.8",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/trade_lab"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+  "benchmark: lightweight synthetic throughput smoke tests",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["RUF022"]
