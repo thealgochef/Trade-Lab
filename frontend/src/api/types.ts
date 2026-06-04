@@ -54,8 +54,26 @@ export type RuntimeStatusDTO = {
   engine_ready: boolean;
   feed_ready: boolean;
   feed_state: string;
+  session?: string | null;
+  trading_day?: string | null;
   replay: ReplayStatusDTO;
   live: LiveStatusDTO;
+};
+
+export type ModelBundleDTO = {
+  model_id: string;
+  strategy_id: string;
+  training_mode: string;
+  instrument: string;
+  feature_count: number;
+  class_map: Record<string, string>;
+  has_checksum: boolean;
+  validation_ok: boolean;
+  validation_detail: string;
+};
+
+export type ModelsResponseDTO = {
+  models: ModelBundleDTO[];
 };
 
 export type LiveStatusDTO = {

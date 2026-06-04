@@ -9,6 +9,7 @@ import { IntelligencePanel } from './components/IntelligencePanel';
 import { EventBlotter } from './components/EventBlotter';
 import { ReplayControls } from './components/ReplayControls';
 import { LiveDataPanel } from './components/LiveDataPanel';
+import { ModelPanel } from './components/ModelPanel';
 
 export function App() {
   useEffect(() => {
@@ -42,6 +43,9 @@ export function App() {
       <section className="control-row">
         <ReplayControls />
         <LiveDataPanel />
+      </section>
+      <section className="control-row model-row">
+        <ModelPanel />
       </section>
       <section className="workspace-grid">
         <ChartWorkspace />

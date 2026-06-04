@@ -1,0 +1,1283 @@
+//@version=6
+strategy("AlgoChef ifvg - v4.6 HTF Maintenance + Audit Fixes", overlay = true, pyramiding = 0, process_orders_on_close = true, calc_on_every_tick = false, initial_capital = 100000, margin_long = 0, margin_short = 0, max_bars_back = 5000, max_boxes_count = 350, max_labels_count = 350, max_lines_count = 300)
+
+// ============================================================================
+// AlgoChef / Yang SMC FVG iFVG Strategy v4.6 HTF Maintenance + Audit Fixes
+// ----------------------------------------------------------------------------
+// Concept:
+// 1. 1H/4H unfilled FVG retest creates the HTF key-level bias.
+// 2. Matching-direction parent FVG must form on 3/5/10/15/30m within the
+//    configurable reaction window. Highest parent TF wins before retest.
+// 3. Once 1m retests the chosen parent FVG, parent locks.
+// 4. 1m opposing FVG near/inside parent must invert.
+// 5. New same-direction 1m FVG confirms during an enabled NY-time session.
+// 6. Entry at confirmation close model; SL at manipulation swing; BE at the
+//    parent internal high/low; TP fixed R multiple.
+//
+// Important backtest note:
+// TradingView historical strategies cannot know true tick order inside a 1m
+// candle. This script uses confirmed-bar logic and process_orders_on_close=true
+// to approximate the requested "entry at confirmation close" model.
+// ============================================================================
+
+// ============================================================================
+// Constants
+// ============================================================================
+const int DIR_BULL = 1
+const int DIR_BEAR = -1
+
+const int PHASE_SCAN = 0
+const int PHASE_PARENT_SEARCH = 1
+const int PHASE_WAIT_OPPOSING = 2
+const int PHASE_WAIT_INVERSION = 3
+const int PHASE_WAIT_ENTRY = 4
+const int PHASE_IN_TRADE = 5
+
+const string TZ_NY = "America/New_York"
+const int MS_PER_MINUTE = 60000
+
+// ============================================================================
+// Inputs
+// ============================================================================
+grpCore = "01. Core Rules"
+enableLongs = input.bool(true, "Enable longs", group = grpCore)
+enableShorts = input.bool(true, "Enable shorts", group = grpCore)
+minFvgTicks = input.int(8, "Minimum FVG size (ticks)", minval = 1, group = grpCore)
+parentWindowBars = input.int(24, "Parent reaction window (parent bars)", minval = 1, group = grpCore)
+proximityTicks = input.int(80, "Execution FVG proximity to parent (ticks)", minval = 0, group = grpCore)
+parentMustBeNearHtf = input.bool(true, "Parent FVG must be near selected HTF FVG", group = grpCore)
+parentHtfProximityTicks = input.int(80, "Parent ↔ HTF max distance (ticks)", minval = 0, group = grpCore)
+invalidateParentOn1mFullFill = input.bool(true, "Invalidate parent on 1m full fill before entry", group = grpCore)
+entryFvgMustBeNearParent = input.bool(false, "Entry FVG must be near parent FVG", group = grpCore)
+entryAfterInversionMaxBars = input.int(30, "Max bars after inversion to find entry FVG", minval = 1, group = grpCore)
+slMode = input.string("Manipulation swing", "SL model", options = ["Manipulation swing", "Parent FVG boundary", "HTF FVG boundary", "Entry FVG boundary"], group = grpCore)
+slBufferTicks = input.int(1, "SL buffer (ticks)", minval = 0, group = grpCore)
+tpR = input.float(1.0, "Take-profit R multiple", minval = 0.1, step = 0.1, group = grpCore)
+beTriggerMode = input.string("Body close", "BE trigger mode", options = ["Wick touch", "Body close"], group = grpCore)
+maxHtfRecords = input.int(1, "Max active HTF FVG records", minval = 1, maxval = 500, group = grpCore)
+
+// Pine's strategy() arguments must be compile-time constants, so the close-fill
+// model is enabled directly in strategy(process_orders_on_close = true).
+
+grpTf = "02. Timeframes"
+enableHtf1h = input.bool(true, "Use 1H HTF FVGs", group = grpTf)
+enableHtf4h = input.bool(true, "Use 4H HTF FVGs", group = grpTf)
+enableParent3 = input.bool(true, "Use 3m parent FVGs", group = grpTf)
+enableParent5 = input.bool(true, "Use 5m parent FVGs", group = grpTf)
+enableParent10 = input.bool(true, "Use 10m parent FVGs", group = grpTf)
+enableParent15 = input.bool(true, "Use 15m parent FVGs", group = grpTf)
+enableParent30 = input.bool(true, "Use 30m parent FVGs", group = grpTf)
+
+grpSess = "03. NY-Time Entry Sessions"
+enableAsia = input.bool(true, "Trade Asia", group = grpSess)
+asiaSession = input.session("1600-0145", "Asia session", group = grpSess)
+enableLondon = input.bool(true, "Trade London", group = grpSess)
+londonSession = input.session("0200-0700", "London session", group = grpSess)
+enableNY = input.bool(true, "Trade New York", group = grpSess)
+nySession = input.session("0800-1400", "New York session", group = grpSess)
+
+grpVisual = "04. Visuals"
+showHtfBox = input.bool(true, "Show selected HTF FVG", group = grpVisual)
+showUntappedHtfBoxes = input.bool(true, "Show untapped HTF FVG candidates", group = grpVisual)
+maxUntappedHtfBoxes = input.int(2, "Max untapped HTF candidate boxes", minval = 0, maxval = 5, group = grpVisual)
+hideUntappedHtfAfterTap = input.bool(true, "Hide untapped HTF candidates after setup starts", group = grpVisual)
+untappedHtfTransparency = input.int(94, "Untapped HTF fill transparency", minval = 0, maxval = 100, group = grpVisual)
+showParentBox = input.bool(true, "Show parent FVG", group = grpVisual)
+showExecutionBox = input.bool(true, "Show execution/iFVG", group = grpVisual)
+showEntryBox = input.bool(true, "Show entry FVG", group = grpVisual)
+fvgTextMode = input.string("Compact", "FVG box text", options = ["Off", "Compact", "Detailed"], group = grpVisual)
+boxTextSizeInput = input.string("Tiny", "FVG text size", options = ["Tiny", "Small", "Normal"], group = grpVisual)
+boxTextColor = input.color(color.black, "FVG text color", group = grpVisual)
+showStateTable = input.bool(true, "Show state panel", group = grpVisual)
+statePanelMode = input.string("Compact", "State panel detail", options = ["Compact", "Full"], group = grpVisual)
+eventLabelMode = input.string("Off", "Event text mode", options = ["Off", "Entry only", "Lifecycle"], group = grpVisual)
+riskLabelMode = input.string("Full prices", "Risk text mode", options = ["Off", "Compact", "Full prices"], group = grpVisual)
+showInternalIds = input.bool(true, "Show internal FVG IDs in table", group = grpVisual)
+showRiskLines = input.bool(true, "Show entry / SL / TP lines", group = grpVisual)
+showBeTriggerLine = input.bool(true, "Show BE trigger line", group = grpVisual)
+showEntryCandleMarker = input.bool(true, "Show entry candle marker", group = grpVisual)
+keepHistoricalDrawings = input.bool(true, "Keep drawings for completed trades", group = grpVisual)
+maxHistoricalBoxes = input.int(80, "Max historical FVG boxes", minval = 0, maxval = 250, group = grpVisual)
+maxHistoricalLabels = input.int(120, "Max historical labels/text", minval = 0, maxval = 250, group = grpVisual)
+maxHistoricalLines = input.int(80, "Max historical risk lines", minval = 0, maxval = 250, group = grpVisual)
+boxExtendBars = input.int(120, "Box extension bars", minval = 10, maxval = 500, group = grpVisual)
+riskLineExtendBars = input.int(12, "Risk line extension bars", minval = 5, maxval = 200, group = grpVisual)
+riskTextOffsetBars = input.int(3, "Risk text right offset bars", minval = 1, maxval = 50, group = grpVisual)
+riskLabelMinTicks = input.int(12, "Minimum spacing between risk text rows (ticks)", minval = 0, maxval = 100, group = grpVisual)
+boxFillTransparency = input.int(88, "FVG fill transparency (0 solid, 100 invisible)", minval = 0, maxval = 100, group = grpVisual)
+boxBorderWidth = input.int(1, "FVG border width", minval = 1, maxval = 4, group = grpVisual)
+tablePositionInput = input.string("Top Right", "State panel position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = grpVisual)
+tableTextSizeInput = input.string("Tiny", "State panel text size", options = ["Tiny", "Small", "Normal"], group = grpVisual)
+tableTextColor = input.color(color.black, "Table text color", group = grpVisual)
+tableBgColor = input.color(color.new(color.white, 12), "Table background", group = grpVisual)
+tableHeaderTextColor = input.color(color.white, "Table header text", group = grpVisual)
+tableHeaderBgColor = input.color(color.new(color.black, 10), "Table header background", group = grpVisual)
+tableBorderColor = input.color(color.new(color.gray, 100), "Table border", group = grpVisual)
+tableInactiveColor = input.color(color.gray, "Table inactive/NA text", group = grpVisual)
+
+// ============================================================================
+// Types
+// ============================================================================
+type Fvg
+    int uid = 0
+    string role = ""
+    string tfName = ""
+    int tfMin = 0
+    int dir = 0
+    float top = na
+    float bottom = na
+    int bornTime = na
+    int sourceTime = na
+    int priority = 0
+    float internalHigh = na
+    float internalLow = na
+
+// ============================================================================
+// Utility functions
+// ============================================================================
+f_phaseName(int phase) =>
+    switch phase
+        PHASE_SCAN => "SCAN_HTF"
+        PHASE_PARENT_SEARCH => "PARENT_SEARCH"
+        PHASE_WAIT_OPPOSING => "WAIT_OPPOSING_1M_FVG"
+        PHASE_WAIT_INVERSION => "WAIT_INVERSION"
+        PHASE_WAIT_ENTRY => "WAIT_ENTRY_FVG"
+        PHASE_IN_TRADE => "IN_TRADE"
+        => "UNKNOWN"
+
+f_dirName(int dir) =>
+    dir == DIR_BULL ? "Bullish" : dir == DIR_BEAR ? "Bearish" : "None"
+
+f_tfName(int tfMin) =>
+    tfMin == 240 ? "4H" : tfMin == 60 ? "1H" : str.tostring(tfMin) + "m"
+
+f_tick() =>
+    syminfo.mintick
+
+f_minFvgPrice() =>
+    minFvgTicks * syminfo.mintick
+
+f_bufferPrice() =>
+    slBufferTicks * syminfo.mintick
+
+f_proximityPrice() =>
+    proximityTicks * syminfo.mintick
+
+f_roundTick(float price) =>
+    math.round(price / syminfo.mintick) * syminfo.mintick
+
+f_floorTick(float price) =>
+    math.floor(price / syminfo.mintick) * syminfo.mintick
+
+f_ceilTick(float price) =>
+    math.ceil(price / syminfo.mintick) * syminfo.mintick
+
+f_parentHtfProximityPrice() =>
+    parentHtfProximityTicks * syminfo.mintick
+
+f_price(float price) =>
+    na(price) ? "—" : str.tostring(price, format.mintick)
+
+f_intText(int value) =>
+    na(value) ? "—" : str.tostring(value)
+
+f_tablePosition(string pos) =>
+    pos == "Top Left" ? position.top_left : pos == "Bottom Right" ? position.bottom_right : pos == "Bottom Left" ? position.bottom_left : position.top_right
+
+f_textSize(string sizeInput) =>
+    sizeInput == "Normal" ? size.normal : sizeInput == "Small" ? size.small : size.tiny
+
+f_phaseShort(int phase) =>
+    switch phase
+        PHASE_SCAN => "SCAN"
+        PHASE_PARENT_SEARCH => "PARENT"
+        PHASE_WAIT_OPPOSING => "OPP"
+        PHASE_WAIT_INVERSION => "INV"
+        PHASE_WAIT_ENTRY => "ENTRY"
+        PHASE_IN_TRADE => "TRADE"
+        => "?"
+
+f_trimText(string txt, int maxLen) =>
+    str.length(txt) > maxLen ? str.substring(txt, 0, maxLen) + "…" : txt
+
+f_riskText(string tag, float price) =>
+    riskLabelMode == "Full prices" ? tag + " " + f_price(price) : tag
+
+f_riskLineRightTime() =>
+    time + riskLineExtendBars * MS_PER_MINUTE
+
+f_riskTextTime() =>
+    time + (riskLineExtendBars + riskTextOffsetBars) * MS_PER_MINUTE
+
+f_levelTextY(float baseY, float compareY, bool above) =>
+    float minGap = riskLabelMinTicks * syminfo.mintick
+    not na(compareY) and math.abs(baseY - compareY) < minGap ? (above ? compareY + minGap : compareY - minGap) : baseY
+
+f_overlap(float topA, float bottomA, float topB, float bottomB) =>
+    math.max(bottomA, bottomB) <= math.min(topA, topB)
+
+f_zoneDistance(float topA, float bottomA, float topB, float bottomB) =>
+    f_overlap(topA, bottomA, topB, bottomB) ? 0.0 : topA < bottomB ? bottomB - topA : bottomA - topB
+
+f_barTouchesZone(float zoneTop, float zoneBottom) =>
+    f_overlap(zoneTop, zoneBottom, high, low)
+
+f_newFvg(int uid, string role, string tfName, int tfMin, int dir, float top, float bottom, int bornTime, int sourceTime, int priority, float internalHigh, float internalLow) =>
+    Fvg f = Fvg.new()
+    f.uid := uid
+    f.role := role
+    f.tfName := tfName
+    f.tfMin := tfMin
+    f.dir := dir
+    f.top := top
+    f.bottom := bottom
+    f.bornTime := bornTime
+    f.sourceTime := sourceTime
+    f.priority := priority
+    f.internalHigh := internalHigh
+    f.internalLow := internalLow
+    f
+
+f_zoneBg(color base) =>
+    color.new(base, boxFillTransparency)
+
+// Drawing anchors use absolute timestamps, not bar_index. This prevents FVG
+// boxes from rebasing when TradingView loads more history and avoids runtime
+// historical-buffer crashes from very old xloc.bar_index coordinates.
+f_drawRightTime(int extendBars) =>
+    time + extendBars * MS_PER_MINUTE
+
+f_drawBox(box bx, int leftTime, float top, float bottom, color bg, color border, int extendBars) =>
+    box out = bx
+    int safeLeft = na(leftTime) ? time : leftTime
+    int safeRight = f_drawRightTime(extendBars)
+    if na(out)
+        out := box.new(left = safeLeft, top = top, right = safeRight, bottom = bottom, xloc = xloc.bar_time, bgcolor = bg, border_color = border, border_width = boxBorderWidth)
+    else
+        box.set_left(out, safeLeft)
+        box.set_top(out, top)
+        box.set_bottom(out, bottom)
+        box.set_right(out, safeRight)
+        box.set_bgcolor(out, bg)
+        box.set_border_color(out, border)
+        box.set_border_width(out, boxBorderWidth)
+    out
+
+f_fvgBoxText(string role, string tfName, int dir, bool locked) =>
+    string dirTxt = dir == DIR_BULL ? "Long" : dir == DIR_BEAR ? "Short" : ""
+    string tfTxt = tfName == "" ? "" : " " + tfName
+    fvgTextMode == "Off" ? "" : fvgTextMode == "Detailed" ? role + tfTxt + " " + dirTxt + (locked ? " locked" : "") : role + tfTxt + (locked ? " ✓" : "")
+
+f_setBoxText(box bx, string txt, color txtColor) =>
+    if not na(bx)
+        box.set_text(bx, fvgTextMode == "Off" ? "" : txt)
+        box.set_text_color(bx, txtColor)
+        box.set_text_size(bx, f_textSize(boxTextSizeInput))
+        box.set_text_halign(bx, text.align_left)
+        box.set_text_valign(bx, text.align_center)
+        box.set_text_wrap(bx, text.wrap_none)
+
+f_levelLine(line ln, int anchorTime, float price, color lineColor, string lineStyle, int lineWidth) =>
+    line out = ln
+    int x1 = na(anchorTime) ? time : anchorTime
+    int x2 = f_riskLineRightTime()
+    if na(out)
+        out := line.new(x1, price, x2, price, xloc = xloc.bar_time, extend = extend.none, color = lineColor, style = lineStyle, width = lineWidth)
+    else
+        line.set_x1(out, x1)
+        line.set_y1(out, price)
+        line.set_x2(out, x2)
+        line.set_y2(out, price)
+        line.set_extend(out, extend.none)
+        line.set_color(out, lineColor)
+        line.set_style(out, lineStyle)
+        line.set_width(out, lineWidth)
+    out
+
+f_textLabel(label lb, float y, string txt, color txtColor) =>
+    label out = lb
+    int x = f_riskTextTime()
+    if riskLabelMode == "Off" or na(y)
+        if not na(out)
+            label.delete(out)
+        out := na
+    else if na(out)
+        out := label.new(x, y, txt, xloc = xloc.bar_time, yloc = yloc.price, style = label.style_none, color = color.new(color.white, 100), textcolor = txtColor, size = size.tiny, textalign = text.align_left)
+    else
+        label.set_x(out, x)
+        label.set_y(out, y)
+        label.set_text(out, txt)
+        label.set_style(out, label.style_none)
+        label.set_textcolor(out, txtColor)
+        label.set_size(out, size.tiny)
+        label.set_textalign(out, text.align_left)
+    out
+
+f_deleteBox(box bx) =>
+    if not na(bx)
+        box.delete(bx)
+
+f_deleteLine(line ln) =>
+    if not na(ln)
+        line.delete(ln)
+
+f_deleteLabel(label lb) =>
+    if not na(lb)
+        label.delete(lb)
+
+f_inSession(string sess) =>
+    not na(time_close(timeframe.period, sess, TZ_NY))
+
+f_anyEntrySession() =>
+    (enableAsia and f_inSession(asiaSession)) or (enableLondon and f_inSession(londonSession)) or (enableNY and f_inSession(nySession))
+
+// Persistent drawing collections/table used by helper functions below.
+// Pine requires these to be declared before UDFs that reference them.
+var array<box> histBoxes = array.new<box>()
+var array<box> htfPreviewBoxes = array.new<box>()
+var array<label> htfPreviewLabels = array.new<label>()
+var array<label> activeSetupLabels = array.new<label>()
+var array<label> histLabels = array.new<label>()
+var array<line> histLines = array.new<line>()
+var table stateTable = table.new(f_tablePosition(tablePositionInput), 2, 14, bgcolor = tableBgColor, frame_color = tableBorderColor, frame_width = 0, border_color = tableBorderColor, border_width = 0)
+
+f_archiveBox(box bx) =>
+    if not na(bx)
+        box.set_right(bx, time)
+        array.push(histBoxes, bx)
+        while array.size(histBoxes) > maxHistoricalBoxes
+            box oldBx = array.shift(histBoxes)
+            box.delete(oldBx)
+
+f_clearHtfPreviewDrawings() =>
+    if array.size(htfPreviewBoxes) > 0
+        for i = 0 to array.size(htfPreviewBoxes) - 1
+            box bx = array.get(htfPreviewBoxes, i)
+            box.delete(bx)
+        array.clear(htfPreviewBoxes)
+    if array.size(htfPreviewLabels) > 0
+        for i = 0 to array.size(htfPreviewLabels) - 1
+            label lb = array.get(htfPreviewLabels, i)
+            label.delete(lb)
+        array.clear(htfPreviewLabels)
+
+f_archiveLine(line ln) =>
+    if not na(ln)
+        line.set_x2(ln, time)
+        line.set_extend(ln, extend.none)
+        array.push(histLines, ln)
+        while array.size(histLines) > maxHistoricalLines
+            line oldLn = array.shift(histLines)
+            line.delete(oldLn)
+
+f_archiveLabel(label lb) =>
+    if not na(lb)
+        array.push(histLabels, lb)
+        while array.size(histLabels) > maxHistoricalLabels
+            label oldLb = array.shift(histLabels)
+            label.delete(oldLb)
+
+f_rememberSetupLabel(label lb) =>
+    if not na(lb)
+        array.push(activeSetupLabels, lb)
+        while array.size(activeSetupLabels) > 30
+            label oldLb = array.shift(activeSetupLabels)
+            label.delete(oldLb)
+
+f_archiveSetupLabels() =>
+    if array.size(activeSetupLabels) > 0
+        for i = 0 to array.size(activeSetupLabels) - 1
+            label lb = array.get(activeSetupLabels, i)
+            f_archiveLabel(lb)
+        array.clear(activeSetupLabels)
+
+f_deleteActiveSetupLabels() =>
+    if array.size(activeSetupLabels) > 0
+        for i = 0 to array.size(activeSetupLabels) - 1
+            label lb = array.get(activeSetupLabels, i)
+            label.delete(lb)
+        array.clear(activeSetupLabels)
+
+f_addSetupLabel(float y, string txt, color bg, color txtColor, bool lifecycle) =>
+    label lb = na
+    bool shouldShow = lifecycle ? eventLabelMode == "Lifecycle" : eventLabelMode != "Off"
+    if shouldShow
+        lb := label.new(f_drawRightTime(1), y, txt, xloc = xloc.bar_time, yloc = yloc.price, style = label.style_none, color = color.new(bg, 100), textcolor = txtColor, size = size.tiny, textalign = text.align_left)
+        f_rememberSetupLabel(lb)
+    lb
+
+f_tableRow(int row, string key, string val, color valColor) =>
+    color bg = row == 0 ? tableHeaderBgColor : tableBgColor
+    color keyColor = row == 0 ? tableHeaderTextColor : tableTextColor
+    color valueColor = row == 0 ? tableHeaderTextColor : valColor
+    table.cell(stateTable, 0, row, key, text_color = keyColor, bgcolor = bg, text_size = f_textSize(tableTextSizeInput), text_halign = text.align_left)
+    table.cell(stateTable, 1, row, val, text_color = valueColor, bgcolor = bg, text_size = f_textSize(tableTextSizeInput), text_halign = text.align_right)
+
+f_tableBlankRow(int row) =>
+    table.cell(stateTable, 0, row, "", text_color = color.new(color.white, 100), bgcolor = color.new(color.white, 100), text_size = size.tiny)
+    table.cell(stateTable, 1, row, "", text_color = color.new(color.white, 100), bgcolor = color.new(color.white, 100), text_size = size.tiny)
+
+// Non-repainting requested-timeframe feed.
+// Uses the previous confirmed requested bar's FVG conditions and returns them
+// with lookahead_on at the start of the next requested bar.
+f_mtfFeed() =>
+    float minPx = minFvgTicks * syminfo.mintick
+    bool bull = low[1] > high[3] and (low[1] - high[3]) >= minPx
+    float bullTop = bull ? low[1] : na
+    float bullBottom = bull ? high[3] : na
+    bool bear = high[1] < low[3] and (low[3] - high[1]) >= minPx
+    float bearTop = bear ? low[3] : na
+    float bearBottom = bear ? high[1] : na
+    float intHigh = math.max(high[1], math.max(high[2], high[3]))
+    float intLow = math.min(low[1], math.min(low[2], low[3]))
+    [time[1], time[3], close[1], bull, bullTop, bullBottom, bear, bearTop, bearBottom, intHigh, intLow]
+
+// ============================================================================
+// Persistent state
+// ============================================================================
+var array<Fvg> htfFvgs = array.new<Fvg>()
+var array<Fvg> parentFvgs = array.new<Fvg>()
+
+var int nextUid = 1
+var int nextSetupId = 1
+var int phase = PHASE_SCAN
+var string resetReason = "Initialized"
+
+var int setupId = na
+var int setupDir = 0
+var int htfId = na
+var int htfTfMin = na
+var string htfTfName = ""
+var float htfTop = na
+var float htfBottom = na
+var int htfBornTime = na
+var int htfTapTime = na
+var int htfTapBar = na
+
+var int parentId = na
+var int parentTfMin = na
+var string parentTfName = ""
+var float parentTop = na
+var float parentBottom = na
+var float parentInternalHigh = na
+var float parentInternalLow = na
+var int parentBornBar = na
+var int parentBornTime = na
+var int parentRetestTime = na
+var int parentRetestBar = na
+var bool parentLocked = false
+
+var int oppFvgId = na
+var float oppFvgTop = na
+var float oppFvgBottom = na
+var int oppFvgTime = na
+var int oppFvgLeftTime = na
+var int oppFvgBar = na
+var int inversionTime = na
+var int inversionBar = na
+var int entryFvgTime = na
+var int entryFvgLeftTime = na
+var int entryFvgBar = na
+
+var float swingLow = na
+var float swingHigh = na
+
+var int tradeDir = 0
+var int tradeEntryBar = na
+var int tradeEntryTime = na
+var float tradeEntry = na
+var float tradeStop = na
+var float tradeTp = na
+var float beTrigger = na
+var bool beActive = false
+
+var box htfBox = na
+var box parentBox = na
+var box execBox = na
+var box entryBox = na
+var line entryLine = na
+var line slLine = na
+var line tpLine = na
+var line beLine = na
+var label entryRiskLabel = na
+var label slRiskLabel = na
+var label tpRiskLabel = na
+var label beRiskLabel = na
+var label tfWarn = na
+
+// Per-parent-timeframe confirmed-bar counters.
+var int p3Count = 0
+var int p5Count = 0
+var int p10Count = 0
+var int p15Count = 0
+var int p30Count = 0
+
+var int startP3 = na
+var int startP5 = na
+var int startP10 = na
+var int startP15 = na
+var int startP30 = na
+
+// Last requested source times for de-duplication.
+var int last60Time = na
+var int last240Time = na
+var int last3Time = na
+var int last5Time = na
+var int last10Time = na
+var int last15Time = na
+var int last30Time = na
+
+// ============================================================================
+// Request confirmed MTF feeds
+// ============================================================================
+[t60, left60, c60, bull60, bullTop60, bullBot60, bear60, bearTop60, bearBot60, intHi60, intLo60] = request.security(syminfo.tickerid, "60", f_mtfFeed(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+[t240, left240, c240, bull240, bullTop240, bullBot240, bear240, bearTop240, bearBot240, intHi240, intLo240] = request.security(syminfo.tickerid, "240", f_mtfFeed(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+
+[t3, left3, c3, bull3, bullTop3, bullBot3, bear3, bearTop3, bearBot3, intHi3, intLo3] = request.security(syminfo.tickerid, "3", f_mtfFeed(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+[t5, left5, c5, bull5, bullTop5, bullBot5, bear5, bearTop5, bearBot5, intHi5, intLo5] = request.security(syminfo.tickerid, "5", f_mtfFeed(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+[t10, left10, c10, bull10, bullTop10, bullBot10, bear10, bearTop10, bearBot10, intHi10, intLo10] = request.security(syminfo.tickerid, "10", f_mtfFeed(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+[t15, left15, c15, bull15, bullTop15, bullBot15, bear15, bearTop15, bearBot15, intHi15, intLo15] = request.security(syminfo.tickerid, "15", f_mtfFeed(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+[t30, left30, c30, bull30, bullTop30, bullBot30, bear30, bearTop30, bearBot30, intHi30, intLo30] = request.security(syminfo.tickerid, "30", f_mtfFeed(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+
+bool new60 = not na(t60) and (na(last60Time) or t60 != last60Time)
+bool new240 = not na(t240) and (na(last240Time) or t240 != last240Time)
+bool new3 = not na(t3) and (na(last3Time) or t3 != last3Time)
+bool new5 = not na(t5) and (na(last5Time) or t5 != last5Time)
+bool new10 = not na(t10) and (na(last10Time) or t10 != last10Time)
+bool new15 = not na(t15) and (na(last15Time) or t15 != last15Time)
+bool new30 = not na(t30) and (na(last30Time) or t30 != last30Time)
+
+if new3
+    p3Count += 1
+if new5
+    p5Count += 1
+if new10
+    p10Count += 1
+if new15
+    p15Count += 1
+if new30
+    p30Count += 1
+
+if new3
+    last3Time := t3
+if new5
+    last5Time := t5
+if new10
+    last10Time := t10
+if new15
+    last15Time := t15
+if new30
+    last30Time := t30
+
+// ============================================================================
+// Chart-level 1m FVG detection
+// ============================================================================
+bool chartIs1m = timeframe.isminutes and timeframe.multiplier == 1
+float minPx = f_minFvgPrice()
+
+bool bull1mFvg = bar_index >= 2 and low > high[2] and (low - high[2]) >= minPx
+float bull1mTop = bull1mFvg ? low : na
+float bull1mBottom = bull1mFvg ? high[2] : na
+int bull1mLeftTime = bull1mFvg ? time[2] : na
+
+bool bear1mFvg = bar_index >= 2 and high < low[2] and (low[2] - high) >= minPx
+float bear1mTop = bear1mFvg ? low[2] : na
+float bear1mBottom = bear1mFvg ? high : na
+int bear1mLeftTime = bear1mFvg ? time[2] : na
+
+bool entrySessionActive = f_anyEntrySession()
+
+// ============================================================================
+// Helper state derived from parent counters
+// ============================================================================
+f_parentBarsSinceStart(int tfMin) =>
+    tfMin == 3 ? p3Count - startP3 : tfMin == 5 ? p5Count - startP5 : tfMin == 10 ? p10Count - startP10 : tfMin == 15 ? p15Count - startP15 : tfMin == 30 ? p30Count - startP30 : 100000
+
+f_parentEligibleWindow(int tfMin) =>
+    int barsSince = f_parentBarsSinceStart(tfMin)
+    not na(barsSince) and barsSince > 0 and barsSince <= parentWindowBars
+
+f_parentNearSelectedHtf(float pTop, float pBottom) =>
+    not parentMustBeNearHtf or (not na(htfTop) and not na(htfBottom) and f_zoneDistance(pTop, pBottom, htfTop, htfBottom) <= f_parentHtfProximityPrice())
+
+f_entryNearParent(float eTop, float eBottom) =>
+    not entryFvgMustBeNearParent or (not na(parentTop) and not na(parentBottom) and f_zoneDistance(eTop, eBottom, parentTop, parentBottom) <= f_proximityPrice())
+
+f_allParentWindowsExpired() =>
+    bool e3 = (not enableParent3) or (not na(startP3) and p3Count - startP3 > parentWindowBars)
+    bool e5 = (not enableParent5) or (not na(startP5) and p5Count - startP5 > parentWindowBars)
+    bool e10 = (not enableParent10) or (not na(startP10) and p10Count - startP10 > parentWindowBars)
+    bool e15 = (not enableParent15) or (not na(startP15) and p15Count - startP15 > parentWindowBars)
+    bool e30 = (not enableParent30) or (not na(startP30) and p30Count - startP30 > parentWindowBars)
+    e3 and e5 and e10 and e15 and e30
+
+f_bestParentIndex() =>
+    int bestIdx = na
+    int bestTf = -1
+    int bestSourceTime = na
+    int sz = array.size(parentFvgs)
+    if sz > 0
+        for i = 0 to sz - 1
+            Fvg f = array.get(parentFvgs, i)
+            if f.dir == setupDir
+                bool betterTf = f.tfMin > bestTf
+                bool sameTfNewer = f.tfMin == bestTf and (na(bestSourceTime) or f.sourceTime > bestSourceTime)
+                if betterTf or sameTfNewer
+                    bestTf := f.tfMin
+                    bestSourceTime := f.sourceTime
+                    bestIdx := i
+    bestIdx
+
+f_invalidateParentsForTf(int tfMin, bool newTfBar, float confirmedClose) =>
+    bool removedSelected = false
+    if newTfBar and array.size(parentFvgs) > 0
+        for i = array.size(parentFvgs) - 1 to 0
+            Fvg f = array.get(parentFvgs, i)
+            if f.tfMin == tfMin
+                bool invalid = f.dir == DIR_BULL ? confirmedClose < f.bottom : confirmedClose > f.top
+                if invalid
+                    if f.uid == parentId
+                        removedSelected := true
+                    array.remove(parentFvgs, i)
+    removedSelected
+
+// ============================================================================
+// Per-bar main logic
+// ============================================================================
+bool doReset = false
+string doResetReason = ""
+bool justEntered = false
+
+// Reset after a trade has closed. This does not permanently mark the HTF FVG used.
+if phase == PHASE_IN_TRADE and not na(tradeEntryBar) and bar_index > tradeEntryBar and strategy.position_size == 0
+    doReset := true
+    doResetReason := "Trade closed"
+
+// Register newly confirmed HTF FVG events before any reset handling can discard
+// the bar. last60Time/last240Time advance only after this block so reset bars do
+// not silently consume an HTF event.
+if new60 and enableHtf1h
+    if bull60
+        array.push(htfFvgs, f_newFvg(nextUid, "HTF", "1H", 60, DIR_BULL, bullTop60, bullBot60, left60, t60, 60, intHi60, intLo60))
+        nextUid += 1
+    if bear60
+        array.push(htfFvgs, f_newFvg(nextUid, "HTF", "1H", 60, DIR_BEAR, bearTop60, bearBot60, left60, t60, 60, intHi60, intLo60))
+        nextUid += 1
+
+if new240 and enableHtf4h
+    if bull240
+        array.push(htfFvgs, f_newFvg(nextUid, "HTF", "4H", 240, DIR_BULL, bullTop240, bullBot240, left240, t240, 240, intHi240, intLo240))
+        nextUid += 1
+    if bear240
+        array.push(htfFvgs, f_newFvg(nextUid, "HTF", "4H", 240, DIR_BEAR, bearTop240, bearBot240, left240, t240, 240, intHi240, intLo240))
+        nextUid += 1
+
+// Remove fully filled HTF FVGs. Same-bar tap+full-fill will be removed before it can activate.
+if array.size(htfFvgs) > 0
+    for i = array.size(htfFvgs) - 1 to 0
+        Fvg f = array.get(htfFvgs, i)
+        bool fullFill = f.dir == DIR_BULL ? low <= f.bottom : high >= f.top
+        if fullFill
+            bool selectedFilled = f.uid == htfId
+            array.remove(htfFvgs, i)
+            if selectedFilled and phase != PHASE_SCAN and phase != PHASE_IN_TRADE and not doReset
+                doReset := true
+                doResetReason := "Selected HTF FVG filled before entry"
+
+// Performance guard: keep the HTF collection bounded after full-fill filtering
+// while preserving the currently selected HTF key level whenever possible.
+while array.size(htfFvgs) > maxHtfRecords
+    int removeIdx = na
+    for i = 0 to array.size(htfFvgs) - 1
+        Fvg f = array.get(htfFvgs, i)
+        if na(removeIdx) and f.uid != htfId
+            removeIdx := i
+    array.remove(htfFvgs, na(removeIdx) ? 0 : removeIdx)
+
+if new60
+    last60Time := t60
+if new240
+    last240Time := t240
+
+// Direct selected-HTF fill check. This protects the active setup even if the
+// selected record is no longer present in the general HTF array for any reason.
+if not doReset and phase != PHASE_SCAN and phase != PHASE_IN_TRADE and not na(htfId)
+    bool selectedHtfFullFill = setupDir == DIR_BULL ? low <= htfBottom : high >= htfTop
+    if selectedHtfFullFill
+        doReset := true
+        doResetReason := "Selected HTF FVG filled before entry"
+
+// Select first retested HTF key level. Same 1m candle 1H/4H tie: 4H wins.
+// If the highest tapped HTF on the candle has both bullish and bearish zones
+// touched, skip the activation because the bias is mechanically conflicted.
+if not doReset and chartIs1m and phase == PHASE_SCAN and strategy.position_size == 0
+    int highestTappedTf = na
+    bool highestHasBull = false
+    bool highestHasBear = false
+    int sz = array.size(htfFvgs)
+    if sz > 0
+        for i = 0 to sz - 1
+            Fvg f = array.get(htfFvgs, i)
+            bool enabledDir = (f.dir == DIR_BULL and enableLongs) or (f.dir == DIR_BEAR and enableShorts)
+            bool tapped = enabledDir and f_barTouchesZone(f.top, f.bottom)
+            if tapped
+                if na(highestTappedTf) or f.tfMin > highestTappedTf
+                    highestTappedTf := f.tfMin
+                    highestHasBull := f.dir == DIR_BULL
+                    highestHasBear := f.dir == DIR_BEAR
+                else if f.tfMin == highestTappedTf
+                    highestHasBull := highestHasBull or f.dir == DIR_BULL
+                    highestHasBear := highestHasBear or f.dir == DIR_BEAR
+
+    bool sameRankConflict = not na(highestTappedTf) and highestHasBull and highestHasBear
+    int targetDir = highestHasBull ? DIR_BULL : highestHasBear ? DIR_BEAR : 0
+    int bestIdx = na
+
+    if not na(highestTappedTf) and not sameRankConflict and targetDir != 0
+        for i = 0 to sz - 1
+            Fvg f = array.get(htfFvgs, i)
+            bool tapped = f.tfMin == highestTappedTf and f.dir == targetDir and f_barTouchesZone(f.top, f.bottom)
+            if tapped
+                if na(bestIdx)
+                    bestIdx := i
+                else
+                    Fvg best = array.get(htfFvgs, bestIdx)
+                    bool betterSameTf = f.dir == DIR_BULL ? (f.top > best.top or (f.top == best.top and f.sourceTime > best.sourceTime)) : (f.bottom < best.bottom or (f.bottom == best.bottom and f.sourceTime > best.sourceTime))
+                    if betterSameTf
+                        bestIdx := i
+
+    if not na(bestIdx)
+        Fvg selected = array.get(htfFvgs, bestIdx)
+        phase := PHASE_PARENT_SEARCH
+        setupId := nextSetupId
+        nextSetupId += 1
+        setupDir := selected.dir
+        htfId := selected.uid
+        htfTfMin := selected.tfMin
+        htfTfName := selected.tfName
+        htfTop := selected.top
+        htfBottom := selected.bottom
+        htfBornTime := selected.bornTime
+        htfTapTime := time
+        htfTapBar := bar_index
+        parentId := na
+        parentTfMin := na
+        parentTfName := ""
+        parentTop := na
+        parentBottom := na
+        parentInternalHigh := na
+        parentInternalLow := na
+        parentBornBar := na
+        parentBornTime := na
+        parentRetestTime := na
+        parentRetestBar := na
+        parentLocked := false
+        oppFvgId := na
+        oppFvgTop := na
+        oppFvgBottom := na
+        oppFvgTime := na
+        oppFvgLeftTime := na
+        oppFvgBar := na
+        inversionTime := na
+        inversionBar := na
+        entryFvgTime := na
+        entryFvgLeftTime := na
+        entryFvgBar := na
+        swingLow := na
+        swingHigh := na
+        array.clear(parentFvgs)
+        startP3 := p3Count
+        startP5 := p5Count
+        startP10 := p10Count
+        startP15 := p15Count
+        startP30 := p30Count
+        resetReason := "HTF tapped: " + selected.tfName + " " + f_dirName(selected.dir)
+        if showHtfBox
+            htfBox := f_drawBox(htfBox, htfBornTime, htfTop, htfBottom, selected.dir == DIR_BULL ? f_zoneBg(color.teal) : f_zoneBg(color.red), selected.dir == DIR_BULL ? color.new(color.teal, 20) : color.new(color.red, 20), boxExtendBars)
+            f_setBoxText(htfBox, f_fvgBoxText("HTF", htfTfName, setupDir, false), boxTextColor)
+        f_addSetupLabel(selected.dir == DIR_BULL ? htfBottom : htfTop, "S" + str.tostring(setupId) + " " + selected.tfName + " " + (selected.dir == DIR_BULL ? "Long" : "Short") + " tap", color.new(color.black, 10), color.white, true)
+    else if sameRankConflict
+        resetReason := "Same-rank opposing HTF conflict skipped"
+
+// Parent invalidation on confirmed parent bar closes.
+bool selectedParentInvalidated = false
+if not doReset and phase != PHASE_SCAN and phase != PHASE_IN_TRADE
+    selectedParentInvalidated := f_invalidateParentsForTf(3, new3, c3) or selectedParentInvalidated
+    selectedParentInvalidated := f_invalidateParentsForTf(5, new5, c5) or selectedParentInvalidated
+    selectedParentInvalidated := f_invalidateParentsForTf(10, new10, c10) or selectedParentInvalidated
+    selectedParentInvalidated := f_invalidateParentsForTf(15, new15, c15) or selectedParentInvalidated
+    selectedParentInvalidated := f_invalidateParentsForTf(30, new30, c30) or selectedParentInvalidated
+    if selectedParentInvalidated
+        if parentLocked
+            doReset := true
+            doResetReason := "Locked parent invalidated before entry"
+        else
+            parentId := na
+            parentTfMin := na
+            parentTfName := ""
+            parentTop := na
+            parentBottom := na
+            parentInternalHigh := na
+            parentInternalLow := na
+            parentBornBar := na
+            parentBornTime := na
+            resetReason := "Provisional parent invalidated; searching next candidate"
+
+// Add eligible parent candidates while parent is not locked.
+if not doReset and phase == PHASE_PARENT_SEARCH
+    if enableParent3 and new3 and f_parentEligibleWindow(3)
+        if setupDir == DIR_BULL and bull3 and f_parentNearSelectedHtf(bullTop3, bullBot3)
+            array.push(parentFvgs, f_newFvg(nextUid, "PARENT", "3m", 3, DIR_BULL, bullTop3, bullBot3, left3, t3, 3, intHi3, intLo3))
+            nextUid += 1
+        if setupDir == DIR_BEAR and bear3 and f_parentNearSelectedHtf(bearTop3, bearBot3)
+            array.push(parentFvgs, f_newFvg(nextUid, "PARENT", "3m", 3, DIR_BEAR, bearTop3, bearBot3, left3, t3, 3, intHi3, intLo3))
+            nextUid += 1
+    if enableParent5 and new5 and f_parentEligibleWindow(5)
+        if setupDir == DIR_BULL and bull5 and f_parentNearSelectedHtf(bullTop5, bullBot5)
+            array.push(parentFvgs, f_newFvg(nextUid, "PARENT", "5m", 5, DIR_BULL, bullTop5, bullBot5, left5, t5, 5, intHi5, intLo5))
+            nextUid += 1
+        if setupDir == DIR_BEAR and bear5 and f_parentNearSelectedHtf(bearTop5, bearBot5)
+            array.push(parentFvgs, f_newFvg(nextUid, "PARENT", "5m", 5, DIR_BEAR, bearTop5, bearBot5, left5, t5, 5, intHi5, intLo5))
+            nextUid += 1
+    if enableParent10 and new10 and f_parentEligibleWindow(10)
+        if setupDir == DIR_BULL and bull10 and f_parentNearSelectedHtf(bullTop10, bullBot10)
+            array.push(parentFvgs, f_newFvg(nextUid, "PARENT", "10m", 10, DIR_BULL, bullTop10, bullBot10, left10, t10, 10, intHi10, intLo10))
+            nextUid += 1
+        if setupDir == DIR_BEAR and bear10 and f_parentNearSelectedHtf(bearTop10, bearBot10)
+            array.push(parentFvgs, f_newFvg(nextUid, "PARENT", "10m", 10, DIR_BEAR, bearTop10, bearBot10, left10, t10, 10, intHi10, intLo10))
+            nextUid += 1
+    if enableParent15 and new15 and f_parentEligibleWindow(15)
+        if setupDir == DIR_BULL and bull15 and f_parentNearSelectedHtf(bullTop15, bullBot15)
+            array.push(parentFvgs, f_newFvg(nextUid, "PARENT", "15m", 15, DIR_BULL, bullTop15, bullBot15, left15, t15, 15, intHi15, intLo15))
+            nextUid += 1
+        if setupDir == DIR_BEAR and bear15 and f_parentNearSelectedHtf(bearTop15, bearBot15)
+            array.push(parentFvgs, f_newFvg(nextUid, "PARENT", "15m", 15, DIR_BEAR, bearTop15, bearBot15, left15, t15, 15, intHi15, intLo15))
+            nextUid += 1
+    if enableParent30 and new30 and f_parentEligibleWindow(30)
+        if setupDir == DIR_BULL and bull30 and f_parentNearSelectedHtf(bullTop30, bullBot30)
+            array.push(parentFvgs, f_newFvg(nextUid, "PARENT", "30m", 30, DIR_BULL, bullTop30, bullBot30, left30, t30, 30, intHi30, intLo30))
+            nextUid += 1
+        if setupDir == DIR_BEAR and bear30 and f_parentNearSelectedHtf(bearTop30, bearBot30)
+            array.push(parentFvgs, f_newFvg(nextUid, "PARENT", "30m", 30, DIR_BEAR, bearTop30, bearBot30, left30, t30, 30, intHi30, intLo30))
+            nextUid += 1
+
+// Remove parent candidates fully filled by 1m before entry. A provisional filled
+// candidate is removed and the script falls back to another valid parent; a
+// locked parent full fill resets the setup.
+bool lockedParentFullFilledOn1m = false
+if not doReset and invalidateParentOn1mFullFill and phase != PHASE_SCAN and phase != PHASE_IN_TRADE
+    if array.size(parentFvgs) > 0
+        for i = array.size(parentFvgs) - 1 to 0
+            Fvg pf = array.get(parentFvgs, i)
+            bool pfFilled = pf.dir == DIR_BULL ? low <= pf.bottom : high >= pf.top
+            if pfFilled
+                if pf.uid == parentId and parentLocked
+                    lockedParentFullFilledOn1m := true
+                array.remove(parentFvgs, i)
+    if parentLocked and not na(parentId)
+        bool lockedDirectFilled = setupDir == DIR_BULL ? low <= parentBottom : high >= parentTop
+        if lockedDirectFilled
+            lockedParentFullFilledOn1m := true
+    if lockedParentFullFilledOn1m
+        doReset := true
+        doResetReason := "Locked parent fully filled on 1m before entry"
+    else if not parentLocked and not na(parentId)
+        bool selectedStillExists = false
+        if array.size(parentFvgs) > 0
+            for i = 0 to array.size(parentFvgs) - 1
+                Fvg pf = array.get(parentFvgs, i)
+                if pf.uid == parentId
+                    selectedStillExists := true
+        if not selectedStillExists
+            parentId := na
+            parentTfMin := na
+            parentTfName := ""
+            parentTop := na
+            parentBottom := na
+            parentInternalHigh := na
+            parentInternalLow := na
+            parentBornBar := na
+            parentBornTime := na
+            resetReason := "Filled provisional parent removed; searching next candidate"
+
+// Recalculate provisional parent: highest TF wins before retest.
+if not doReset and phase == PHASE_PARENT_SEARCH
+    int bestParentIdx = f_bestParentIndex()
+    if not na(bestParentIdx)
+        Fvg p = array.get(parentFvgs, bestParentIdx)
+        bool parentChanged = na(parentId) or parentId != p.uid
+        parentId := p.uid
+        parentTfMin := p.tfMin
+        parentTfName := p.tfName
+        parentTop := p.top
+        parentBottom := p.bottom
+        parentInternalHigh := p.internalHigh
+        parentInternalLow := p.internalLow
+        if parentChanged or na(parentBornBar)
+            parentBornBar := bar_index
+            parentBornTime := p.bornTime
+        if showParentBox
+            parentBox := f_drawBox(parentBox, parentBornTime, parentTop, parentBottom, setupDir == DIR_BULL ? f_zoneBg(color.blue) : f_zoneBg(color.orange), setupDir == DIR_BULL ? color.new(color.blue, 20) : color.new(color.orange, 20), boxExtendBars)
+            f_setBoxText(parentBox, f_fvgBoxText("PARENT", parentTfName, setupDir, parentLocked), boxTextColor)
+    else
+        parentId := na
+        parentTfMin := na
+        parentTfName := ""
+        parentTop := na
+        parentBottom := na
+        parentInternalHigh := na
+        parentInternalLow := na
+        parentBornBar := na
+        parentBornTime := na
+
+// Expire setup if no parent appears inside all enabled parent windows.
+if not doReset and phase == PHASE_PARENT_SEARCH and array.size(parentFvgs) == 0 and f_allParentWindowsExpired()
+    doReset := true
+    doResetReason := "No parent FVG inside reaction window"
+
+// Lock parent on first 1m retest that does not fully fill/violate it.
+if not doReset and phase == PHASE_PARENT_SEARCH and not na(parentId) and not na(parentBornBar) and bar_index > parentBornBar and f_barTouchesZone(parentTop, parentBottom)
+    phase := PHASE_WAIT_OPPOSING
+    parentLocked := true
+    parentRetestTime := time
+    parentRetestBar := bar_index
+    swingLow := low
+    swingHigh := high
+    resetReason := "Parent locked: " + parentTfName
+    f_addSetupLabel(setupDir == DIR_BULL ? parentBottom : parentTop, "S" + str.tostring(setupId) + " P" + parentTfName + " lock", color.new(color.yellow, 10), color.black, true)
+
+// Update manipulation swing from parent retest through entry.
+if not doReset and (phase == PHASE_WAIT_OPPOSING or phase == PHASE_WAIT_INVERSION or phase == PHASE_WAIT_ENTRY)
+    swingLow := na(swingLow) ? low : math.min(swingLow, low)
+    swingHigh := na(swingHigh) ? high : math.max(swingHigh, high)
+
+// First check whether the currently selected opposing FVG inverted. This avoids
+// overwriting a valid inversion with a newer opposing FVG formed on the same bar.
+if not doReset and phase == PHASE_WAIT_INVERSION and not na(oppFvgId)
+    bool inverted = setupDir == DIR_BULL ? close > oppFvgTop : close < oppFvgBottom
+    if inverted
+        phase := PHASE_WAIT_ENTRY
+        inversionTime := time
+        inversionBar := bar_index
+        resetReason := "Opposing 1m FVG inverted"
+        if showExecutionBox
+            execBox := f_drawBox(execBox, oppFvgLeftTime, oppFvgTop, oppFvgBottom, f_zoneBg(color.fuchsia), color.new(color.fuchsia, 20), boxExtendBars)
+            f_setBoxText(execBox, f_fvgBoxText("iFVG", "1m", setupDir, true), boxTextColor)
+        f_addSetupLabel(setupDir == DIR_BULL ? oppFvgTop : oppFvgBottom, "S" + str.tostring(setupId) + " iFVG OK", color.new(color.fuchsia, 10), color.white, true)
+
+// Select/replace the most recent eligible opposing 1m FVG after parent retest.
+if not doReset and (phase == PHASE_WAIT_OPPOSING or phase == PHASE_WAIT_INVERSION) and bar_index > parentRetestBar
+    bool opposingFormed = setupDir == DIR_BULL ? bear1mFvg : bull1mFvg
+    float oppTopCandidate = setupDir == DIR_BULL ? bear1mTop : bull1mTop
+    float oppBottomCandidate = setupDir == DIR_BULL ? bear1mBottom : bull1mBottom
+    bool nearParent = opposingFormed and f_zoneDistance(oppTopCandidate, oppBottomCandidate, parentTop, parentBottom) <= f_proximityPrice()
+    if nearParent
+        oppFvgId := nextUid
+        nextUid += 1
+        oppFvgTop := oppTopCandidate
+        oppFvgBottom := oppBottomCandidate
+        oppFvgTime := time
+        oppFvgLeftTime := setupDir == DIR_BULL ? bear1mLeftTime : bull1mLeftTime
+        oppFvgBar := bar_index
+        phase := PHASE_WAIT_INVERSION
+        resetReason := "Opposing 1m FVG selected"
+        if showExecutionBox
+            execBox := f_drawBox(execBox, oppFvgLeftTime, oppFvgTop, oppFvgBottom, f_zoneBg(color.purple), color.new(color.purple, 20), boxExtendBars)
+            f_setBoxText(execBox, f_fvgBoxText("O-FVG", "1m", setupDir == DIR_BULL ? DIR_BEAR : DIR_BULL, false), boxTextColor)
+        f_addSetupLabel(setupDir == DIR_BULL ? oppFvgTop : oppFvgBottom, "S" + str.tostring(setupId) + " O1m", color.new(color.purple, 10), color.white, true)
+
+// Final same-direction 1m FVG entry trigger.
+if not doReset and phase == PHASE_WAIT_ENTRY and not na(inversionBar) and bar_index - inversionBar > entryAfterInversionMaxBars
+    doReset := true
+    doResetReason := "Entry FVG did not appear before inversion expiry"
+
+if not doReset and phase == PHASE_WAIT_ENTRY
+    bool sameDirFvg = setupDir == DIR_BULL ? bull1mFvg : bear1mFvg
+    float entryFvgTop = setupDir == DIR_BULL ? bull1mTop : bear1mTop
+    float entryFvgBottom = setupDir == DIR_BULL ? bull1mBottom : bear1mBottom
+    bool entryNearParentOk = sameDirFvg and f_entryNearParent(entryFvgTop, entryFvgBottom)
+    bool entryAfterInversion = not na(inversionBar) and bar_index > inversionBar
+    if sameDirFvg and not entryNearParentOk
+        resetReason := "Entry FVG ignored: too far from parent"
+    if sameDirFvg and entryNearParentOk and not entryAfterInversion
+        resetReason := "Entry FVG ignored: same bar as inversion"
+    if sameDirFvg and entryNearParentOk and entryAfterInversion
+        if entrySessionActive and strategy.position_size == 0 and chartIs1m
+            float signalEntry = f_roundTick(close)
+            float rawLongStop = slMode == "Parent FVG boundary" ? parentBottom : slMode == "HTF FVG boundary" ? htfBottom : slMode == "Entry FVG boundary" ? entryFvgBottom : swingLow
+            float rawShortStop = slMode == "Parent FVG boundary" ? parentTop : slMode == "HTF FVG boundary" ? htfTop : slMode == "Entry FVG boundary" ? entryFvgTop : swingHigh
+            float stopPrice = setupDir == DIR_BULL ? f_floorTick(rawLongStop - f_bufferPrice()) : f_ceilTick(rawShortStop + f_bufferPrice())
+            float risk = setupDir == DIR_BULL ? signalEntry - stopPrice : stopPrice - signalEntry
+            if risk >= syminfo.mintick
+                float targetPrice = setupDir == DIR_BULL ? f_roundTick(signalEntry + risk * tpR) : f_roundTick(signalEntry - risk * tpR)
+                entryFvgBar := bar_index
+                entryFvgTime := time
+                entryFvgLeftTime := setupDir == DIR_BULL ? bull1mLeftTime : bear1mLeftTime
+                tradeDir := setupDir
+                tradeEntryBar := bar_index
+                tradeEntryTime := time
+                tradeEntry := signalEntry
+                tradeStop := stopPrice
+                tradeTp := targetPrice
+                beTrigger := setupDir == DIR_BULL ? parentInternalHigh : parentInternalLow
+                beActive := false
+                phase := PHASE_IN_TRADE
+                justEntered := true
+                resetReason := "Entry submitted: Setup #" + str.tostring(setupId) + " " + f_dirName(setupDir) + " / HTF " + htfTfName + " / Parent " + parentTfName
+                if showEntryBox
+                    entryBox := f_drawBox(entryBox, entryFvgLeftTime, entryFvgTop, entryFvgBottom, setupDir == DIR_BULL ? f_zoneBg(color.lime) : f_zoneBg(color.red), setupDir == DIR_BULL ? color.new(color.lime, 20) : color.new(color.red, 20), boxExtendBars)
+                    f_setBoxText(entryBox, f_fvgBoxText("ENTRY", "1m", setupDir, false), boxTextColor)
+                f_addSetupLabel(setupDir == DIR_BULL ? low : high, (setupDir == DIR_BULL ? "LONG S" : "SHORT S") + str.tostring(setupId), color.new(color.black, 10), color.white, false)
+                if showRiskLines
+                    color entryColor = color.new(color.gray, 10)
+                    color stopColor = color.new(color.red, 0)
+                    color targetColor = color.new(color.green, 0)
+                    color beColor = color.new(color.orange, 0)
+                    entryLine := f_levelLine(entryLine, tradeEntryTime, tradeEntry, entryColor, line.style_dashed, 1)
+                    slLine := f_levelLine(slLine, tradeEntryTime, tradeStop, stopColor, line.style_solid, 1)
+                    tpLine := f_levelLine(tpLine, tradeEntryTime, tradeTp, targetColor, line.style_solid, 1)
+                    if showBeTriggerLine and not na(beTrigger)
+                        beLine := f_levelLine(beLine, tradeEntryTime, beTrigger, beColor, line.style_dotted, 1)
+                    float entryTextY = f_levelTextY(tradeEntry, tradeStop, tradeDir == DIR_BULL)
+                    float beTextY = showBeTriggerLine and not na(beTrigger) ? f_levelTextY(beTrigger, entryTextY, tradeDir == DIR_BULL) : na
+                    float tpTextY = f_levelTextY(tradeTp, na(beTextY) ? entryTextY : beTextY, tradeDir == DIR_BULL)
+                    entryRiskLabel := f_textLabel(entryRiskLabel, entryTextY, f_riskText("ENTRY", tradeEntry), entryColor)
+                    slRiskLabel := f_textLabel(slRiskLabel, tradeStop, f_riskText("SL", tradeStop), stopColor)
+                    tpRiskLabel := f_textLabel(tpRiskLabel, tpTextY, f_riskText("TP", tradeTp), targetColor)
+                    if showBeTriggerLine and not na(beTrigger)
+                        beRiskLabel := f_textLabel(beRiskLabel, beTextY, f_riskText("BE", beTrigger), beColor)
+                if setupDir == DIR_BULL
+                    strategy.entry("Long", strategy.long)
+                    strategy.exit("Long-X", from_entry = "Long", stop = tradeStop, limit = tradeTp)
+                else
+                    strategy.entry("Short", strategy.short)
+                    strategy.exit("Short-X", from_entry = "Short", stop = tradeStop, limit = tradeTp)
+            else
+                doReset := true
+                doResetReason := "Invalid or zero-risk entry skipped"
+        else
+            resetReason := "Entry FVG ignored outside enabled session or non-1m chart"
+
+// Trade management. Do not session-gate exits or BE movement.
+if not doReset and phase == PHASE_IN_TRADE
+    if tradeDir == DIR_BULL
+        bool bullBeHit = beTriggerMode == "Wick touch" ? high >= beTrigger : close > beTrigger
+        if not beActive and bar_index > tradeEntryBar and not na(beTrigger) and bullBeHit
+            beActive := true
+            tradeStop := f_roundTick(tradeEntry)
+        strategy.exit("Long-X", from_entry = "Long", stop = tradeStop, limit = tradeTp)
+    if tradeDir == DIR_BEAR
+        bool bearBeHit = beTriggerMode == "Wick touch" ? low <= beTrigger : close < beTrigger
+        if not beActive and bar_index > tradeEntryBar and not na(beTrigger) and bearBeHit
+            beActive := true
+            tradeStop := f_roundTick(tradeEntry)
+        strategy.exit("Short-X", from_entry = "Short", stop = tradeStop, limit = tradeTp)
+    if showRiskLines
+        color entryColor = color.new(color.gray, 10)
+        color stopColor = beActive ? color.new(color.aqua, 0) : color.new(color.red, 0)
+        color targetColor = color.new(color.green, 0)
+        color beColor = color.new(color.orange, 0)
+        if beActive
+            f_deleteLine(entryLine)
+            entryLine := na
+            f_deleteLabel(entryRiskLabel)
+            entryRiskLabel := na
+            f_deleteLine(beLine)
+            beLine := na
+            f_deleteLabel(beRiskLabel)
+            beRiskLabel := na
+        else
+            entryLine := f_levelLine(entryLine, tradeEntryTime, tradeEntry, entryColor, line.style_dashed, 1)
+            if showBeTriggerLine and not na(beTrigger)
+                beLine := f_levelLine(beLine, tradeEntryTime, beTrigger, beColor, line.style_dotted, 1)
+        slLine := f_levelLine(slLine, tradeEntryTime, tradeStop, stopColor, beActive ? line.style_dashed : line.style_solid, 1)
+        tpLine := f_levelLine(tpLine, tradeEntryTime, tradeTp, targetColor, line.style_solid, 1)
+        float entryTextY = beActive ? na : f_levelTextY(tradeEntry, tradeStop, tradeDir == DIR_BULL)
+        float beTextY = not beActive and showBeTriggerLine and not na(beTrigger) ? f_levelTextY(beTrigger, entryTextY, tradeDir == DIR_BULL) : na
+        float stopTextY = tradeStop
+        float tpTextY = f_levelTextY(tradeTp, na(beTextY) ? nz(entryTextY, stopTextY) : beTextY, tradeDir == DIR_BULL)
+        entryRiskLabel := f_textLabel(entryRiskLabel, entryTextY, f_riskText("ENTRY", tradeEntry), entryColor)
+        slRiskLabel := f_textLabel(slRiskLabel, stopTextY, f_riskText(beActive ? "BE/SL" : "SL", tradeStop), stopColor)
+        tpRiskLabel := f_textLabel(tpRiskLabel, tpTextY, f_riskText("TP", tradeTp), targetColor)
+        if not beActive and showBeTriggerLine and not na(beTrigger)
+            beRiskLabel := f_textLabel(beRiskLabel, beTextY, f_riskText("BE", beTrigger), beColor)
+
+// Apply reset after all pre-entry invalidation checks.
+if doReset
+    bool archiveClosedTradeDrawings = keepHistoricalDrawings and doResetReason == "Trade closed"
+    resetReason := doResetReason
+    phase := PHASE_SCAN
+    setupId := na
+    setupDir := 0
+    htfId := na
+    htfTfMin := na
+    htfTfName := ""
+    htfTop := na
+    htfBottom := na
+    htfBornTime := na
+    htfTapTime := na
+    htfTapBar := na
+    parentId := na
+    parentTfMin := na
+    parentTfName := ""
+    parentTop := na
+    parentBottom := na
+    parentInternalHigh := na
+    parentInternalLow := na
+    parentBornBar := na
+    parentBornTime := na
+    parentRetestTime := na
+    parentRetestBar := na
+    parentLocked := false
+    oppFvgId := na
+    oppFvgTop := na
+    oppFvgBottom := na
+    oppFvgTime := na
+    oppFvgLeftTime := na
+    oppFvgBar := na
+    inversionTime := na
+    inversionBar := na
+    entryFvgTime := na
+    entryFvgLeftTime := na
+    entryFvgBar := na
+    swingLow := na
+    swingHigh := na
+    tradeDir := 0
+    tradeEntryBar := na
+    tradeEntryTime := na
+    tradeEntry := na
+    tradeStop := na
+    tradeTp := na
+    beTrigger := na
+    beActive := false
+    startP3 := na
+    startP5 := na
+    startP10 := na
+    startP15 := na
+    startP30 := na
+    array.clear(parentFvgs)
+    if archiveClosedTradeDrawings
+        f_archiveBox(htfBox)
+        f_archiveBox(parentBox)
+        f_archiveBox(execBox)
+        f_archiveBox(entryBox)
+        f_archiveLine(entryLine)
+        f_archiveLine(slLine)
+        f_archiveLine(tpLine)
+        f_archiveLine(beLine)
+        f_archiveLabel(entryRiskLabel)
+        f_archiveLabel(slRiskLabel)
+        f_archiveLabel(tpRiskLabel)
+        f_archiveLabel(beRiskLabel)
+        f_archiveSetupLabels()
+    else
+        f_deleteBox(htfBox)
+        f_deleteBox(parentBox)
+        f_deleteBox(execBox)
+        f_deleteBox(entryBox)
+        f_deleteLine(entryLine)
+        f_deleteLine(slLine)
+        f_deleteLine(tpLine)
+        f_deleteLine(beLine)
+        f_deleteLabel(entryRiskLabel)
+        f_deleteLabel(slRiskLabel)
+        f_deleteLabel(tpRiskLabel)
+        f_deleteLabel(beRiskLabel)
+        f_deleteActiveSetupLabels()
+    htfBox := na
+    parentBox := na
+    execBox := na
+    entryBox := na
+    entryLine := na
+    slLine := na
+    tpLine := na
+    beLine := na
+    entryRiskLabel := na
+    slRiskLabel := na
+    tpRiskLabel := na
+    beRiskLabel := na
+
+// Keep active boxes extended to the right.
+if showHtfBox and not na(htfBox) and not na(htfTop)
+    htfBox := f_drawBox(htfBox, htfBornTime, htfTop, htfBottom, setupDir == DIR_BULL ? f_zoneBg(color.teal) : f_zoneBg(color.red), setupDir == DIR_BULL ? color.new(color.teal, 20) : color.new(color.red, 20), boxExtendBars)
+    f_setBoxText(htfBox, f_fvgBoxText("HTF", htfTfName, setupDir, false), boxTextColor)
+if showParentBox and not na(parentBox) and not na(parentTop)
+    parentBox := f_drawBox(parentBox, parentBornTime, parentTop, parentBottom, parentLocked ? f_zoneBg(color.yellow) : setupDir == DIR_BULL ? f_zoneBg(color.blue) : f_zoneBg(color.orange), parentLocked ? color.new(color.yellow, 20) : setupDir == DIR_BULL ? color.new(color.blue, 20) : color.new(color.orange, 20), boxExtendBars)
+    f_setBoxText(parentBox, f_fvgBoxText("PARENT", parentTfName, setupDir, parentLocked), boxTextColor)
+if showExecutionBox and not na(execBox) and not na(oppFvgTop)
+    execBox := f_drawBox(execBox, oppFvgLeftTime, oppFvgTop, oppFvgBottom, phase == PHASE_WAIT_ENTRY or phase == PHASE_IN_TRADE ? f_zoneBg(color.fuchsia) : f_zoneBg(color.purple), phase == PHASE_WAIT_ENTRY or phase == PHASE_IN_TRADE ? color.new(color.fuchsia, 20) : color.new(color.purple, 20), boxExtendBars)
+    f_setBoxText(execBox, f_fvgBoxText(phase == PHASE_WAIT_ENTRY or phase == PHASE_IN_TRADE ? "iFVG" : "O-FVG", "1m", phase == PHASE_WAIT_ENTRY or phase == PHASE_IN_TRADE ? setupDir : setupDir == DIR_BULL ? DIR_BEAR : DIR_BULL, phase == PHASE_WAIT_ENTRY or phase == PHASE_IN_TRADE), boxTextColor)
+
+// ============================================================================
+// Visual markers and status table
+// ============================================================================
+plotshape(showEntryCandleMarker and justEntered and tradeDir == DIR_BULL, title = "Long entry marker", style = shape.circle, location = location.belowbar, color = color.new(color.lime, 0), size = size.tiny, text = "")
+plotshape(showEntryCandleMarker and justEntered and tradeDir == DIR_BEAR, title = "Short entry marker", style = shape.circle, location = location.abovebar, color = color.new(color.red, 0), size = size.tiny, text = "")
+
+if barstate.islast
+    f_clearHtfPreviewDrawings()
+    bool showHtfPreviewNow = showUntappedHtfBoxes and maxUntappedHtfBoxes > 0 and (phase == PHASE_SCAN or not hideUntappedHtfAfterTap)
+    if showHtfPreviewNow and array.size(htfFvgs) > 0
+        int drawnHtfPreview = 0
+        for j = 0 to array.size(htfFvgs) - 1
+            int i = array.size(htfFvgs) - 1 - j
+            Fvg hf = array.get(htfFvgs, i)
+            bool skipSelected = not na(htfId) and hf.uid == htfId
+            bool enabledHtfDir = (hf.dir == DIR_BULL and enableLongs) or (hf.dir == DIR_BEAR and enableShorts)
+            bool drawableHtf = drawnHtfPreview < maxUntappedHtfBoxes and enabledHtfDir and not skipSelected and not na(hf.top) and not na(hf.bottom)
+            if drawableHtf
+                color htfPreviewColor = hf.dir == DIR_BULL ? color.teal : color.red
+                int htfPreviewLeft = na(hf.bornTime) ? time : hf.bornTime
+                box previewBox = box.new(left = htfPreviewLeft, top = hf.top, right = f_drawRightTime(boxExtendBars), bottom = hf.bottom, xloc = xloc.bar_time, bgcolor = color.new(htfPreviewColor, untappedHtfTransparency), border_color = color.new(htfPreviewColor, 50), border_width = 1)
+                f_setBoxText(previewBox, f_fvgBoxText("HTF", hf.tfName, hf.dir, false), boxTextColor)
+                label previewLabel = label.new(f_drawRightTime(1), hf.dir == DIR_BULL ? hf.bottom : hf.top, "", xloc = xloc.bar_time, yloc = yloc.price, style = label.style_none, color = color.new(htfPreviewColor, 100), textcolor = color.new(htfPreviewColor, 100), size = size.tiny)
+                array.push(htfPreviewBoxes, previewBox)
+                array.push(htfPreviewLabels, previewLabel)
+                drawnHtfPreview += 1
+
+    if not chartIs1m
+        if na(tfWarn)
+            tfWarn := label.new(time, high, "SMC FVG Strategy v4.6 HTF Maintenance + Audit Fixes is designed for a 1-minute chart. Entries are disabled on this timeframe.", xloc = xloc.bar_time, yloc = yloc.price, style = label.style_none, textcolor = color.red, color = color.new(color.white, 100), size = size.small)
+        else
+            label.set_x(tfWarn, time)
+            label.set_y(tfWarn, high)
+    else if not na(tfWarn)
+        label.delete(tfWarn)
+        tfWarn := na
+
+    if showStateTable
+        float pendingLongStop = slMode == "Parent FVG boundary" ? parentBottom : slMode == "HTF FVG boundary" ? htfBottom : slMode == "Entry FVG boundary" ? na : swingLow
+        float pendingShortStop = slMode == "Parent FVG boundary" ? parentTop : slMode == "HTF FVG boundary" ? htfTop : slMode == "Entry FVG boundary" ? na : swingHigh
+        float pendingStop = setupDir == DIR_BULL and not na(pendingLongStop) ? f_floorTick(pendingLongStop - f_bufferPrice()) : setupDir == DIR_BEAR and not na(pendingShortStop) ? f_ceilTick(pendingShortStop + f_bufferPrice()) : na
+        string setupTxt = na(setupId) ? "—" : "S" + str.tostring(setupId) + " " + (setupDir == DIR_BULL ? "LONG" : "SHORT")
+        string htfTxt = htfTfName == "" ? "—" : (showInternalIds ? "H" + f_intText(htfId) + " " : "") + htfTfName + " " + f_dirName(setupDir)
+        string parentTxt = parentTfName == "" ? "—" : (showInternalIds ? "P" + f_intText(parentId) + " " : "") + parentTfName + (parentLocked ? " locked" : " provisional")
+        string execTxt = na(oppFvgId) ? "—" : (showInternalIds ? "O" + f_intText(oppFvgId) + " " : "") + "iFVG " + (phase >= PHASE_WAIT_ENTRY ? "inverted" : "selected")
+        string activeOrPendingSl = phase == PHASE_IN_TRADE ? f_price(tradeStop) : f_price(pendingStop)
+        string riskTxt = (phase == PHASE_IN_TRADE ? "SL " + f_price(tradeStop) + " / TP " + f_price(tradeTp) : "SL " + activeOrPendingSl) + " / " + slMode + " +" + str.tostring(slBufferTicks) + "t"
+        if statePanelMode == "Compact"
+            f_tableRow(0, setupTxt, f_phaseShort(phase), na(setupId) ? tableInactiveColor : tableTextColor)
+            f_tableRow(1, "HTF", htfTxt, htfTfName == "" ? tableInactiveColor : tableTextColor)
+            f_tableRow(2, "Parent", parentTxt, parentTfName == "" ? tableInactiveColor : tableTextColor)
+            f_tableRow(3, "Exec", execTxt, na(oppFvgId) ? tableInactiveColor : color.purple)
+            f_tableRow(4, "Risk", riskTxt, phase == PHASE_IN_TRADE ? color.red : tableTextColor)
+            f_tableRow(5, "BE", f_price(beTrigger) + " / " + (beActive ? "Active" : "Inactive"), beActive ? color.aqua : tableInactiveColor)
+            f_tableRow(6, "Last", f_trimText(resetReason, 34), tableTextColor)
+            f_tableRow(7, "Chart", chartIs1m ? "1m OK" : "Not 1m", chartIs1m ? color.green : color.red)
+            for row = 8 to 13
+                f_tableBlankRow(row)
+        else
+            f_tableRow(0, "Setup", setupTxt, na(setupId) ? tableInactiveColor : tableTextColor)
+            f_tableRow(1, "Phase", f_phaseName(phase), tableTextColor)
+            f_tableRow(2, "Direction", f_dirName(setupDir), setupDir == DIR_BULL ? color.green : setupDir == DIR_BEAR ? color.red : tableInactiveColor)
+            f_tableRow(3, "HTF", htfTxt, htfTfName == "" ? tableInactiveColor : tableTextColor)
+            f_tableRow(4, "Parent", parentTxt, parentTfName == "" ? tableInactiveColor : tableTextColor)
+            f_tableRow(5, "Exec iFVG", execTxt, na(oppFvgId) ? tableInactiveColor : color.purple)
+            f_tableRow(6, "Session", entrySessionActive ? "Active" : "Inactive", entrySessionActive ? color.green : tableInactiveColor)
+            f_tableRow(7, "SL model", slMode + " +" + str.tostring(slBufferTicks) + "t", tableTextColor)
+            f_tableRow(8, phase == PHASE_IN_TRADE ? "Active SL" : "Pending SL", activeOrPendingSl, na(pendingStop) and phase != PHASE_IN_TRADE ? tableInactiveColor : color.red)
+            f_tableRow(9, "Entry", f_price(tradeEntry), na(tradeEntry) ? tableInactiveColor : tableTextColor)
+            f_tableRow(10, "TP", f_price(tradeTp), na(tradeTp) ? tableInactiveColor : color.green)
+            f_tableRow(11, "BE trigger", f_price(beTrigger) + " / " + (beActive ? "Active" : "Inactive"), beActive ? color.aqua : tableInactiveColor)
+            f_tableRow(12, "Last event", f_trimText(resetReason, 54), tableTextColor)
+            f_tableRow(13, "Chart", chartIs1m ? "1m OK" : "Not 1m", chartIs1m ? color.green : color.red)

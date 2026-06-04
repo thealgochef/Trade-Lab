@@ -6,9 +6,10 @@ canonical events are allowed into this hot path and DTO mapping remains at the A
 edge.
 """
 
+import logging
 import re
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import date, timedelta
 from types import MappingProxyType
 from typing import Any
 
@@ -24,7 +25,14 @@ from trade_lab.domain.events import (
 )
 from trade_lab.domain.feed import FeedConnectionState, FeedStatus
 from trade_lab.domain.levels import DisplayLevel, SessionLevelEngine, TouchEvent
-from trade_lab.domain.observations import Observation, ObservationEngine
+from trade_lab.domain.market_context import DEFAULT_RETENTION_MINUTES, MarketContextBuffer
+from trade_lab.domain.observations import Observation, ObservationEngine, ObservationStatus
+from trade_lab.domain.outcomes import Outcome
+from trade_lab.domain.sessions import classify_session
+from trade_lab.services.inference.inference_engine import InferenceEngine, Prediction
+from trade_lab.services.inference.outcome_tracker import OutcomeTracker
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +44,8 @@ class RuntimeUpdate:
     display_levels: tuple[DisplayLevel, ...] = ()
     touches: tuple[TouchEvent, ...] = ()
     observations: tuple[Observation, ...] = ()
+    predictions: tuple[Prediction, ...] = ()
+    outcomes: tuple[Outcome, ...] = ()
 
     def has_deltas(self) -> bool:
         return any(
@@ -47,8 +57,32 @@ class RuntimeUpdate:
                 self.display_levels,
                 self.touches,
                 self.observations,
+                self.predictions,
+                self.outcomes,
             )
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ModelStatus:
+    """Path-free, secret-free view of the active inference model for the API edge.
+
+    Built from the active model's strategy contract so the UI can show which model
+    is serving predictions without ever learning a filesystem path. ``loaded`` is
+    ``False`` (with all detail fields ``None``/empty) when no model is active.
+    """
+
+    loaded: bool
+    model_id: str | None = None
+    strategy_id: str | None = None
+    training_mode: str | None = None
+    instrument: str | None = None
+    feature_names: tuple[str, ...] = ()
+    class_map: MappingProxyType[int, str] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+    validation_ok: bool = False
+    validation_detail: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +93,11 @@ class RuntimeSnapshot:
     active_observations: tuple[Observation, ...]
     feed_status: FeedStatus
     warnings: tuple[DataQualityWarning, ...]
+    predictions: tuple[Prediction, ...] = ()
+    outcomes: tuple[Outcome, ...] = ()
+    model_status: ModelStatus = field(default_factory=lambda: ModelStatus(loaded=False))
+    session: str | None = None
+    trading_day: date | None = None
     metadata: MappingProxyType[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
 
@@ -73,21 +112,57 @@ class ApplicationRuntime:
         observation_duration_seconds: int,
         warning_limit: int = 100,
         recent_closed_bar_limit: int = 500,
+        seed_bar_limit_per_timeframe: int = 2500,
+        market_context_retention_minutes: int = DEFAULT_RETENTION_MINUTES,
+        prediction_limit: int = 500,
+        outcome_limit: int = 500,
+        inference_engine: InferenceEngine | None = None,
     ) -> None:
         if warning_limit <= 0:
             raise ValueError("warning_limit must be positive")
         if recent_closed_bar_limit <= 0:
             raise ValueError("recent_closed_bar_limit must be positive")
+        if seed_bar_limit_per_timeframe <= 0:
+            raise ValueError("seed_bar_limit_per_timeframe must be positive")
+        if market_context_retention_minutes <= 0:
+            raise ValueError("market_context_retention_minutes must be positive")
+        if prediction_limit <= 0:
+            raise ValueError("prediction_limit must be positive")
+        if outcome_limit <= 0:
+            raise ValueError("outcome_limit must be positive")
         self.requested_symbol = requested_symbol
         self.candles = CandleEngine(tick_timeframes)
         self.levels = SessionLevelEngine()
         self.observations = ObservationEngine(timedelta(seconds=observation_duration_seconds))
+        # Rolling L1/L0 context for pre-touch order-flow features. Structurally cannot
+        # hold depth, so inference downstream can never read more than trades + BBO.
+        self.market_context = MarketContextBuffer(
+            retention=timedelta(minutes=market_context_retention_minutes)
+        )
+        self._market_context_retention_minutes = market_context_retention_minutes
+        # Optional inference seam: when an InferenceEngine with an active model is set,
+        # completed observations produce Predictions attached to the RuntimeUpdate.
+        self._inference_engine = inference_engine
+        self._prediction_limit = prediction_limit
+        self._outcome_limit = outcome_limit
+        self._predictions: list[Prediction] = []
+        self._outcomes: list[Outcome] = []
+        # MAE-first forward-outcome tracker, contract-specific. Built from the active
+        # model's contract so a hot-swap re-derives forward bar type + thresholds.
+        self._outcome_tracker: OutcomeTracker | None = self._build_outcome_tracker(
+            inference_engine
+        )
         self._warning_limit = warning_limit
         self._recent_closed_bar_limit = recent_closed_bar_limit
+        self._seed_bar_limit_per_timeframe = seed_bar_limit_per_timeframe
         self._tick_timeframes = tick_timeframes
         self._observation_duration_seconds = observation_duration_seconds
         self._warnings: list[DataQualityWarning] = []
         self._recent_closed_bars: list[Candle] = []
+        # Historical warm-up bars kept separate from the rolling live buffer so live
+        # deltas never evict the initial "last N sessions" context and so the snapshot
+        # can serve history to clients that connect after seeding completes.
+        self._seed_closed_bars: list[Candle] = []
         self._metadata: dict[str, Any] = {}
         self._feed_status = FeedStatus(
             state=FeedConnectionState.DISCONNECTED,
@@ -117,9 +192,15 @@ class ApplicationRuntime:
         self.observations = ObservationEngine(
             timedelta(seconds=self._observation_duration_seconds)
         )
+        self.market_context.reset()
+        self._predictions.clear()
+        self._outcomes.clear()
+        if self._outcome_tracker is not None:
+            self._outcome_tracker.reset()
         if not preserve_warnings:
             self._warnings.clear()
         self._recent_closed_bars.clear()
+        self._seed_closed_bars.clear()
         self._metadata.clear()
         self._feed_status = FeedStatus(
             state=FeedConnectionState.DISCONNECTED,
@@ -136,6 +217,147 @@ class ApplicationRuntime:
     def set_feed_status(self, status: FeedStatus) -> RuntimeUpdate:
         self._feed_status = status
         return RuntimeUpdate(feed_status=status)
+
+    def set_inference_engine(self, engine: InferenceEngine | None) -> None:
+        """Attach (or detach) the inference engine and clear prediction state.
+
+        Called on model hot-swap: an activation switches the engine's active model,
+        so prior predictions belong to a different contract and must be dropped to
+        avoid mixing bundles in one session. Market-data state is untouched.
+        """
+
+        self._inference_engine = engine
+        self._predictions.clear()
+        self._outcomes.clear()
+        self._outcome_tracker = self._build_outcome_tracker(engine)
+
+    @staticmethod
+    def _build_outcome_tracker(engine: InferenceEngine | None) -> OutcomeTracker | None:
+        """Construct a contract-specific OutcomeTracker for the active model, if any.
+
+        Returns ``None`` when no engine/model is active so the runtime tracks no
+        outcomes until a model is loaded.
+        """
+
+        if engine is None:
+            return None
+        contract = engine.active_contract
+        if contract is None:
+            return None
+        return OutcomeTracker(contract)
+
+    def clear_predictions(self) -> None:
+        """Drop accumulated predictions + outcomes (e.g. on model hot-swap)."""
+
+        self._predictions.clear()
+        self._outcomes.clear()
+        if self._outcome_tracker is not None:
+            self._outcome_tracker.reset()
+
+    @property
+    def predictions(self) -> tuple[Prediction, ...]:
+        return tuple(self._predictions)
+
+    @property
+    def outcomes(self) -> tuple[Outcome, ...]:
+        return tuple(self._outcomes)
+
+    def model_status(self) -> ModelStatus:
+        """Path-free status of the active inference model for the API edge.
+
+        Returns an unloaded status when no engine/model is active, so the snapshot
+        and ``model.status`` message always have a stable, serializable shape.
+        """
+
+        engine = self._inference_engine
+        active = engine.active() if engine is not None else None
+        if active is None:
+            return ModelStatus(loaded=False)
+        contract = active.contract
+        return ModelStatus(
+            loaded=True,
+            model_id=active.model_id,
+            strategy_id=contract.strategy_id,
+            training_mode=contract.training_mode,
+            instrument=contract.instrument,
+            feature_names=tuple(contract.feature_set.names),
+            class_map=MappingProxyType(dict(contract.class_map.mapping)),
+            validation_ok=True,
+            validation_detail="active model validated against its contract",
+        )
+
+    def session_state(self) -> tuple[str | None, date | None]:
+        """Derive the current session label + trading day from the latest event.
+
+        Uses the wall-clock session classifier against the most recent event
+        timestamp so the frontend placeholders reflect the live/replay clock. When
+        no event has been processed yet (no timestamp), both are ``None`` rather
+        than a fabricated value.
+        """
+
+        last_event_ts = self._feed_status.last_event_ts_utc
+        if last_event_ts is None:
+            return None, None
+        info = classify_session(last_event_ts)
+        return info.session.value, info.trading_day
+
+    def _run_inference(
+        self, changed_observations: tuple[Observation, ...]
+    ) -> tuple[Prediction, ...]:
+        """Produce predictions for observations that just completed.
+
+        An observation "completes" when the engine expires it at its scheduled end
+        (its full interaction window has elapsed). With no active model this yields
+        nothing and the runtime keeps serving market data unchanged.
+        """
+
+        engine = self._inference_engine
+        if engine is None or not engine.has_active_model:
+            return ()
+        produced: list[Prediction] = []
+        for observation in changed_observations:
+            if observation.status is not ObservationStatus.EXPIRED:
+                continue
+            try:
+                prediction = engine.predict_for_observation(observation, self.market_context)
+            except Exception:
+                # Inference must never break the market-data hot path.
+                logger.warning("inference failed for a completed observation", exc_info=False)
+                continue
+            if prediction is not None:
+                produced.append(prediction)
+        if produced:
+            self._predictions.extend(produced)
+            if len(self._predictions) > self._prediction_limit:
+                del self._predictions[: len(self._predictions) - self._prediction_limit]
+            tracker = self._outcome_tracker
+            if tracker is not None:
+                for prediction in produced:
+                    tracker.register(prediction)
+        return tuple(produced)
+
+    def _track_outcomes(self, closed_bars: tuple[Candle, ...]) -> tuple[Outcome, ...]:
+        """Advance open outcome trackers on each just-closed contract bar.
+
+        Only forward-bar-type closes resolve predictions; non-matching timeframes are
+        ignored inside the tracker. Outcome tracking must never break the market-data
+        hot path, so failures are swallowed.
+        """
+
+        tracker = self._outcome_tracker
+        if tracker is None or not closed_bars:
+            return ()
+        resolved: list[Outcome] = []
+        for bar in closed_bars:
+            try:
+                resolved.extend(tracker.on_bar_close(bar))
+            except Exception:
+                logger.warning("outcome tracking failed for a closed bar", exc_info=False)
+        if resolved:
+            self._outcomes.extend(resolved)
+            if len(self._outcomes) > self._outcome_limit:
+                del self._outcomes[: len(self._outcomes) - self._outcome_limit]
+        return tuple(resolved)
 
     def record_warning(self, warning: DataQualityWarning) -> RuntimeUpdate:
         warning = _safe_warning(warning)
@@ -167,7 +389,7 @@ class ApplicationRuntime:
         if isinstance(event, TradeEvent):
             return self._process_trade(event)
         if isinstance(event, TopOfBookEvent):
-            return self._update_feed_context(event.event_ts_utc, schema=event.source_schema)
+            return self._process_quote(event)
         if isinstance(event, InstrumentDefinitionEvent):
             self._metadata["instrument"] = {
                 "instrument_id": event.instrument_id,
@@ -209,19 +431,68 @@ class ApplicationRuntime:
             return self._update_feed_context(event.event_ts_utc, schema=event.source_schema)
         raise TypeError(f"unsupported market event type: {type(event).__name__}")
 
+    def seed_closed_bars(self, bars: tuple[Candle, ...]) -> RuntimeUpdate:
+        """Inject historical warm-up bars into the snapshot and broadcast them.
+
+        Bars are stored apart from the rolling live buffer and bounded per timeframe so
+        the chart shows the last N sessions immediately without live deltas evicting
+        them. Returns a delta the caller can fan out as ``market.bar.closed``.
+        """
+
+        if not bars:
+            return RuntimeUpdate()
+        self._seed_closed_bars.extend(bars)
+        self._trim_seed_bars()
+        return RuntimeUpdate(closed_bars=tuple(bars))
+
+    def _trim_seed_bars(self) -> None:
+        limit = self._seed_bar_limit_per_timeframe
+        kept_by_timeframe: dict[int, int] = {}
+        trimmed: list[Candle] = []
+        # Walk newest-first so the most recent bars per timeframe are retained.
+        for bar in reversed(self._seed_closed_bars):
+            kept = kept_by_timeframe.get(bar.timeframe_ticks, 0)
+            if kept >= limit:
+                continue
+            kept_by_timeframe[bar.timeframe_ticks] = kept + 1
+            trimmed.append(bar)
+        trimmed.reverse()
+        self._seed_closed_bars = trimmed
+
     def snapshot(self) -> RuntimeSnapshot:
         candle_update = self.candles.snapshot_update(())
+        session, trading_day = self.session_state()
         return RuntimeSnapshot(
             current_bars=candle_update.current,
-            recent_closed_bars=tuple(self._recent_closed_bars),
+            recent_closed_bars=tuple((*self._seed_closed_bars, *self._recent_closed_bars)),
             display_levels=self.levels.display_levels(),
             active_observations=self.observations.active(),
             feed_status=self._feed_status,
             warnings=tuple(self._warnings),
+            predictions=tuple(self._predictions),
+            outcomes=tuple(self._outcomes),
+            model_status=self.model_status(),
+            session=session,
+            trading_day=trading_day,
             metadata=MappingProxyType(dict(self._metadata)),
         )
 
+    def _process_quote(self, quote: TopOfBookEvent) -> RuntimeUpdate:
+        """Retain best bid/ask for context features, then update feed status only.
+
+        Quotes never advance bars/touches/observations; the feed-status side effect is
+        identical to the prior behaviour so existing outputs are unchanged.
+        """
+
+        self.market_context.append_quote(
+            quote.event_ts_utc, quote.bid_price_ticks, quote.ask_price_ticks
+        )
+        return self._update_feed_context(quote.event_ts_utc, schema=quote.source_schema)
+
     def _process_trade(self, trade: TradeEvent) -> RuntimeUpdate:
+        self.market_context.append_trade(
+            trade.event_ts_utc, trade.price_ticks, trade.size, trade.side
+        )
         candle_update = self.candles.process_trade(trade)
         if candle_update.completed:
             self._recent_closed_bars.extend(candle_update.completed)
@@ -231,6 +502,11 @@ class ApplicationRuntime:
                 ]
         level_update = self.levels.process_trade(trade)
         changed_observations = list(self.observations.refresh(trade.event_ts_utc))
+        # Run inference before appending the just-started observations: only the
+        # observations completed by this trade are eligible for a prediction now.
+        predictions = self._run_inference(tuple(changed_observations))
+        # Resolve any open predictions against bars that just closed on this trade.
+        outcomes = self._track_outcomes(candle_update.completed)
         for touch in level_update.touches:
             changed_observations.append(self.observations.start_from_touch(touch))
         self._feed_status = FeedStatus(
@@ -253,6 +529,8 @@ class ApplicationRuntime:
             display_levels=level_update.display_levels,
             touches=level_update.touches,
             observations=tuple(changed_observations),
+            predictions=predictions,
+            outcomes=outcomes,
         )
 
     def _update_feed_context(self, event_ts_utc, *, schema: str | None) -> RuntimeUpdate:

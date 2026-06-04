@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     allowed_origins: str = "http://localhost:5174,http://127.0.0.1:5174"
     data_path: Path | None = None
 
+    # Root directory holding model bundles (one subdir per bundle, each with
+    # model.cbm + metadata.json + strategy.json). Discovered by the ModelRegistry;
+    # request-provided paths are never accepted, mirroring TRADE_LAB_DATA_PATH.
+    models_path: Path | None = None
+
     # Secret values stay backend-only. They are excluded from repr and masked during
     # serialization to prevent accidental logging.
     databento_api_key: SecretStr | None = Field(default=None, repr=False)
@@ -51,6 +56,19 @@ class Settings(BaseSettings):
 
     observation_duration_seconds: int = 300
     tick_timeframes: tuple[int, ...] = (147, 987, 2000)
+
+    # Rolling L1/L0 context retention for pre-touch order-flow features. Inference
+    # fires at observation completion (~interaction window after the touch) but
+    # approach features reach back approach_window before the touch, so retention must
+    # cover approach + interaction + margin (default 30 + 5 + 10 = 45 minutes).
+    market_context_retention_minutes: int = Field(default=45, ge=45, le=240)
+
+    # Live warm-up: on live start, pre-fill the chart with the last N completed sessions
+    # of front-month tick bars fetched from the Databento Historical API (L0/L1 only, to
+    # match what live streaming provides). Bounded per timeframe to cap snapshot size.
+    seed_enabled: bool = True
+    seed_lookback_days: int = Field(default=3, ge=1, le=30)
+    seed_max_bars_per_timeframe: int = Field(default=2500, ge=1, le=20_000)
 
     _ALLOWED_DATASETS: ClassVar[set[str]] = {"GLBX.MDP3"}
     _ALLOWED_STYPE_IN: ClassVar[set[str]] = {"raw_symbol", "continuous", "instrument_id", "parent"}

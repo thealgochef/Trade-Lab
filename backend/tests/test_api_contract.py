@@ -167,6 +167,8 @@ def test_status_includes_runtime_fields_and_supported_timeframes_without_secrets
         "engine_ready": True,
         "feed_ready": False,
         "feed_state": "disconnected",
+        "session": None,
+        "trading_day": None,
         "replay": {
             "state": "idle",
             "events_processed": 0,
@@ -408,25 +410,27 @@ def test_replay_start_allowed_synthetic_source_processes_runtime_domain_deltas()
     app = create_app(
         Settings(_env_file=None), runtime=runtime, replay=replay, broadcaster=broadcaster
     )
-    client = TestClient(app)
+    # Enter the app lifespan so the background replay task keeps running while we poll;
+    # a plain TestClient tears its portal down per request and cancels replay early,
+    # which (now that replay coalesces broadcasts on an interval) leaves no deltas to see.
+    with TestClient(app) as client:
+        response = client.post("/api/v1/replay/start", json={"source_id": "synthetic:nq-demo"})
+        assert response.status_code == 200
 
-    response = client.post("/api/v1/replay/start", json={"source_id": "synthetic:nq-demo"})
-    assert response.status_code == 200
+        for _ in range(500):
+            if replay.status().state.value == "completed":
+                break
+            time.sleep(0.001)
 
-    for _ in range(500):
-        if replay.status().state.value == "completed":
-            break
-        time.sleep(0.001)
+        seen = {
+            message["type"]
+            for update in list(replay.updates._queue)
+            for message in (json.loads(raw) for raw in broadcaster.messages_for_update(update))
+        }
 
-    seen = {
-        message["type"]
-        for update in list(replay.updates._queue)
-        for message in (json.loads(raw) for raw in broadcaster.messages_for_update(update))
-    }
-
-    assert {"feed.status", "market.bar.updated", "levels.updated"} <= seen
-    assert response.json()["source_id"] == "synthetic:nq-demo"
-    _assert_no_secret_text(response.json())
+        assert {"feed.status", "market.bar.updated", "levels.updated"} <= seen
+        assert response.json()["source_id"] == "synthetic:nq-demo"
+        _assert_no_secret_text(response.json())
 
 
 def test_app_factory_accepts_injected_runtime_replay_and_broadcaster() -> None:
@@ -535,12 +539,32 @@ def test_websocket_snapshot_contract_is_versioned_deterministic_and_safe() -> No
         "active_observations",
         "feed_status",
         "warnings",
+        "predictions",
+        "outcomes",
+        "model_status",
+        "session",
+        "trading_day",
     }
     assert snapshot["payload"]["current_bars"] == []
     assert snapshot["payload"]["recent_closed_bars"] == []
     assert snapshot["payload"]["display_levels"] == []
     assert snapshot["payload"]["active_observations"] == []
     assert snapshot["payload"]["warnings"] == []
+    assert snapshot["payload"]["predictions"] == []
+    assert snapshot["payload"]["outcomes"] == []
+    assert snapshot["payload"]["model_status"] == {
+        "loaded": False,
+        "model_id": None,
+        "strategy_id": None,
+        "training_mode": None,
+        "instrument": None,
+        "feature_names": [],
+        "class_map": {},
+        "validation_ok": False,
+        "validation_detail": None,
+    }
+    assert snapshot["payload"]["session"] is None
+    assert snapshot["payload"]["trading_day"] is None
     assert snapshot["payload"]["feed_status"] == {
         "state": "disconnected",
         "mode": "idle",
@@ -619,6 +643,11 @@ def test_empty_snapshot_payload_has_required_shape() -> None:
         "active_observations",
         "feed_status",
         "warnings",
+        "predictions",
+        "outcomes",
+        "model_status",
+        "session",
+        "trading_day",
     }
 
 

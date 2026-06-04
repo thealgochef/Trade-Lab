@@ -18,14 +18,17 @@ from trade_lab.api.dto import (
     feed_status_to_dto,
     levels_payload,
     make_envelope,
+    model_status_to_dto,
     observation_to_dto,
+    outcome_payload,
+    prediction_payload,
     snapshot_payload_from_runtime,
     touch_to_dto,
     warning_to_dto,
 )
 from trade_lab.api.serialization import dumps_bytes
 from trade_lab.domain.data_quality import DataQualityCode, DataQualityWarning
-from trade_lab.services.runtime import ApplicationRuntime, RuntimeUpdate
+from trade_lab.services.runtime import ApplicationRuntime, ModelStatus, RuntimeUpdate
 
 
 class WebSocketBroadcaster:
@@ -39,6 +42,9 @@ class WebSocketBroadcaster:
         self._pending_backpressure_drops: dict[asyncio.Queue[bytes], int] = {}
         self._client_dropped_messages: dict[asyncio.Queue[bytes], int] = {}
         self.dropped_messages = 0
+        # Track the active model id so a model.status delta is emitted only when the
+        # active model actually changes (activate/deactivate), not on every update.
+        self._last_model_id = runtime.model_status().model_id
 
     def snapshot_payload(self) -> SnapshotPayload:
         return snapshot_payload_from_runtime(self.runtime.snapshot())
@@ -94,7 +100,43 @@ class WebSocketBroadcaster:
             messages.append(
                 self.envelope_bytes("observation.updated", observation_to_dto(observation))
             )
+        for prediction in update.predictions:
+            messages.append(
+                self.envelope_bytes("prediction.created", prediction_payload(prediction))
+            )
+        for outcome in update.outcomes:
+            messages.append(self.envelope_bytes("prediction.resolved", outcome_payload(outcome)))
+        model_status_message = self._model_status_message_if_changed()
+        if model_status_message is not None:
+            messages.append(model_status_message)
         return tuple(messages)
+
+    def _model_status_message_if_changed(self) -> bytes | None:
+        """Emit a model.status envelope only when the active model id changed.
+
+        The active model is swapped out-of-band (REST activate/deactivate), so each
+        update checks the runtime's current status against the last broadcast id and
+        emits a delta exactly once per change.
+        """
+
+        status = self.runtime.model_status()
+        if status.model_id == self._last_model_id:
+            return None
+        self._last_model_id = status.model_id
+        return self.envelope_bytes("model.status", model_status_to_dto(status))
+
+    def model_status_message(self, status: ModelStatus) -> bytes:
+        """Build a model.status envelope and mark it as the last broadcast model.
+
+        Called by the REST hot-swap handlers so an activation/deactivation pushes a
+        model.status delta immediately without waiting for the next market update.
+        """
+
+        self._last_model_id = status.model_id
+        return self.envelope_bytes("model.status", model_status_to_dto(status))
+
+    async def broadcast_model_status(self, status: ModelStatus) -> None:
+        await self._fanout(self.model_status_message(status))
 
     async def _fanout(self, message: bytes) -> None:
         await self._fanout_messages((message,))

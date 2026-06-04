@@ -624,6 +624,34 @@ async def test_synthetic_replay_source_drives_bars_levels_touches_and_observatio
 
 
 @pytest.mark.asyncio
+async def test_replay_coalesces_broadcasts_without_dropping_closed_bars() -> None:
+    # A fast (speed=0) replay must not out-run the WebSocket: deltas are coalesced into
+    # far fewer broadcasts than trades, yet every completed bar is still delivered (no
+    # gaps in the chart).
+    runtime = ApplicationRuntime(
+        requested_symbol="NQ.c.0", tick_timeframes=(2,), observation_duration_seconds=300
+    )
+    service = HistoricalReplayService(runtime, update_queue_depth=10_000)
+    trade_count = 400
+    await service.start(
+        FakeSource(tuple(_trade(i, price_ticks=68_000 + (i % 5)) for i in range(trade_count))),
+        ReplayConfig(
+            paths=(Path("safe-id.parquet"),), requested_symbol="NQ.c.0", schema="trades"
+        ),
+    )
+    await _wait_terminal(service)
+
+    updates = list(service.updates._queue)
+    closed = [bar for update in updates for bar in update.closed_bars]
+
+    assert service.status().state == ReplayState.COMPLETED
+    # 400 trades / 2-tick bars => 200 contiguous closed bars, none dropped.
+    assert [bar.bar_index for bar in closed] == list(range(trade_count // 2))
+    # Coalescing collapsed the per-trade deltas into far fewer broadcasts.
+    assert len(updates) < trade_count
+
+
+@pytest.mark.asyncio
 async def test_replay_state_transitions_pause_resume_stop_and_complete_are_deterministic() -> None:
     runtime = _runtime()
     service = HistoricalReplayService(runtime)

@@ -30,6 +30,9 @@ _MAX_DIRECTORIES_VISITED = 512
 _MAX_DIRECTORY_DEPTH = 8
 _MAX_DIRECTORY_ENTRIES_INSPECTED = 4096
 _MAX_METADATA_READS = 1024
+# Replay decodes parquet on a worker thread; smaller batches keep each decode's GIL hold
+# short so the event loop / WebSocket fan-out stays responsive (no replay "stop-and-go").
+_REPLAY_SCAN_BATCH_SIZE = 4096
 
 
 @dataclass(slots=True)
@@ -381,7 +384,13 @@ def _definition_for_file(
     )
     # Use the opaque source id as the adapter source label so warnings/status never
     # include full local paths. Historical-only depth fields are ignored by adapter.
-    return definition, HistoricalParquetSource(dataset_label=source_id)
+    # Real local dumps mix the front-month outright with back-month/calendar-spread
+    # trades, so restrict replay tick bars to the dominant front-month outright.
+    return definition, HistoricalParquetSource(
+        dataset_label=source_id,
+        front_month_only=True,
+        batch_size=_REPLAY_SCAN_BATCH_SIZE,
+    )
 
 
 _SKIPPED_UNSUPPORTED_NAME = object()

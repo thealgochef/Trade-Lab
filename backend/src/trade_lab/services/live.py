@@ -14,10 +14,15 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 
-from trade_lab.domain.data_quality import DataQualityWarning
+from trade_lab.domain.data_quality import (
+    DataQualityCode,
+    DataQualitySeverity,
+    DataQualityWarning,
+)
 from trade_lab.domain.feed import FeedConnectionState, FeedStatus
 from trade_lab.ports.market_data import MarketDataFeed
 from trade_lab.services.runtime import ApplicationRuntime, RuntimeUpdate, _safe_text
+from trade_lab.services.seed import HistoricalSeedService
 
 logger = logging.getLogger(__name__)
 
@@ -79,11 +84,13 @@ class LiveMarketDataService:
         feed_factory: FeedFactory,
         *,
         on_update: Callable[[RuntimeUpdate], Awaitable[None]] | None = None,
+        seed_service: HistoricalSeedService | None = None,
     ) -> None:
         self.runtime = runtime
         self.config = config
         self._feed_factory = feed_factory
         self._on_update = on_update
+        self._seed_service = seed_service
         self._state = LiveState.IDLE
         self._events_processed = 0
         self._last_error: str | None = None
@@ -91,6 +98,7 @@ class LiveMarketDataService:
         self._started_at_utc: datetime | None = None
         self._stopped_at_utc: datetime | None = None
         self._task: asyncio.Task[None] | None = None
+        self._seed_task: asyncio.Task[None] | None = None
         self._feed: MarketDataFeed | None = None
         self._lock = asyncio.Lock()
 
@@ -179,10 +187,19 @@ class LiveMarketDataService:
                 ) from exc
             self._state = LiveState.RUNNING
             await self._emit_status(FeedConnectionState.CONNECTED, "live feed running")
+            # Warm-up runs off the event loop and broadcasts when ready, so the live
+            # connection is never blocked by the historical fetch. It is scheduled after
+            # the runtime reset above so its bars are not cleared by the reset.
+            if self._seed_service is not None and self._seed_service.enabled:
+                self._seed_task = asyncio.create_task(self._seed_and_broadcast())
             self._task = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
         async with self._lock:
+            if self._seed_task is not None and not self._seed_task.done():
+                self._seed_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._seed_task
             if self._task is not None and not self._task.done():
                 self._task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -222,6 +239,41 @@ class LiveMarketDataService:
                 _redact_configured_secrets(str(exc), self.config.secret_values),
             )
             await self._emit_status(FeedConnectionState.DISCONNECTED, "live feed failed")
+
+    async def _seed_and_broadcast(self) -> None:
+        service = self._seed_service
+        if service is None:
+            return
+        try:
+            bars = await asyncio.to_thread(service.build_seed_bars)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "historical warm-up seeding task failed: exception_type=%s", type(exc).__name__
+            )
+            bars = ()
+        if bars:
+            logger.info("historical warm-up seeded %d bars", len(bars))
+            await self._emit(self.runtime.seed_closed_bars(bars))
+            return
+        # Surface (rather than silently swallow) so an empty chart is explained in the UI.
+        logger.warning("historical warm-up produced no seed bars")
+        await self._emit(
+            RuntimeUpdate(
+                warnings=(
+                    DataQualityWarning(
+                        code=DataQualityCode.PROVIDER_ERROR,
+                        message=(
+                            "live warm-up history unavailable; chart starts without prior "
+                            "sessions and will fill as live trades arrive"
+                        ),
+                        severity=DataQualitySeverity.WARNING,
+                        source="seed",
+                    ),
+                )
+            )
+        )
 
     async def _emit_status(self, state: FeedConnectionState, message: str) -> None:
         await self._emit(

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { addBlotterEvent, blotterStore, connectionStore, intelligenceStore, marketStore, runtimeStore } from './stores';
+import { addBlotterEvent, addOutcome, addPrediction, blotterStore, clearPredictions, connectionStore, intelligenceStore, marketStore, predictionStore, runtimeStore, setModelStatus } from './stores';
+import type { Outcome, Prediction } from '../domain/models';
 
 const resetStores = () => {
   runtimeStore.reset();
@@ -7,7 +8,40 @@ const resetStores = () => {
   marketStore.reset();
   intelligenceStore.reset();
   blotterStore.reset();
+  predictionStore.reset();
 };
+
+const makePrediction = (id: string): Prediction => ({
+  id,
+  touchId: 'touch-1',
+  observationId: 'obs-1',
+  timeUtc: '2026-05-21T14:02:00Z',
+  predictedClass: 'continuation',
+  probabilities: { continuation: 0.7, reversal: 0.3 },
+  levelKind: 'pdh',
+  levelPriceTicks: 76000,
+  direction: 'long',
+  session: 'ny',
+  eligible: true,
+  modelId: 'model-a',
+  contractId: 'NQM6',
+  nanCount: 0,
+  outcome: null,
+});
+
+const makeOutcome = (predictionId: string): Outcome => ({
+  id: `out-${predictionId}`,
+  predictionId,
+  touchId: 'touch-1',
+  resolutionType: 'target',
+  actualClass: 'continuation',
+  predictedClass: 'continuation',
+  correct: true,
+  maxMfePts: 12.5,
+  maxMaePts: 3.0,
+  barsToResolution: 8,
+  timeUtc: '2026-05-21T14:10:00Z',
+});
 
 describe('workstation stores', () => {
   afterEach(resetStores);
@@ -45,6 +79,64 @@ describe('workstation stores', () => {
     const ids = blotterStore.getSnapshot().events.map((entry) => entry.id);
     expect(new Set(ids).size).toBe(2);
     expect(ids.every((id) => id.startsWith('ws-10-'))).toBe(true);
+  });
+
+  it('bounds prediction history to the newest 100 and de-dupes by id', () => {
+    for (let index = 0; index < 105; index += 1) {
+      addPrediction(makePrediction(`pred-${index}`));
+    }
+
+    const predictions = predictionStore.getSnapshot().predictions;
+    expect(predictions).toHaveLength(100);
+    expect(predictions[0]).toMatchObject({ id: 'pred-104' });
+    expect(predictions.at(-1)).toMatchObject({ id: 'pred-5' });
+
+    addPrediction(makePrediction('pred-104'));
+    expect(predictionStore.getSnapshot().predictions.filter((entry) => entry.id === 'pred-104')).toHaveLength(1);
+  });
+
+  it('annotates the matching prediction when its outcome resolves', () => {
+    addPrediction(makePrediction('pred-1'));
+    addPrediction(makePrediction('pred-2'));
+
+    addOutcome(makeOutcome('pred-1'));
+
+    const state = predictionStore.getSnapshot();
+    expect(state.outcomes[0]).toMatchObject({ predictionId: 'pred-1', correct: true });
+    expect(state.predictions.find((entry) => entry.id === 'pred-1')?.outcome).toMatchObject({ id: 'out-pred-1' });
+    expect(state.predictions.find((entry) => entry.id === 'pred-2')?.outcome).toBeNull();
+  });
+
+  it('annotates a prediction that arrives after its outcome', () => {
+    addOutcome(makeOutcome('pred-9'));
+    addPrediction(makePrediction('pred-9'));
+
+    expect(predictionStore.getSnapshot().predictions.find((entry) => entry.id === 'pred-9')?.outcome).toMatchObject({ id: 'out-pred-9' });
+  });
+
+  it('bounds outcome history to the newest 100 and de-dupes by prediction id', () => {
+    for (let index = 0; index < 105; index += 1) {
+      addOutcome(makeOutcome(`pred-${index}`));
+    }
+
+    const outcomes = predictionStore.getSnapshot().outcomes;
+    expect(outcomes).toHaveLength(100);
+    expect(outcomes[0]).toMatchObject({ predictionId: 'pred-104' });
+
+    addOutcome(makeOutcome('pred-104'));
+    expect(predictionStore.getSnapshot().outcomes.filter((entry) => entry.predictionId === 'pred-104')).toHaveLength(1);
+  });
+
+  it('clears predictions and outcomes while keeping model status', () => {
+    addPrediction(makePrediction('pred-1'));
+    addOutcome(makeOutcome('pred-1'));
+    setModelStatus({ loaded: true, modelId: 'model-a', strategyId: null, trainingMode: null, instrument: null, featureNames: [], classMap: {}, validationOk: true, validationDetail: null });
+
+    clearPredictions();
+
+    expect(predictionStore.getSnapshot().predictions).toEqual([]);
+    expect(predictionStore.getSnapshot().outcomes).toEqual([]);
+    expect(predictionStore.getSnapshot().modelStatus).toMatchObject({ loaded: true, modelId: 'model-a' });
   });
 
   it('stores backend offline state without requiring chart or intelligence data', () => {

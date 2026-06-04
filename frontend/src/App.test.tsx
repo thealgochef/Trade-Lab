@@ -9,6 +9,8 @@ const mocks = vi.hoisted(() => ({
   replaySources: vi.fn(),
   replayStatus: vi.fn(),
   liveStatus: vi.fn(),
+  listModels: vi.fn(),
+  activeModel: vi.fn(),
   start: vi.fn(),
   stop: vi.fn(),
   chartRemove: vi.fn(),
@@ -35,6 +37,8 @@ vi.mock('./api/client', () => ({
     replaySources: mocks.replaySources,
     replayStatus: mocks.replayStatus,
     liveStatus: mocks.liveStatus,
+    listModels: mocks.listModels,
+    activeModel: mocks.activeModel,
   },
 }));
 
@@ -53,6 +57,8 @@ const resetStores = () => {
   mocks.replaySources.mockResolvedValue({ ok: true, data: { sources: [] } });
   mocks.replayStatus.mockResolvedValue({ ok: true, data: { state: 'idle', events_processed: 0, warnings_recorded: 0, last_event_ts_utc: null, last_error: null, requested_symbol: null, schema: null } });
   mocks.liveStatus.mockResolvedValue({ ok: true, data: { state: 'idle', requested_symbol: 'NQ.c.0', dataset: 'GLBX.MDP3', schemas: ['trades'], api_key_configured: false, enabled: false, events_processed: 0, last_event_ts_utc: null, last_error: null, started_at_utc: null, stopped_at_utc: null } });
+  mocks.listModels.mockResolvedValue({ ok: true, data: { models: [] } });
+  mocks.activeModel.mockResolvedValue({ ok: true, data: { loaded: false, model_id: null, strategy_id: null, training_mode: null, instrument: null, feature_names: [], class_map: {}, validation_ok: false, validation_detail: null } });
 };
 
 describe('App workstation UI', () => {

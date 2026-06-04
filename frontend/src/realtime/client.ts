@@ -1,9 +1,9 @@
 import { config } from '../config';
 import { MAX_BARS_PER_TIMEFRAME, barKey, isSupportedTimeframe } from '../chart/viewModels';
-import { addBlotterEvent, connectionStore, intelligenceStore, liveStore, marketStore, replayStore, runtimeStore } from '../state/stores';
-import { normalizeBar, normalizeLevel, normalizeObservation, normalizeTouch, normalizeWarning } from '../domain/normalize';
+import { addBlotterEvent, addOutcome, addPrediction, clearPredictions, connectionStore, intelligenceStore, liveStore, marketStore, predictionStore, replayStore, runtimeStore, setModelStatus } from '../state/stores';
+import { normalizeBar, normalizeLevel, normalizeModelStatus, normalizeObservation, normalizeOutcome, normalizePrediction, normalizeTouch, normalizeWarning } from '../domain/normalize';
 import type { MarketBar } from '../domain/models';
-import type { BarDTO, DataQualityWarningDTO, DisplayLevelDTO, Envelope, FeedStatusDTO, ObservationDTO, SnapshotPayloadDTO, TouchDTO } from './types';
+import type { BarDTO, DataQualityWarningDTO, DisplayLevelDTO, Envelope, FeedStatusDTO, ModelStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, SnapshotPayloadDTO, TouchDTO } from './types';
 
 type WebSocketFactory = (url: string) => WebSocket;
 
@@ -130,6 +130,18 @@ export class RealtimeClient {
         intelligenceStore.setState((current) => ({ ...current, observations: upsertById(current.observations, normalizeObservation(envelope.payload as ObservationDTO), 'id') }));
         addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'observation', severity: 'info', message: 'Observation updated', sequence: envelope.sequence });
         break;
+      case 'prediction.created':
+        addPrediction(normalizePrediction((envelope.payload as { prediction: PredictionDTO }).prediction));
+        addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'observation', severity: 'info', message: 'Prediction created', sequence: envelope.sequence });
+        break;
+      case 'prediction.resolved':
+        addOutcome(normalizeOutcome((envelope.payload as { outcome: OutcomeDTO }).outcome));
+        addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'observation', severity: 'info', message: 'Prediction resolved', sequence: envelope.sequence });
+        break;
+      case 'model.status':
+        setModelStatus(normalizeModelStatus(envelope.payload as ModelStatusDTO));
+        addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'system', severity: 'info', message: 'Model status updated', sequence: envelope.sequence });
+        break;
       default:
         addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'warning', severity: 'warning', message: `Unhandled WS message type: ${envelope.type}`, sequence: envelope.sequence });
         break;
@@ -144,6 +156,22 @@ export class RealtimeClient {
       warnings: payload.warnings.map(normalizeWarning).slice(0, 100),
       touches: [],
     });
+    // Seed predictions/outcomes newest-first and annotate each prediction with any
+    // already-resolved outcome so the snapshot matches the running delta state.
+    const outcomes = (payload.outcomes ?? []).map(normalizeOutcome).slice(0, 100);
+    const outcomeByPrediction = new Map(outcomes.map((outcome) => [outcome.predictionId, outcome]));
+    const predictions = (payload.predictions ?? []).map((dto) => {
+      const prediction = normalizePrediction(dto);
+      const outcome = outcomeByPrediction.get(prediction.id);
+      return outcome ? { ...prediction, outcome } : prediction;
+    }).slice(0, 100);
+    predictionStore.setState((current) => ({
+      ...current,
+      predictions,
+      outcomes,
+      modelStatus: payload.model_status ? normalizeModelStatus(payload.model_status) : current.modelStatus,
+    }));
+    runtimeStore.setState((current) => ({ ...current, session: payload.session ?? null, tradingDay: payload.trading_day ?? null }));
     this.applyFeedStatus(payload.feed_status);
   }
 
@@ -151,6 +179,7 @@ export class RealtimeClient {
     if ((status.last_message ?? '').toLowerCase().includes('runtime reset')) {
       marketStore.setState({ currentBars: [], recentClosedBars: [] });
       intelligenceStore.setState({ levels: [], touches: [], observations: [] });
+      clearPredictions();
     }
     const replayState = replayStateFromFeedMessage(status.last_message, status.state, runtimeStore.getSnapshot().replayState);
     runtimeStore.setState((current) => ({ ...current, runtimeMode: status.mode, requestedSymbol: status.requested_symbol ?? current.requestedSymbol, feedReady: ['connected', 'replaying'].includes(status.state), feedState: status.state, replayState: status.mode === 'replay' ? replayState : current.replayState }));

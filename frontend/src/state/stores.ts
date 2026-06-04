@@ -1,5 +1,15 @@
 import { createStore, useStore } from './createStore';
-import type { BlotterEvent, LiveStatus, MarketBar, MarketLevel, MarketTouch, Observation, ReplaySource, ReplayStatus, RuntimeSummary, Timeframe, Warning } from '../domain/models';
+import type { BlotterEvent, LiveStatus, MarketBar, MarketLevel, MarketTouch, ModelBundle, ModelStatus, Observation, Outcome, Prediction, ReplaySource, ReplayStatus, RuntimeSummary, Timeframe, Warning } from '../domain/models';
+
+const MAX_PREDICTIONS = 100;
+const MAX_OUTCOMES = 100;
+
+export type PredictionState = {
+  predictions: Prediction[];
+  outcomes: Outcome[];
+  modelStatus: ModelStatus | null;
+  bundles: ModelBundle[];
+};
 
 export type ConnectionState = {
   wsStatus: 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'offline';
@@ -27,6 +37,7 @@ export const runtimeStore = createStore<RuntimeSummary>({
   feedReady: false,
   feedState: 'unknown',
   replayState: 'unknown',
+  session: null,
   tradingDay: null,
   lastError: null,
 });
@@ -95,6 +106,47 @@ export const liveStore = createStore({
   error: null as string | null,
 });
 
+export const predictionStore = createStore<PredictionState>({
+  predictions: [],
+  outcomes: [],
+  modelStatus: null,
+  bundles: [],
+});
+
+// Newest-first, bounded prediction history; the matching prediction is annotated
+// with its outcome by prediction_id when one resolves so the UI can render the
+// resolved state without a second lookup.
+export const addPrediction = (prediction: Prediction) => {
+  predictionStore.setState((current) => {
+    const existingOutcome = current.outcomes.find((outcome) => outcome.predictionId === prediction.id) ?? null;
+    const annotated = existingOutcome ? { ...prediction, outcome: existingOutcome } : prediction;
+    const without = current.predictions.filter((entry) => entry.id !== prediction.id);
+    return { ...current, predictions: [annotated, ...without].slice(0, MAX_PREDICTIONS) };
+  });
+};
+
+export const addOutcome = (outcome: Outcome) => {
+  predictionStore.setState((current) => {
+    const withoutOutcome = current.outcomes.filter((entry) => entry.predictionId !== outcome.predictionId);
+    const predictions = current.predictions.map((prediction) =>
+      prediction.id === outcome.predictionId ? { ...prediction, outcome } : prediction,
+    );
+    return { ...current, outcomes: [outcome, ...withoutOutcome].slice(0, MAX_OUTCOMES), predictions };
+  });
+};
+
+export const setModelStatus = (modelStatus: ModelStatus) => {
+  predictionStore.setState((current) => ({ ...current, modelStatus }));
+};
+
+export const setModelBundles = (bundles: ModelBundle[]) => {
+  predictionStore.setState((current) => ({ ...current, bundles }));
+};
+
+export const clearPredictions = () => {
+  predictionStore.setState((current) => ({ ...current, predictions: [], outcomes: [] }));
+};
+
 export const useRuntime = <T = RuntimeSummary>(selector?: (state: RuntimeSummary) => T) => useStore(runtimeStore, selector ?? ((state) => state as T));
 export const useConnection = <T = ConnectionState>(selector?: (state: ConnectionState) => T) => useStore(connectionStore, selector ?? ((state) => state as T));
 export const useMarket = <T = MarketState>(selector?: (state: MarketState) => T) => useStore(marketStore, selector ?? ((state) => state as T));
@@ -102,6 +154,10 @@ export const useIntelligence = <T = ReturnType<typeof intelligenceStore.getSnaps
 export const useBlotter = <T = ReturnType<typeof blotterStore.getSnapshot>>(selector?: (state: ReturnType<typeof blotterStore.getSnapshot>) => T) => useStore(blotterStore, selector ?? ((state) => state as T));
 export const useReplay = <T = ReturnType<typeof replayStore.getSnapshot>>(selector?: (state: ReturnType<typeof replayStore.getSnapshot>) => T) => useStore(replayStore, selector ?? ((state) => state as T));
 export const useLive = <T = ReturnType<typeof liveStore.getSnapshot>>(selector?: (state: ReturnType<typeof liveStore.getSnapshot>) => T) => useStore(liveStore, selector ?? ((state) => state as T));
+export const usePredictions = <T = Prediction[]>(selector?: (predictions: Prediction[]) => T) => useStore(predictionStore, (state) => (selector ? selector(state.predictions) : (state.predictions as T)));
+export const useOutcomes = <T = Outcome[]>(selector?: (outcomes: Outcome[]) => T) => useStore(predictionStore, (state) => (selector ? selector(state.outcomes) : (state.outcomes as T)));
+export const useModelStatus = <T = ModelStatus | null>(selector?: (modelStatus: ModelStatus | null) => T) => useStore(predictionStore, (state) => (selector ? selector(state.modelStatus) : (state.modelStatus as T)));
+export const useBundles = <T = ModelBundle[]>(selector?: (bundles: ModelBundle[]) => T) => useStore(predictionStore, (state) => (selector ? selector(state.bundles) : (state.bundles as T)));
 
 let blotterEventCounter = 0;
 

@@ -2,7 +2,10 @@
 
 import asyncio
 import logging
+import queue
+import time
 from collections.abc import Awaitable, Callable, Iterable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -19,6 +22,20 @@ from trade_lab.services.runtime import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Coalesce per-trade replay deltas into at most one broadcast per interval so a fast
+# (speed=0) replay cannot outrun the WebSocket and force the broadcaster to drop
+# market.bar.closed messages (which shows up as gaps in the chart).
+_REPLAY_FLUSH_INTERVAL_SECONDS = 0.05
+_REPLAY_MAX_PENDING_UPDATES = 4000
+
+# The historical scan (parquet decode + per-row normalization) is CPU-heavy and blocks in
+# ~batch-sized chunks. Running it on a worker thread feeding a bounded queue keeps a batch
+# boundary from freezing the event loop / WebSocket fan-out (which showed as replay
+# "stop-and-go"). The buffer absorbs decode stalls so the consumer never starves.
+_REPLAY_PRODUCER_QUEUE_DEPTH = 20_000
+_REPLAY_CONSUMER_CHUNK = 1_000
+_SCAN_DONE = object()
 
 
 class ReplayState(StrEnum):
@@ -89,6 +106,8 @@ class HistoricalReplayService:
         self._pause_event.set()
         self._stop_requested = False
         self._on_update = on_update
+        self._pending_updates: list[RuntimeUpdate] = []
+        self._last_flush_monotonic = 0.0
         self.updates: asyncio.Queue[RuntimeUpdate] = asyncio.Queue(maxsize=update_queue_depth)
 
     @property
@@ -187,32 +206,92 @@ class HistoricalReplayService:
 
     async def _run(self, source: HistoricalMarketDataSource, config: ReplayConfig) -> None:
         self._state = ReplayState.RUNNING
+        self._pending_updates = []
+        self._last_flush_monotonic = time.monotonic()
+        raw_queue: queue.Queue = queue.Queue(maxsize=_REPLAY_PRODUCER_QUEUE_DEPTH)
+        producer_error: list[BaseException] = []
+        max_events = config.max_events
+
+        def _produce() -> None:
+            # Worker thread: pull canonical events from the blocking scan into the queue so
+            # the event loop never waits on parquet decode. Checks max_events BEFORE fetching
+            # so the source is never over-read (the max_events DoS guard), and honors stop.
+            produced = 0
+            try:
+                scan = iter(
+                    source.scan(
+                        config.paths,
+                        requested_symbol=config.requested_symbol,
+                        schema=config.schema,
+                        start_ts_utc=config.start_ts_utc,
+                        end_ts_utc=config.end_ts_utc,
+                    )
+                )
+                while not self._stop_requested:
+                    if max_events is not None and produced >= max_events:
+                        break
+                    try:
+                        produced_item = next(scan)
+                    except StopIteration:
+                        break
+                    produced += 1
+                    while not self._stop_requested:
+                        try:
+                            raw_queue.put(produced_item, timeout=0.1)
+                            break
+                        except queue.Full:
+                            continue
+            except Exception as exc:
+                producer_error.append(exc)
+            finally:
+                while not self._stop_requested:
+                    try:
+                        raw_queue.put(_SCAN_DONE, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+                else:
+                    with suppress(queue.Full):
+                        raw_queue.put_nowait(_SCAN_DONE)
+
+        def _drain() -> list[object]:
+            chunk: list[object] = [raw_queue.get()]
+            while len(chunk) < _REPLAY_CONSUMER_CHUNK:
+                try:
+                    chunk.append(raw_queue.get_nowait())
+                except queue.Empty:
+                    break
+            return chunk
+
+        producer = asyncio.create_task(asyncio.to_thread(_produce))
+        buffer: list[object] = []
+        buffer_index = 0
         try:
             previous_event_ts: datetime | None = None
             emitted_items_processed = 0
-            items = iter(source.scan(
-                config.paths,
-                requested_symbol=config.requested_symbol,
-                schema=config.schema,
-                start_ts_utc=config.start_ts_utc,
-                end_ts_utc=config.end_ts_utc,
-            ))
             while True:
                 if self._stop_requested:
+                    await self._flush_pending()
                     self._state = ReplayState.STOPPED
                     await self._emit_terminal_feed_status("historical replay stopped")
                     return
                 if config.max_events is not None and emitted_items_processed >= config.max_events:
                     break
                 await self._pause_event.wait()
-                try:
-                    item = next(items)
-                except StopIteration:
+                if buffer_index >= len(buffer):
+                    buffer = await asyncio.to_thread(_drain)
+                    buffer_index = 0
+                item = buffer[buffer_index]
+                buffer_index += 1
+                if item is _SCAN_DONE:
+                    if producer_error:
+                        raise producer_error[0]
                     break
                 if isinstance(item, DataQualityWarning):
                     self._warnings_recorded += 1
                     emitted_items_processed += 1
-                    await self._emit(self.runtime.record_warning(item))
+                    self._accumulate(self.runtime.record_warning(item))
+                    await self._maybe_flush()
                     continue
                 if previous_event_ts is not None and config.speed > 0:
                     elapsed = max((item.event_ts_utc - previous_event_ts).total_seconds(), 0)
@@ -220,13 +299,14 @@ class HistoricalReplayService:
                     await asyncio.sleep(min(delay, 0.25))
                 await self._pause_event.wait()
                 if self._stop_requested:
+                    await self._flush_pending()
                     self._state = ReplayState.STOPPED
                     await self._emit_terminal_feed_status("historical replay stopped")
                     return
                 if previous_event_ts is not None and item.event_ts_utc < previous_event_ts:
                     self._warnings_recorded += 1
                     emitted_items_processed += 1
-                    await self._emit(
+                    self._accumulate(
                         self.runtime.record_warning(
                             DataQualityWarning(
                                 code=DataQualityCode.TIMESTAMP_REGRESSION,
@@ -237,13 +317,16 @@ class HistoricalReplayService:
                             )
                         )
                     )
+                    await self._maybe_flush()
                     continue
                 self._events_processed += 1
                 emitted_items_processed += 1
                 self._last_event_ts_utc = item.event_ts_utc
                 previous_event_ts = item.event_ts_utc
-                await self._emit(self.runtime.process_market_event(item))
+                self._accumulate(self.runtime.process_market_event(item))
+                await self._maybe_flush()
                 await asyncio.sleep(0)
+            await self._flush_pending()
             self._state = ReplayState.COMPLETED
             self._completed_at_utc = datetime.now(UTC)
             await self._emit_terminal_feed_status("historical replay completed")
@@ -277,8 +360,14 @@ class HistoricalReplayService:
                 },
             )
             await self._emit_terminal_feed_status("historical replay failed")
+        finally:
+            # Signal the scan thread to stop and let it unwind (it exits within ~0.1s).
+            self._stop_requested = True
+            with suppress(BaseException):
+                await producer
 
     async def _emit_feed_status(self, message: str) -> None:
+        await self._flush_pending()
         current = self.runtime.feed_status
         await self._emit(
             self.runtime.set_feed_status(
@@ -316,6 +405,28 @@ class HistoricalReplayService:
             )
         )
 
+    def _accumulate(self, update: RuntimeUpdate) -> None:
+        if update.has_deltas():
+            self._pending_updates.append(update)
+
+    async def _maybe_flush(self) -> None:
+        if not self._pending_updates:
+            return
+        elapsed = time.monotonic() - self._last_flush_monotonic
+        if (
+            elapsed >= _REPLAY_FLUSH_INTERVAL_SECONDS
+            or len(self._pending_updates) >= _REPLAY_MAX_PENDING_UPDATES
+        ):
+            await self._flush_pending()
+
+    async def _flush_pending(self) -> None:
+        if not self._pending_updates:
+            return
+        merged = _coalesce_replay_updates(self._pending_updates)
+        self._pending_updates = []
+        self._last_flush_monotonic = time.monotonic()
+        await self._emit(merged)
+
     async def _emit(self, update: RuntimeUpdate) -> None:
         if not update.has_deltas():
             return
@@ -324,6 +435,55 @@ class HistoricalReplayService:
         self.updates.put_nowait(update)
         if self._on_update is not None:
             await self._on_update(update)
+
+
+def _coalesce_replay_updates(updates: list[RuntimeUpdate]) -> RuntimeUpdate:
+    """Merge buffered per-trade deltas into one delta for a single broadcast.
+
+    Snapshot-style fields (feed_status, current_bars, display_levels) keep the latest
+    non-empty value; event-style fields (closed_bars, touches, observations, warnings)
+    are concatenated so no completed bar is ever lost. Mirrors how the frontend
+    consumes each message type.
+    """
+
+    if len(updates) == 1:
+        return updates[0]
+    merged = RuntimeUpdate()
+    feed_status = merged.feed_status
+    warnings = list(merged.warnings)
+    current_bars = merged.current_bars
+    closed_bars = list(merged.closed_bars)
+    display_levels = merged.display_levels
+    touches = list(merged.touches)
+    observations = list(merged.observations)
+    predictions = list(merged.predictions)
+    for update in updates:
+        if update.feed_status is not None:
+            feed_status = update.feed_status
+        if update.warnings:
+            warnings.extend(update.warnings)
+        if update.current_bars:
+            current_bars = update.current_bars
+        if update.closed_bars:
+            closed_bars.extend(update.closed_bars)
+        if update.display_levels:
+            display_levels = update.display_levels
+        if update.touches:
+            touches.extend(update.touches)
+        if update.observations:
+            observations.extend(update.observations)
+        if update.predictions:
+            predictions.extend(update.predictions)
+    return RuntimeUpdate(
+        feed_status=feed_status,
+        warnings=tuple(warnings),
+        current_bars=current_bars,
+        closed_bars=tuple(closed_bars),
+        display_levels=display_levels,
+        touches=tuple(touches),
+        observations=tuple(observations),
+        predictions=tuple(predictions),
+    )
 
 
 def resolve_replay_paths(data_root: Path, identifiers: Iterable[str]) -> tuple[Path, ...]:

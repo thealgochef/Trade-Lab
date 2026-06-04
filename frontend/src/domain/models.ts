@@ -11,6 +11,7 @@ export type RuntimeSummary = {
   feedReady: boolean;
   feedState: string;
   replayState: string;
+  session: string | null;
   tradingDay: string | null;
   lastError: string | null;
 };
@@ -111,6 +112,62 @@ export type ReplaySource = {
   kind: string;
   sessionLabel: string | null;
   availability: string | null;
+};
+
+export type Prediction = {
+  id: string;
+  touchId: string;
+  observationId: string;
+  timeUtc: string;
+  predictedClass: string;
+  probabilities: Record<string, number>;
+  levelKind: string;
+  levelPriceTicks: number;
+  direction: string;
+  session: string;
+  eligible: boolean;
+  modelId: string;
+  contractId: string;
+  nanCount: number;
+  outcome: Outcome | null;
+};
+
+export type Outcome = {
+  id: string;
+  predictionId: string;
+  touchId: string;
+  resolutionType: string;
+  actualClass: string;
+  predictedClass: string;
+  correct: boolean;
+  maxMfePts: number;
+  maxMaePts: number;
+  barsToResolution: number;
+  timeUtc: string;
+};
+
+export type ModelStatus = {
+  loaded: boolean;
+  modelId: string | null;
+  strategyId: string | null;
+  trainingMode: string | null;
+  instrument: string | null;
+  featureNames: string[];
+  classMap: Record<string, string>;
+  validationOk: boolean;
+  validationDetail: string | null;
+};
+
+export type ModelBundle = {
+  modelId: string;
+  strategyId: string;
+  trainingMode: string;
+  instrument: string;
+  featureCount: number;
+  classMap: Record<string, string>;
+  hasChecksum: boolean;
+  validationOk: boolean;
+  validationDetail: string;
 };
 
 export type ReplayStatus = {

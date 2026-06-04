@@ -180,6 +180,62 @@ describe('ApiClient', () => {
     expect(JSON.stringify(body).toLowerCase()).not.toMatch(/path|file|parquet|[\\/]|\.\.|^[a-z]:/);
   });
 
+  it('gets and posts model activation endpoints without sending secrets', async () => {
+    const models = {
+      models: [
+        { model_id: 'model-a', strategy_id: 'strat-1', training_mode: 'offline', instrument: 'NQ', feature_count: 12, class_map: { '0': 'continuation' }, has_checksum: true, validation_ok: true, validation_detail: 'ok' },
+      ],
+    };
+    const status = { loaded: true, model_id: 'model-a', strategy_id: 'strat-1', training_mode: 'offline', instrument: 'NQ', feature_names: ['f0'], class_map: { '0': 'continuation' }, validation_ok: true, validation_detail: 'ok' };
+    const responses = [jsonResponse(models), jsonResponse(status), jsonResponse(status), jsonResponse({ ...status, loaded: false, model_id: null })];
+    const fetchImpl = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(async () => responses.shift() as Response);
+    const client = new ApiClient('http://localhost:8001', fetchImpl as unknown as typeof fetch);
+
+    await expect(client.listModels()).resolves.toEqual({ ok: true, data: models });
+    await expect(client.activeModel()).resolves.toEqual({ ok: true, data: status });
+    await expect(client.activateModel('model-a')).resolves.toEqual({ ok: true, data: status });
+    await expect(client.deactivateModel()).resolves.toEqual({ ok: true, data: { ...status, loaded: false, model_id: null } });
+
+    expect(fetchImpl.mock.calls.map(([url]) => String(url))).toEqual([
+      'http://localhost:8001/api/v1/models',
+      'http://localhost:8001/api/v1/models/active',
+      'http://localhost:8001/api/v1/models/activate',
+      'http://localhost:8001/api/v1/models/deactivate',
+    ]);
+    expect(fetchImpl.mock.calls[2][1]).toMatchObject({ method: 'POST', body: JSON.stringify({ model_id: 'model-a' }) });
+    expect(fetchImpl.mock.calls[3][1]).toMatchObject({ method: 'POST' });
+    expect(fetchImpl.mock.calls[3][1]?.body).toBeUndefined();
+    expect(JSON.stringify(fetchImpl.mock.calls).toLowerCase()).not.toMatch(/api[_-]?key|secret|password|credential/);
+  });
+
+  it('returns graceful offline errors for model endpoints without throwing', async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('connect ECONNREFUSED');
+    }) as unknown as typeof fetch;
+    const client = new ApiClient('http://localhost:8001', fetchImpl);
+
+    await expect(client.listModels()).resolves.toMatchObject({ ok: false, error: expect.stringContaining('Backend unavailable') });
+    await expect(client.activeModel()).resolves.toMatchObject({ ok: false, error: expect.stringContaining('Backend unavailable') });
+    await expect(client.activateModel('model-a')).resolves.toMatchObject({ ok: false, error: expect.stringContaining('Backend unavailable') });
+    await expect(client.deactivateModel()).resolves.toMatchObject({ ok: false, error: expect.stringContaining('Backend unavailable') });
+  });
+
+  it('redacts secret-like detail in model activation errors', async () => {
+    const detail = 'model bundle validation failed; api_key=db-abcdefghijklmnopqrstuvwxyz123 path=C:\\Users\\operator\\models\\model-a';
+    const fetchImpl = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(async () => jsonResponse({ detail }, { ok: false, status: 409 }));
+    const client = new ApiClient('http://localhost:8001', fetchImpl as unknown as typeof fetch);
+
+    const result = await client.activateModel('model-a');
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.status).toBe(409);
+      expect(result.error).toContain('model bundle validation failed');
+      expect(result.error).not.toContain('abcdefghijklmnopqrstuvwxyz');
+      expect(result.error).not.toContain('C:\\Users');
+    }
+  });
+
   it('returns graceful offline errors without throwing', async () => {
     const fetchImpl = vi.fn(async () => {
       throw new Error('connect ECONNREFUSED');

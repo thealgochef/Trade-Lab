@@ -12,13 +12,27 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from trade_lab import __version__
 from trade_lab.adapters.databento import DatabentoMarketDataFeed, is_databento_sdk_available
+from trade_lab.adapters.databento_historical import DatabentoHistoricalSource
 from trade_lab.adapters.replay_catalog import build_replay_catalog
-from trade_lab.api.dto import ReplaySourceDTO, replay_status_to_dto
+from trade_lab.api.dto import (
+    ReplaySourceDTO,
+    model_bundle_to_dto,
+    model_status_to_dto,
+    replay_status_to_dto,
+)
 from trade_lab.config import Settings, load_settings
 from trade_lab.services.broadcaster import WebSocketBroadcaster
+from trade_lab.services.inference.inference_engine import InferenceEngine
 from trade_lab.services.live import LiveConfig, LiveMarketDataService
+from trade_lab.services.model_registry import (
+    ModelNotFoundError,
+    ModelRegistry,
+    ModelValidationError,
+    is_safe_model_id,
+)
 from trade_lab.services.replay import HistoricalReplayService, ReplayConfig
 from trade_lab.services.runtime import ApplicationRuntime
+from trade_lab.services.seed import HistoricalSeedService
 
 
 class ReplayStartRequest(BaseModel):
@@ -27,6 +41,12 @@ class ReplayStartRequest(BaseModel):
     source_id: str = Field(default="synthetic:nq-demo", min_length=1, max_length=128)
     speed: float = Field(default=0.0, ge=0.0, le=10_000.0)
     max_events: int | None = Field(default=None, ge=1, le=100_000)
+
+
+class ActivateModelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model_id: str = Field(min_length=1, max_length=128)
 
 
 _SAFE_SOURCE_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
@@ -181,7 +201,18 @@ def create_app(
         requested_symbol=settings.front_month_symbol,
         tick_timeframes=settings.tick_timeframes,
         observation_duration_seconds=settings.observation_duration_seconds,
+        seed_bar_limit_per_timeframe=settings.seed_max_bars_per_timeframe,
+        market_context_retention_minutes=settings.market_context_retention_minutes,
     )
+    # ModelRegistry discovers bundles from the configured models path; the runtime
+    # invokes inference on completed observations only once an operator activates a
+    # model (Stage 5). No model is active by default, so the runtime just serves
+    # market data until then.
+    model_registry = ModelRegistry(settings.models_path)
+    inference_engine = InferenceEngine(model_registry)
+    runtime.set_inference_engine(inference_engine)
+    app.state.model_registry = model_registry
+    app.state.inference_engine = inference_engine
     broadcaster = broadcaster or WebSocketBroadcaster(runtime)
     app.state.runtime = runtime
     app.state.broadcaster = broadcaster
@@ -215,7 +246,25 @@ def create_app(
                 context_schemas=config.context_schemas,
             )
 
-        live = LiveMarketDataService(runtime, live_config, live_feed_factory)
+        seed_service = HistoricalSeedService(
+            DatabentoHistoricalSource(
+                api_key=(
+                    None
+                    if settings.databento_api_key is None
+                    else settings.databento_api_key.get_secret_value()
+                ),
+                dataset=settings.databento_dataset,
+                requested_symbol=settings.databento_requested_symbol,
+                stype_in=settings.databento_stype_in,
+            ),
+            tick_timeframes=settings.tick_timeframes,
+            lookback_days=settings.seed_lookback_days,
+            max_bars_per_timeframe=settings.seed_max_bars_per_timeframe,
+            enabled=settings.seed_enabled,
+        )
+        live = LiveMarketDataService(
+            runtime, live_config, live_feed_factory, seed_service=seed_service
+        )
     if not live.has_update_callback:
         live.set_update_callback(broadcaster.broadcast_update)
     app.state.live = live
@@ -235,6 +284,7 @@ def create_app(
     async def status() -> dict[str, object]:
         replay_status = _replay_status_payload(app.state.replay)
         feed_status = app.state.runtime.feed_status
+        session, trading_day = app.state.runtime.session_state()
         return {
             "service": "trade-lab-backend",
             "version": __version__,
@@ -245,6 +295,8 @@ def create_app(
             "engine_ready": True,
             "feed_ready": feed_status.state.value in {"connected", "replaying"},
             "feed_state": feed_status.state.value,
+            "session": session,
+            "trading_day": None if trading_day is None else trading_day.isoformat(),
             "replay": replay_status,
             "live": _live_status_payload(app.state.live),
         }
@@ -269,6 +321,55 @@ def create_app(
         _authorize_live_control(request, settings)
         await app.state.live.stop()
         return _live_status_payload(app.state.live)
+
+    @app.get("/api/v1/models")
+    async def list_models() -> dict[str, object]:
+        registry: ModelRegistry = app.state.model_registry
+        return {
+            "models": [
+                model_bundle_to_dto(bundle).model_dump(mode="json")
+                for bundle in registry.discover()
+            ]
+        }
+
+    @app.get("/api/v1/models/active")
+    async def active_model() -> dict[str, object]:
+        return model_status_to_dto(app.state.runtime.model_status()).model_dump(mode="json")
+
+    @app.post("/api/v1/models/activate")
+    async def activate_model(payload: ActivateModelRequest, request: Request) -> dict[str, object]:
+        _authorize_live_control(request, settings)
+        model_id = payload.model_id
+        # Reject path-like ids before touching the registry so traversal/probing is
+        # a 400, not a 404 that confirms which ids exist on disk.
+        if not is_safe_model_id(model_id):
+            raise HTTPException(status_code=400, detail="invalid model id")
+        registry: ModelRegistry = app.state.model_registry
+        try:
+            registry.activate(model_id)
+        except ModelNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="unknown model id") from exc
+        except ModelValidationError as exc:
+            # The message is already path-free/secret-free by ModelRegistry design.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        # The active contract changed: rebind the engine so prior predictions,
+        # outcomes, and the contract-specific tracker are cleared atomically.
+        app.state.runtime.set_inference_engine(app.state.inference_engine)
+        status = app.state.runtime.model_status()
+        await app.state.broadcaster.broadcast_model_status(status)
+        return model_status_to_dto(status).model_dump(mode="json")
+
+    @app.post("/api/v1/models/deactivate")
+    async def deactivate_model(request: Request) -> dict[str, object]:
+        _authorize_live_control(request, settings)
+        registry: ModelRegistry = app.state.model_registry
+        registry.deactivate()
+        # Rebind so prediction/outcome/tracker state is dropped; market data keeps
+        # flowing with no model active.
+        app.state.runtime.set_inference_engine(app.state.inference_engine)
+        status = app.state.runtime.model_status()
+        await app.state.broadcaster.broadcast_model_status(status)
+        return model_status_to_dto(status).model_dump(mode="json")
 
     @app.get("/api/v1/replay/status")
     async def replay_status() -> dict[str, object]:

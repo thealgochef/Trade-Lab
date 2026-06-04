@@ -1,5 +1,6 @@
 import { config } from '../config';
-import type { ApiResult, HealthDTO, LiveStatusDTO, ReplaySourcesResponseDTO, ReplayStartRequestDTO, ReplayStatusDTO, RuntimeStatusDTO } from './types';
+import type { ApiResult, HealthDTO, LiveStatusDTO, ModelsResponseDTO, ReplaySourcesResponseDTO, ReplayStartRequestDTO, ReplayStatusDTO, RuntimeStatusDTO } from './types';
+import type { ModelStatusDTO } from '../realtime/types';
 
 type FetchLike = typeof fetch;
 
@@ -37,6 +38,24 @@ export class ApiClient {
 
   stopLive(): Promise<ApiResult<LiveStatusDTO>> {
     return this.post<LiveStatusDTO>('/api/v1/live/stop');
+  }
+
+  listModels(): Promise<ApiResult<ModelsResponseDTO>> {
+    return this.get<ModelsResponseDTO>('/api/v1/models');
+  }
+
+  activeModel(): Promise<ApiResult<ModelStatusDTO>> {
+    return this.get<ModelStatusDTO>('/api/v1/models/active');
+  }
+
+  // Activation is operator-gated server-side; on localhost the loopback path
+  // authorizes, so the UI never sends API keys or secrets here.
+  activateModel(modelId: string): Promise<ApiResult<ModelStatusDTO>> {
+    return this.post<ModelStatusDTO>('/api/v1/models/activate', { model_id: modelId });
+  }
+
+  deactivateModel(): Promise<ApiResult<ModelStatusDTO>> {
+    return this.post<ModelStatusDTO>('/api/v1/models/deactivate');
   }
 
   startReplay(request: ReplayStartRequestDTO): Promise<ApiResult<ReplayStatusDTO>> {

@@ -7,7 +7,10 @@ export type MessageType =
   | 'market.bar.closed'
   | 'levels.updated'
   | 'touch.detected'
-  | 'observation.updated';
+  | 'observation.updated'
+  | 'prediction.created'
+  | 'prediction.resolved'
+  | 'model.status';
 
 export type BarDTO = {
   timeframe_ticks: number;
@@ -84,6 +87,50 @@ export type ObservationDTO = {
   level_price_ticks: number;
 };
 
+export type PredictionDTO = {
+  prediction_id: string;
+  touch_id: string;
+  observation_id: string;
+  event_ts_utc: string;
+  predicted_class: string;
+  probabilities: Record<string, number>;
+  feature_values: Record<string, number>;
+  level_kind: string;
+  level_price_ticks: number;
+  direction: string;
+  session: string;
+  is_eligible: boolean;
+  model_id: string;
+  contract_id: string;
+  nan_count: number;
+};
+
+export type OutcomeDTO = {
+  outcome_id: string;
+  prediction_id: string;
+  touch_id: string;
+  resolution_type: string;
+  actual_class: string;
+  predicted_class: string;
+  correct: boolean;
+  max_mfe_pts: number;
+  max_mae_pts: number;
+  bars_to_resolution: number;
+  resolved_ts_utc: string;
+};
+
+export type ModelStatusDTO = {
+  loaded: boolean;
+  model_id: string | null;
+  strategy_id: string | null;
+  training_mode: string | null;
+  instrument: string | null;
+  feature_names: string[];
+  class_map: Record<string, string>;
+  validation_ok: boolean;
+  validation_detail: string | null;
+};
+
 export type SnapshotPayloadDTO = {
   current_bars: BarDTO[];
   recent_closed_bars: BarDTO[];
@@ -91,6 +138,11 @@ export type SnapshotPayloadDTO = {
   active_observations: ObservationDTO[];
   feed_status: FeedStatusDTO;
   warnings: DataQualityWarningDTO[];
+  predictions: PredictionDTO[];
+  outcomes: OutcomeDTO[];
+  model_status: ModelStatusDTO;
+  session: string | null;
+  trading_day: string | null;
 };
 
 export type Envelope<T = unknown> = {

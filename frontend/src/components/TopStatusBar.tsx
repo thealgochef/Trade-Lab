@@ -7,6 +7,7 @@ export function TopStatusBar() {
   const connection = useConnection();
   const market = useMarket();
   const tradingDay = runtime.tradingDay ?? '—';
+  const session = runtime.session ?? 'unavailable';
 
   return (
     <header className="top-bar">
@@ -15,7 +16,7 @@ export function TopStatusBar() {
         <strong>NQ / {runtime.requestedSymbol}</strong>
       </div>
       <StatusPill label="Mode" value={runtime.runtimeMode} tone={runtime.runtimeMode === 'replay' ? 'amber' : 'blue'} />
-      <StatusPill label="Session" value="unavailable" />
+      <StatusPill label="Session" value={session} tone={runtime.session ? 'blue' : 'neutral'} />
       <StatusPill label="Trading Day" value={tradingDay} />
       <StatusPill label="Feed" value={runtime.feedState} tone={runtime.feedReady ? 'green' : 'red'} />
       <StatusPill label="API" value={runtime.apiOnline ? 'online' : 'offline'} tone={runtime.apiOnline ? 'green' : 'red'} />

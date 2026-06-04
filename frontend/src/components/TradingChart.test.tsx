@@ -24,7 +24,7 @@ vi.mock('lightweight-charts', () => ({
   createSeriesMarkers: mocks.createSeriesMarkers,
 }));
 
-const chartBar = (key: string, time: number, close: number): ChartBar => ({ key, timeframe: 147, time: time as ChartBar['time'], open: close - 1, high: close + 1, low: close - 2, close, complete: true });
+const chartBar = (key: string, time: number, close: number): ChartBar => ({ key, timeframe: 147, time: time as ChartBar['time'], open: close - 1, high: close + 1, low: close - 2, close, complete: true, openTimeUtc: '2026-05-21T14:00:00Z', closeTimeUtc: '2026-05-21T14:00:10Z' });
 
 const renderChart = (props?: Partial<React.ComponentProps<typeof TradingChart>>) => render(<TradingChart timeframe={147} bars={[]} levels={[]} markers={[]} emptyTitle="empty" emptySubtitle="offline" {...props} />);
 

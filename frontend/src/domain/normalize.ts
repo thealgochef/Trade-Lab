@@ -1,6 +1,6 @@
-import type { LiveStatusDTO, ReplaySourceDTO, ReplayStatusDTO, RuntimeStatusDTO } from '../api/types';
-import type { BarDTO, DataQualityWarningDTO, DisplayLevelDTO, ObservationDTO, TouchDTO } from '../realtime/types';
-import type { LiveStatus, MarketBar, MarketLevel, MarketTouch, Observation, ReplaySource, ReplayStatus, RuntimeSummary, Timeframe, Warning, WarningMetadata } from './models';
+import type { LiveStatusDTO, ModelBundleDTO, ReplaySourceDTO, ReplayStatusDTO, RuntimeStatusDTO } from '../api/types';
+import type { BarDTO, DataQualityWarningDTO, DisplayLevelDTO, ModelStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, TouchDTO } from '../realtime/types';
+import type { LiveStatus, MarketBar, MarketLevel, MarketTouch, ModelBundle, ModelStatus, Observation, Outcome, Prediction, ReplaySource, ReplayStatus, RuntimeSummary, Timeframe, Warning, WarningMetadata } from './models';
 
 // API DTOs stay at the transport boundary; components consume these narrower
 // workstation models so future backend contract changes do not leak everywhere.
@@ -15,7 +15,8 @@ export const normalizeRuntimeStatus = (dto: RuntimeStatusDTO): RuntimeSummary =>
   feedReady: dto.feed_ready,
   feedState: dto.feed_state,
   replayState: dto.replay.state,
-  tradingDay: null,
+  session: dto.session ?? null,
+  tradingDay: dto.trading_day ?? null,
   lastError: dto.replay.last_error,
 });
 
@@ -109,6 +110,80 @@ export const normalizeWarning = (dto: DataQualityWarningDTO): Warning => ({
   timeUtc: dto.event_ts_utc,
   metadata: safeWarningMetadata(dto.metadata),
 });
+
+// Predictions carry only display-safe fields; raw feature vectors stay at the
+// transport boundary and are deliberately dropped from the domain model.
+export const normalizePrediction = (dto: PredictionDTO): Prediction => ({
+  id: dto.prediction_id,
+  touchId: dto.touch_id,
+  observationId: dto.observation_id,
+  timeUtc: dto.event_ts_utc,
+  predictedClass: dto.predicted_class,
+  probabilities: safeProbabilities(dto.probabilities),
+  levelKind: dto.level_kind,
+  levelPriceTicks: dto.level_price_ticks,
+  direction: dto.direction,
+  session: dto.session,
+  eligible: dto.is_eligible,
+  modelId: dto.model_id,
+  contractId: dto.contract_id,
+  nanCount: dto.nan_count,
+  outcome: null,
+});
+
+export const normalizeOutcome = (dto: OutcomeDTO): Outcome => ({
+  id: dto.outcome_id,
+  predictionId: dto.prediction_id,
+  touchId: dto.touch_id,
+  resolutionType: dto.resolution_type,
+  actualClass: dto.actual_class,
+  predictedClass: dto.predicted_class,
+  correct: dto.correct,
+  maxMfePts: dto.max_mfe_pts,
+  maxMaePts: dto.max_mae_pts,
+  barsToResolution: dto.bars_to_resolution,
+  timeUtc: dto.resolved_ts_utc,
+});
+
+export const normalizeModelStatus = (dto: ModelStatusDTO): ModelStatus => ({
+  loaded: dto.loaded,
+  modelId: dto.model_id ?? null,
+  strategyId: dto.strategy_id ?? null,
+  trainingMode: dto.training_mode ?? null,
+  instrument: dto.instrument ?? null,
+  featureNames: Array.isArray(dto.feature_names) ? dto.feature_names.filter((name): name is string => typeof name === 'string') : [],
+  classMap: safeStringRecord(dto.class_map),
+  validationOk: dto.validation_ok,
+  validationDetail: dto.validation_detail ?? null,
+});
+
+export const normalizeModelBundle = (dto: ModelBundleDTO): ModelBundle => ({
+  modelId: dto.model_id,
+  strategyId: dto.strategy_id,
+  trainingMode: dto.training_mode,
+  instrument: dto.instrument,
+  featureCount: dto.feature_count,
+  classMap: safeStringRecord(dto.class_map),
+  hasChecksum: dto.has_checksum,
+  validationOk: dto.validation_ok,
+  validationDetail: dto.validation_detail,
+});
+
+const safeProbabilities = (probabilities: Record<string, number>): Record<string, number> => {
+  const safe: Record<string, number> = {};
+  for (const [key, value] of Object.entries(probabilities ?? {})) {
+    if (typeof value === 'number' && Number.isFinite(value)) safe[key] = value;
+  }
+  return safe;
+};
+
+const safeStringRecord = (record: Record<string, string>): Record<string, string> => {
+  const safe: Record<string, string> = {};
+  for (const [key, value] of Object.entries(record ?? {})) {
+    if (typeof value === 'string') safe[key] = value;
+  }
+  return safe;
+};
 
 const isTimeframe = (value: number): value is Timeframe => [147, 987, 2000].includes(value);
 

@@ -1,0 +1,128 @@
+{
+  "contract_version": "trade_lab_contract_v1",
+  "strategy_id": "NQ_20260405_147t_5m_30m_multiclass-250602-260220-iterations800_depth4",
+  "training_mode": "dashboard_utility",
+  "supported_by_runtime": true,
+  "instrument": "NQ",
+  "tick_size": 0.25,
+  "point_value": 20.0,
+  "model": {
+    "type": "catboost",
+    "loss_function": "MultiClass",
+    "file": "model.cbm"
+  },
+  "feature_set": {
+    "names": [
+      "int_time_beyond_level",
+      "int_time_within_2pts",
+      "int_absorption_ratio",
+      "app_large_trade_vol_pct",
+      "app_avg_trade_size",
+      "app_max_spread"
+    ],
+    "order_is_contractual": true,
+    "interaction_features": [
+      "int_time_beyond_level",
+      "int_time_within_2pts",
+      "int_absorption_ratio"
+    ],
+    "approach_features": [
+      "app_large_trade_vol_pct",
+      "app_avg_trade_size",
+      "app_max_spread"
+    ],
+    "nan_policy": "model_native"
+  },
+  "class_map": {
+    "0": "tradeable_reversal",
+    "1": "trap_reversal",
+    "2": "aggressive_blowthrough"
+  },
+  "session_scheme": {
+    "timezone": "US/Eastern",
+    "trading_day_boundary": "18:00",
+    "sessions": {
+      "asia": {
+        "start": "18:00",
+        "end": "01:00",
+        "crosses_midnight": true
+      },
+      "london": {
+        "start": "01:00",
+        "end": "08:00"
+      },
+      "ny_rth": {
+        "start": "09:30",
+        "end": "16:15"
+      }
+    }
+  },
+  "level_scheme": {
+    "pdh_pdl_source": "prior_day_ny_rth",
+    "session_levels": [
+      "asia_high",
+      "asia_low",
+      "london_high",
+      "london_low",
+      "pdh",
+      "pdl"
+    ],
+    "available_from_guard": true
+  },
+  "touch_rule": {
+    "type": "bar_intersect",
+    "bar_type": "147t",
+    "zone_proximity_pts": 3.0,
+    "zone_representative_price": "mean_of_constituent_levels",
+    "scope": "first_touch_per_zone_per_day",
+    "direction_from_side": {
+      "low": "long",
+      "high": "short"
+    }
+  },
+  "feature_windows": {
+    "interaction_window_minutes": 5,
+    "approach_window_minutes": 30,
+    "within_band_pts": 2.0,
+    "level_proximity_pts": 0.5,
+    "large_trade_threshold": 10,
+    "mid_price_source": "top_of_book"
+  },
+  "label_policy": {
+    "resolution": "mae_first",
+    "entry_reference": "level_representative_price",
+    "tp_points": 15.0,
+    "sl_points": 30.0,
+    "trap_mfe_min": 5.0,
+    "forward_bar_type": "147t",
+    "forward_cutoff": "16:15_US/Eastern_rth_close",
+    "no_resolution_dropped": true
+  },
+  "inference": {
+    "eligible_class": "tradeable_reversal",
+    "eligible_session": "ny_rth",
+    "confidence_gate": 0.7
+  },
+  "data_requirements": {
+    "min_book_level": "L1",
+    "live_schemas": [
+      "trades",
+      "mbp-1"
+    ],
+    "replay_schemas": [
+      "trades",
+      "mbp-1",
+      "mbp-10"
+    ],
+    "depth_usage": "top_of_book_only"
+  },
+  "provenance": {
+    "dataset_config_hash": "89d82fb5",
+    "catboost": {
+      "iterations": 800,
+      "depth": 4,
+      "learning_rate": 0.03,
+      "auto_class_weights": "Balanced"
+    }
+  }
+}

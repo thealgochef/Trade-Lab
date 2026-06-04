@@ -924,3 +924,58 @@ def test_adapter_has_no_real_data_path_hardcoding() -> None:
                 schema="trades",
             )
         )
+
+
+def test_front_month_only_keeps_dominant_outright_and_drops_spreads_and_back_month(
+    tmp_path: Path,
+) -> None:
+    # Real local dumps mix the front-month outright (NQZ1) with back-month outrights
+    # (NQH2) and calendar spreads (NQZ1-NQH2 trading near +/-7). Without filtering, the
+    # spread/back-month prints corrupt candle OHLC and spawn INVALID_PRICE warnings.
+    path = tmp_path / "mbp10_mixed.parquet"
+    base = 1_735_689_600_000_000_000
+    _write_table(
+        path,
+        [
+            {"ts_event": base, "action": "T", "price": "17000.00", "size": 1,
+             "instrument_id": 2770, "symbol": "NQZ1"},
+            {"ts_event": base + 1, "action": "T", "price": "17000.25", "size": 1,
+             "instrument_id": 2770, "symbol": "NQZ1"},
+            {"ts_event": base + 2, "action": "T", "price": "17000.50", "size": 1,
+             "instrument_id": 2770, "symbol": "NQZ1"},
+            {"ts_event": base + 3, "action": "T", "price": "16000.00", "size": 1,
+             "instrument_id": 3541, "symbol": "NQH2"},
+            {"ts_event": base + 4, "action": "T", "price": "7.55", "size": 1,
+             "instrument_id": 23200, "symbol": "NQZ1-NQH2"},
+            {"ts_event": base + 5, "action": "T", "price": "-7.00", "size": 1,
+             "instrument_id": 23200, "symbol": "NQZ1-NQH2"},
+        ],
+    )
+
+    filtered = list(
+        HistoricalParquetAdapter(front_month_only=True).scan(
+            [path], requested_symbol="NQ.c.0", schema="mbp-10"
+        )
+    )
+    unfiltered = list(
+        HistoricalParquetAdapter().scan([path], requested_symbol="NQ.c.0", schema="mbp-10")
+    )
+
+    filtered_trades = [item for item in filtered if isinstance(item, TradeEvent)]
+    assert [trade.price_ticks for trade in filtered_trades] == [68_000, 68_001, 68_002]
+    assert {trade.raw_symbol for trade in filtered_trades} == {"NQZ1"}
+    assert not any(
+        isinstance(item, DataQualityWarning) and item.code == DataQualityCode.INVALID_PRICE
+        for item in filtered
+    )
+
+    # Sanity check that the fixture actually contains contaminating data the filter removed.
+    unfiltered_trade_ticks = {
+        trade.price_ticks for trade in unfiltered if isinstance(trade, TradeEvent)
+    }
+    assert 64_000 in unfiltered_trade_ticks  # back-month NQH2
+    assert -28 in unfiltered_trade_ticks  # tick-aligned spread print
+    assert any(
+        isinstance(item, DataQualityWarning) and item.code == DataQualityCode.INVALID_PRICE
+        for item in unfiltered
+    )

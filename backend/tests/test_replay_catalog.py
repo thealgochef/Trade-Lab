@@ -368,20 +368,21 @@ def test_partitioned_historical_source_start_replays_all_parts(tmp_path: Path) -
         runtime=runtime,
         replay=replay,
     )
-    client = TestClient(app)
+    # Enter the app lifespan so the off-thread replay scan runs to completion while we poll
+    # (a plain TestClient tears its portal down per request and cancels the replay early).
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/replay/start", json={"source_id": "historical:nq:2026-02-24:mbp-10"}
+        )
+        for _ in range(500):
+            if replay.status().state.value == "completed":
+                break
+            time.sleep(0.001)
 
-    response = client.post(
-        "/api/v1/replay/start", json={"source_id": "historical:nq:2026-02-24:mbp-10"}
-    )
-    for _ in range(500):
-        if replay.status().state.value == "completed":
-            break
-        time.sleep(0.001)
-
-    assert response.status_code == 200
-    assert replay.status().events_processed == 2
-    assert response.json()["source_id"] == "historical:nq:2026-02-24:mbp-10"
-    _assert_no_temp_path(response.json(), tmp_path)
+        assert response.status_code == 200
+        assert replay.status().events_processed == 2
+        assert response.json()["source_id"] == "historical:nq:2026-02-24:mbp-10"
+        _assert_no_temp_path(response.json(), tmp_path)
 
 
 def test_date_label_uses_dataset_relative_path_not_absolute_parent_date(tmp_path: Path) -> None:
@@ -727,21 +728,20 @@ def test_start_with_discovered_historical_source_replays_runtime_and_bars(tmp_pa
         replay=replay,
         broadcaster=broadcaster,
     )
-    client = TestClient(app)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/replay/start", json={"source_id": "historical:nq:2026-02-22:trades"}
+        )
+        for _ in range(500):
+            if replay.status().state.value == "completed":
+                break
+            time.sleep(0.001)
 
-    response = client.post(
-        "/api/v1/replay/start", json={"source_id": "historical:nq:2026-02-22:trades"}
-    )
-    for _ in range(500):
-        if replay.status().state.value == "completed":
-            break
-        time.sleep(0.001)
-
-    assert response.status_code == 200
-    assert replay.status().events_processed == 2
-    assert len(runtime.snapshot().recent_closed_bars) == 1
-    assert response.json()["source_id"] == "historical:nq:2026-02-22:trades"
-    _assert_no_temp_path(response.json(), tmp_path)
+        assert response.status_code == 200
+        assert replay.status().events_processed == 2
+        assert len(runtime.snapshot().recent_closed_bars) == 1
+        assert response.json()["source_id"] == "historical:nq:2026-02-22:trades"
+        _assert_no_temp_path(response.json(), tmp_path)
 
 
 def test_start_with_discovered_mbp10_source_replays_trade_actions_only(tmp_path: Path) -> None:
@@ -781,21 +781,20 @@ def test_start_with_discovered_mbp10_source_replays_trade_actions_only(tmp_path:
         runtime=runtime,
         replay=replay,
     )
-    client = TestClient(app)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/replay/start", json={"source_id": "historical:nq:2026-02-22:mbp-10"}
+        )
+        for _ in range(500):
+            if replay.status().state.value == "completed":
+                break
+            time.sleep(0.001)
 
-    response = client.post(
-        "/api/v1/replay/start", json={"source_id": "historical:nq:2026-02-22:mbp-10"}
-    )
-    for _ in range(500):
-        if replay.status().state.value == "completed":
-            break
-        time.sleep(0.001)
-
-    assert response.status_code == 200
-    assert replay.status().events_processed == 4
-    assert len(runtime.snapshot().recent_closed_bars) == 1
-    assert response.json()["source_id"] == "historical:nq:2026-02-22:mbp-10"
-    _assert_no_temp_path(response.json(), tmp_path)
+        assert response.status_code == 200
+        assert replay.status().events_processed == 4
+        assert len(runtime.snapshot().recent_closed_bars) == 1
+        assert response.json()["source_id"] == "historical:nq:2026-02-22:mbp-10"
+        _assert_no_temp_path(response.json(), tmp_path)
 
 
 def test_unknown_stale_and_path_like_historical_ids_are_rejected(tmp_path: Path) -> None:
@@ -867,20 +866,19 @@ def test_invalid_size_warning_source_is_generic_for_catalog_discovered_replay(
         runtime=runtime,
         replay=replay,
     )
-    client = TestClient(app)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/replay/start", json={"source_id": "historical:nq:2026-02-22:trades"}
+        )
+        for _ in range(500):
+            if replay.status().state.value == "completed":
+                break
+            time.sleep(0.001)
 
-    response = client.post(
-        "/api/v1/replay/start", json={"source_id": "historical:nq:2026-02-22:trades"}
-    )
-    for _ in range(500):
-        if replay.status().state.value == "completed":
-            break
-        time.sleep(0.001)
-
-    assert response.status_code == 200
-    assert replay.status().warnings_recorded == 1
-    warnings = runtime.snapshot().warnings
-    assert len(warnings) == 1
-    warning_dto = warning_to_dto(warnings[0])
-    _assert_generic_historical_warning_source(warning_dto.source)
-    _assert_no_temp_path(warning_dto.model_dump(), tmp_path)
+        assert response.status_code == 200
+        assert replay.status().warnings_recorded == 1
+        warnings = runtime.snapshot().warnings
+        assert len(warnings) == 1
+        warning_dto = warning_to_dto(warnings[0])
+        _assert_generic_historical_warning_source(warning_dto.source)
+        _assert_no_temp_path(warning_dto.model_dump(), tmp_path)

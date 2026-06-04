@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { RealtimeClient } from './client';
-import { blotterStore, connectionStore, intelligenceStore, liveStore, marketStore, replayStore, runtimeStore } from '../state/stores';
-import type { BarDTO, DataQualityWarningDTO, Envelope, FeedStatusDTO, ObservationDTO, SnapshotPayloadDTO, TouchDTO } from './types';
+import { blotterStore, connectionStore, intelligenceStore, liveStore, marketStore, predictionStore, replayStore, runtimeStore } from '../state/stores';
+import type { BarDTO, DataQualityWarningDTO, Envelope, FeedStatusDTO, ModelStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, SnapshotPayloadDTO, TouchDTO } from './types';
 import { MAX_BARS_PER_TIMEFRAME } from '../chart/viewModels';
 import { normalizeBar, normalizeWarning } from '../domain/normalize';
 
@@ -38,6 +38,7 @@ const resetStores = () => {
   blotterStore.reset();
   replayStore.reset();
   liveStore.reset();
+  predictionStore.reset();
 };
 
 const feedStatus = (state = 'connected'): FeedStatusDTO => ({
@@ -113,6 +114,53 @@ const observation: ObservationDTO = {
   level_price_ticks: 76000,
 };
 
+const prediction = (overrides: Partial<PredictionDTO> = {}): PredictionDTO => ({
+  prediction_id: 'pred-1',
+  touch_id: 'touch-1',
+  observation_id: 'obs-1',
+  event_ts_utc: '2026-05-21T14:02:00Z',
+  predicted_class: 'continuation',
+  probabilities: { continuation: 0.7, reversal: 0.3 },
+  feature_values: { f0: 1.2, f1: -0.4 },
+  level_kind: 'pdh',
+  level_price_ticks: 76000,
+  direction: 'long',
+  session: 'ny',
+  is_eligible: true,
+  model_id: 'model-a',
+  contract_id: 'NQM6',
+  nan_count: 0,
+  ...overrides,
+});
+
+const outcome = (overrides: Partial<OutcomeDTO> = {}): OutcomeDTO => ({
+  outcome_id: 'out-1',
+  prediction_id: 'pred-1',
+  touch_id: 'touch-1',
+  resolution_type: 'target',
+  actual_class: 'continuation',
+  predicted_class: 'continuation',
+  correct: true,
+  max_mfe_pts: 12.5,
+  max_mae_pts: 3.0,
+  bars_to_resolution: 8,
+  resolved_ts_utc: '2026-05-21T14:10:00Z',
+  ...overrides,
+});
+
+const modelStatus = (overrides: Partial<ModelStatusDTO> = {}): ModelStatusDTO => ({
+  loaded: true,
+  model_id: 'model-a',
+  strategy_id: 'strat-1',
+  training_mode: 'offline',
+  instrument: 'NQ',
+  feature_names: ['f0', 'f1'],
+  class_map: { '0': 'continuation', '1': 'reversal' },
+  validation_ok: true,
+  validation_detail: 'ok',
+  ...overrides,
+});
+
 let sequence = 1;
 const envelope = <T,>(type: Envelope<T>['type'], payload: T): string =>
   JSON.stringify({ version: 'ws.v1', type, sequence: sequence++, server_time_utc: '2026-05-21T14:03:00Z', payload });
@@ -156,6 +204,11 @@ describe('RealtimeClient', () => {
       active_observations: [observation],
       feed_status: feedStatus('connected'),
       warnings: [warning(0)],
+      predictions: [prediction()],
+      outcomes: [outcome()],
+      model_status: modelStatus(),
+      session: 'ny',
+      trading_day: '2026-05-21',
     };
 
     client.start();
@@ -163,7 +216,7 @@ describe('RealtimeClient', () => {
     sockets[0].message(envelope('system.snapshot', snapshot));
 
     expect(connectionStore.getSnapshot()).toMatchObject({ lastSequence: 1, lastServerTimeUtc: '2026-05-21T14:03:00Z' });
-    expect(runtimeStore.getSnapshot()).toMatchObject({ runtimeMode: 'live', requestedSymbol: 'NQ.c.0', feedReady: true, feedState: 'connected' });
+    expect(runtimeStore.getSnapshot()).toMatchObject({ runtimeMode: 'live', requestedSymbol: 'NQ.c.0', feedReady: true, feedState: 'connected', session: 'ny', tradingDay: '2026-05-21' });
     expect(marketStore.getSnapshot().currentBars[0]).toMatchObject({ timeframe: 147, complete: false });
     expect(marketStore.getSnapshot().recentClosedBars[0]).toMatchObject({ timeframe: 987, complete: true });
     expect(intelligenceStore.getSnapshot().levels).toEqual([
@@ -172,6 +225,11 @@ describe('RealtimeClient', () => {
     ]);
     expect(intelligenceStore.getSnapshot().observations[0]).toMatchObject({ id: 'obs-1', status: 'active' });
     expect(intelligenceStore.getSnapshot().warnings[0]).toMatchObject({ code: 'gap-0' });
+    expect(predictionStore.getSnapshot().predictions[0]).toMatchObject({ id: 'pred-1', predictedClass: 'continuation', outcome: expect.objectContaining({ id: 'out-1', correct: true }) });
+    expect(predictionStore.getSnapshot().outcomes[0]).toMatchObject({ id: 'out-1', predictionId: 'pred-1' });
+    expect(predictionStore.getSnapshot().modelStatus).toMatchObject({ loaded: true, modelId: 'model-a' });
+    // Feature vectors stay at the transport boundary and never reach the store.
+    expect(JSON.stringify(predictionStore.getSnapshot().predictions[0])).not.toContain('feature_values');
   });
 
   it('handles heartbeat, feed status, warnings, bars, levels, touches, and observations', () => {
@@ -194,6 +252,48 @@ describe('RealtimeClient', () => {
     expect(intelligenceStore.getSnapshot().levels[0]).toMatchObject({ kind: 'pdl', eligible: true });
     expect(intelligenceStore.getSnapshot().touches[0]).toMatchObject({ id: 'touch-1', createdObservation: true });
     expect(intelligenceStore.getSnapshot().observations[0]).toMatchObject({ id: 'obs-1', levelKind: 'pdh' });
+  });
+
+  it('routes prediction.created, prediction.resolved, and model.status deltas', () => {
+    client.start();
+
+    sockets[0].message(envelope('prediction.created', { prediction: prediction() }));
+    expect(predictionStore.getSnapshot().predictions[0]).toMatchObject({ id: 'pred-1', predictedClass: 'continuation', outcome: null });
+
+    sockets[0].message(envelope('prediction.resolved', { outcome: outcome() }));
+    expect(predictionStore.getSnapshot().outcomes[0]).toMatchObject({ id: 'out-1', predictionId: 'pred-1', correct: true });
+    expect(predictionStore.getSnapshot().predictions[0]).toMatchObject({ id: 'pred-1', outcome: expect.objectContaining({ id: 'out-1' }) });
+
+    sockets[0].message(envelope('model.status', modelStatus({ model_id: 'model-b', loaded: true })));
+    expect(predictionStore.getSnapshot().modelStatus).toMatchObject({ loaded: true, modelId: 'model-b' });
+
+    expect(blotterStore.getSnapshot().events.some((event) => event.message === 'Prediction created')).toBe(true);
+    expect(blotterStore.getSnapshot().events.some((event) => event.message === 'Prediction resolved')).toBe(true);
+    expect(blotterStore.getSnapshot().events.some((event) => event.message === 'Model status updated')).toBe(true);
+  });
+
+  it('bounds recent predictions and outcomes to the newest entries', () => {
+    client.start();
+
+    for (let index = 0; index < 105; index += 1) {
+      sockets[0].message(envelope('prediction.created', { prediction: prediction({ prediction_id: `pred-${index}` }) }));
+    }
+
+    expect(predictionStore.getSnapshot().predictions).toHaveLength(100);
+    expect(predictionStore.getSnapshot().predictions[0]).toMatchObject({ id: 'pred-104' });
+    expect(predictionStore.getSnapshot().predictions.at(-1)).toMatchObject({ id: 'pred-5' });
+  });
+
+  it('clears predictions and outcomes when a runtime reset feed status arrives', () => {
+    client.start();
+    sockets[0].message(envelope('prediction.created', { prediction: prediction() }));
+    sockets[0].message(envelope('prediction.resolved', { outcome: outcome() }));
+    expect(predictionStore.getSnapshot().predictions).toHaveLength(1);
+
+    sockets[0].message(envelope('feed.status', { ...feedStatus('disconnected'), mode: 'idle', last_message: 'runtime reset for live market data' }));
+
+    expect(predictionStore.getSnapshot().predictions).toHaveLength(0);
+    expect(predictionStore.getSnapshot().outcomes).toHaveLength(0);
   });
 
   it('converts provider warning metadata into blotter code, source, and safe details only', () => {

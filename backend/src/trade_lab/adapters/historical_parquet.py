@@ -13,6 +13,8 @@ from itertools import count
 from pathlib import Path
 from typing import Any
 
+import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from trade_lab.domain.data_quality import DataQualityCode, DataQualitySeverity, DataQualityWarning
@@ -81,6 +83,7 @@ class HistoricalParquetAdapter:
         batch_size: int = DEFAULT_BATCH_SIZE,
         dataset_label: str | None = None,
         ignored_column_sample_size: int = DEFAULT_IGNORED_COLUMN_SAMPLE_SIZE,
+        front_month_only: bool = False,
     ) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -89,6 +92,13 @@ class HistoricalParquetAdapter:
         self.batch_size = batch_size
         self.dataset_label = dataset_label
         self.ignored_column_sample_size = ignored_column_sample_size
+        # Local Databento dumps for a parent symbol mix the front-month outright with
+        # back-month outrights and calendar spreads (e.g. NQZ1, NQH2, NQZ1-NQH2). Tick
+        # bars must track a single continuous front-month outright, so this opt-in flag
+        # drops spread symbols and keeps only the dominant outright instrument. It stays
+        # off for the bare adapter so single-instrument test fixtures are unaffected.
+        self.front_month_only = front_month_only
+        self._front_month_cache: dict[str, int | None] = {}
 
     def scan(
         self,
@@ -206,10 +216,16 @@ class HistoricalParquetAdapter:
             )
             return
 
+        front_month_id = (
+            self._front_month_instrument_id(path, names) if self.front_month_only else None
+        )
+
         for batch in parquet.iter_batches(columns=selected, batch_size=self.batch_size):
             batch_events: list[TradeEvent | TopOfBookEvent] = []
             batch_warnings: list[DataQualityWarning] = []
             for row in batch.to_pylist():
+                if self.front_month_only and self._is_off_front_month_row(row, front_month_id):
+                    continue
                 normalized = normalizer(
                     row,
                     requested_symbol=requested_symbol,
@@ -374,6 +390,70 @@ class HistoricalParquetAdapter:
             if row.get(name) is not None:
                 return row[name]
         return None
+
+    def _front_month_instrument_id(self, path: Path, names: set[str]) -> int | None:
+        cache_key = str(path)
+        if cache_key not in self._front_month_cache:
+            self._front_month_cache[cache_key] = self._resolve_front_month_instrument_id(
+                path, names
+            )
+        return self._front_month_cache[cache_key]
+
+    def _resolve_front_month_instrument_id(self, path: Path, names: set[str]) -> int | None:
+        """Pick the dominant outright instrument by trade count via a narrow column scan.
+
+        Spread symbols (containing ``-``) are excluded so a spread can never win. When
+        ``instrument_id`` is absent the adapter cannot disambiguate instruments, so it
+        returns ``None`` and leaves the stream unfiltered (the spread-symbol guard in
+        ``_is_off_front_month_row`` still applies). Only ``action``, ``instrument_id``,
+        and ``symbol`` are read and the count is done with vectorized PyArrow compute so
+        resolution stays fast and never blocks the replay event loop on large files.
+        """
+
+        if "instrument_id" not in names:
+            return None
+        columns = [name for name in ("action", "instrument_id", "symbol") if name in names]
+        table = pq.read_table(path, columns=columns)
+        if table.num_rows == 0:
+            return None
+        mask: pa.Array | None = None
+        if "action" in names:
+            action = pc.utf8_lower(pc.cast(table["action"], pa.string()))
+            mask = pc.is_in(action, value_set=pa.array(["t", "trade"]))
+        if "symbol" in names:
+            not_spread = pc.invert(pc.match_substring(pc.cast(table["symbol"], pa.string()), "-"))
+            mask = not_spread if mask is None else pc.and_(mask, not_spread)
+        instruments = table["instrument_id"]
+        if mask is not None:
+            instruments = instruments.filter(mask)
+        instruments = instruments.drop_null().combine_chunks()
+        if len(instruments) == 0:
+            return None
+        value_counts = pc.value_counts(instruments)
+        values = value_counts.field("values").to_pylist()
+        counts = value_counts.field("counts").to_pylist()
+        ranked = [
+            (count, value)
+            for value, count in zip(values, counts, strict=True)
+            if value is not None
+        ]
+        if not ranked:
+            return None
+        return int(max(ranked)[1])
+
+    def _is_off_front_month_row(self, row: dict[str, Any], front_month_id: int | None) -> bool:
+        if self._is_spread_symbol(row.get("symbol")):
+            return True
+        if front_month_id is None:
+            return False
+        instrument = row.get("instrument_id")
+        if not isinstance(instrument, int) or isinstance(instrument, bool):
+            return True
+        return instrument != front_month_id
+
+    @staticmethod
+    def _is_spread_symbol(value: Any) -> bool:
+        return value is not None and "-" in str(value)
 
     @staticmethod
     def _is_trade_action(value: Any) -> bool:

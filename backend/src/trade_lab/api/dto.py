@@ -15,8 +15,11 @@ from trade_lab.domain.data_quality import DataQualityWarning
 from trade_lab.domain.feed import FeedConnectionState, FeedStatus
 from trade_lab.domain.levels import DisplayLevel, TouchEvent
 from trade_lab.domain.observations import Observation
+from trade_lab.domain.outcomes import Outcome
+from trade_lab.services.inference.inference_engine import Prediction
+from trade_lab.services.model_registry import ModelBundle
 from trade_lab.services.replay import ReplayStatus
-from trade_lab.services.runtime import RuntimeSnapshot
+from trade_lab.services.runtime import ModelStatus, RuntimeSnapshot
 
 MESSAGE_VERSION = "ws.v1"
 MessageType = Literal[
@@ -29,6 +32,9 @@ MessageType = Literal[
     "observation.updated",
     "data_quality.warning",
     "feed.status",
+    "prediction.created",
+    "prediction.resolved",
+    "model.status",
 ]
 
 
@@ -90,6 +96,66 @@ class ObservationDTO(ApiModel):
     level_price_ticks: int
 
 
+class PredictionDTO(ApiModel):
+    prediction_id: str
+    touch_id: str
+    observation_id: str
+    event_ts_utc: datetime
+    predicted_class: str
+    probabilities: dict[str, float]
+    feature_values: dict[str, float]
+    level_kind: str
+    level_price_ticks: int
+    direction: str
+    session: str
+    is_eligible: bool
+    model_id: str
+    contract_id: str
+    nan_count: int
+
+
+class OutcomeDTO(ApiModel):
+    outcome_id: str
+    prediction_id: str
+    touch_id: str
+    resolution_type: str
+    actual_class: str
+    predicted_class: str
+    correct: bool
+    max_mfe_pts: float
+    max_mae_pts: float
+    bars_to_resolution: int
+    resolved_ts_utc: datetime
+
+
+class ModelStatusDTO(ApiModel):
+    """Active model status for the UI. Path-free and secret-free by construction."""
+
+    loaded: bool
+    model_id: str | None = None
+    strategy_id: str | None = None
+    training_mode: str | None = None
+    instrument: str | None = None
+    feature_names: list[str] = Field(default_factory=list)
+    class_map: dict[int, str] = Field(default_factory=dict)
+    validation_ok: bool = False
+    validation_detail: str | None = None
+
+
+class ModelBundleDTO(ApiModel):
+    """Opaque descriptor for one discovered model bundle (never any path)."""
+
+    model_id: str
+    strategy_id: str
+    training_mode: str
+    instrument: str
+    feature_count: int
+    class_map: dict[int, str]
+    has_checksum: bool
+    validation_ok: bool
+    validation_detail: str
+
+
 class FeedStatusDTO(ApiModel):
     state: str
     mode: str
@@ -118,6 +184,11 @@ class SnapshotPayload(ApiModel):
     active_observations: list[ObservationDTO] = Field(default_factory=list)
     feed_status: FeedStatusDTO
     warnings: list[DataQualityWarningDTO] = Field(default_factory=list)
+    predictions: list[PredictionDTO] = Field(default_factory=list)
+    outcomes: list[OutcomeDTO] = Field(default_factory=list)
+    model_status: ModelStatusDTO
+    session: str | None = None
+    trading_day: date | None = None
 
 
 class ReplayStatusDTO(ApiModel):
@@ -210,6 +281,70 @@ def observation_to_dto(observation: Observation) -> ObservationDTO:
     )
 
 
+def prediction_to_dto(prediction: Prediction) -> PredictionDTO:
+    return PredictionDTO(
+        prediction_id=prediction.prediction_id,
+        touch_id=prediction.touch_id,
+        observation_id=prediction.observation_id,
+        event_ts_utc=prediction.event_ts_utc,
+        predicted_class=prediction.predicted_class,
+        probabilities=dict(prediction.probabilities),
+        feature_values=dict(prediction.feature_values),
+        level_kind=prediction.level_kind,
+        level_price_ticks=prediction.level_price_ticks,
+        direction=prediction.direction,
+        session=prediction.session,
+        is_eligible=prediction.is_eligible,
+        model_id=prediction.model_id,
+        contract_id=prediction.contract_id,
+        nan_count=prediction.nan_count,
+    )
+
+
+def outcome_to_dto(outcome: Outcome) -> OutcomeDTO:
+    return OutcomeDTO(
+        outcome_id=outcome.outcome_id,
+        prediction_id=outcome.prediction_id,
+        touch_id=outcome.touch_id,
+        resolution_type=outcome.resolution_type.value,
+        actual_class=outcome.actual_class,
+        predicted_class=outcome.predicted_class,
+        correct=outcome.correct,
+        max_mfe_pts=outcome.max_mfe_pts,
+        max_mae_pts=outcome.max_mae_pts,
+        bars_to_resolution=outcome.bars_to_resolution,
+        resolved_ts_utc=outcome.resolved_ts_utc,
+    )
+
+
+def model_status_to_dto(status: ModelStatus) -> ModelStatusDTO:
+    return ModelStatusDTO(
+        loaded=status.loaded,
+        model_id=status.model_id,
+        strategy_id=status.strategy_id,
+        training_mode=status.training_mode,
+        instrument=status.instrument,
+        feature_names=list(status.feature_names),
+        class_map=dict(status.class_map),
+        validation_ok=status.validation_ok,
+        validation_detail=status.validation_detail,
+    )
+
+
+def model_bundle_to_dto(bundle: ModelBundle) -> ModelBundleDTO:
+    return ModelBundleDTO(
+        model_id=bundle.model_id,
+        strategy_id=bundle.strategy_id,
+        training_mode=bundle.training_mode,
+        instrument=bundle.instrument,
+        feature_count=bundle.feature_count,
+        class_map=dict(bundle.class_map),
+        has_checksum=bundle.has_checksum,
+        validation_ok=bundle.validation_ok,
+        validation_detail=bundle.validation_detail,
+    )
+
+
 def feed_status_to_dto(status: FeedStatus) -> FeedStatusDTO:
     return FeedStatusDTO(
         state=status.state.value,
@@ -263,6 +398,11 @@ def snapshot_payload_from_runtime(snapshot: RuntimeSnapshot) -> SnapshotPayload:
         active_observations=[observation_to_dto(obs) for obs in snapshot.active_observations],
         feed_status=feed_status_to_dto(snapshot.feed_status),
         warnings=[warning_to_dto(warning) for warning in snapshot.warnings],
+        predictions=[prediction_to_dto(prediction) for prediction in snapshot.predictions],
+        outcomes=[outcome_to_dto(outcome) for outcome in snapshot.outcomes],
+        model_status=model_status_to_dto(snapshot.model_status),
+        session=snapshot.session,
+        trading_day=snapshot.trading_day,
     )
 
 
@@ -273,8 +413,17 @@ def empty_snapshot_payload(*, requested_symbol: str | None) -> SnapshotPayload:
             mode="idle",
             requested_symbol=requested_symbol,
             last_message="Market-data feed is not started in Phase 2B.",
-        )
+        ),
+        model_status=ModelStatusDTO(loaded=False),
     )
+
+
+def prediction_payload(prediction: Prediction) -> dict[str, Any]:
+    return {"prediction": prediction_to_dto(prediction).model_dump(mode="json")}
+
+
+def outcome_payload(outcome: Outcome) -> dict[str, Any]:
+    return {"outcome": outcome_to_dto(outcome).model_dump(mode="json")}
 
 
 def make_envelope(

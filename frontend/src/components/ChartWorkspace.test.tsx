@@ -2,8 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, render } from '@testing-library/react';
 import { ChartWorkspace } from './ChartWorkspace';
 import { RealtimeClient } from '../realtime/client';
-import { blotterStore, connectionStore, intelligenceStore, marketStore, runtimeStore } from '../state/stores';
-import type { BarDTO, DisplayLevelDTO, Envelope, FeedStatusDTO, ObservationDTO, TouchDTO } from '../realtime/types';
+import { blotterStore, connectionStore, intelligenceStore, marketStore, predictionStore, runtimeStore } from '../state/stores';
+import type { BarDTO, DisplayLevelDTO, Envelope, FeedStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, TouchDTO } from '../realtime/types';
 import type { TradingChart } from './TradingChart';
 
 const chartMock = vi.hoisted(() => ({
@@ -33,6 +33,7 @@ const resetStores = () => {
   marketStore.reset();
   intelligenceStore.reset();
   blotterStore.reset();
+  predictionStore.reset();
 };
 
 const bar = (timeframe = 147, complete = false, overrides: Partial<BarDTO> = {}): BarDTO => ({
@@ -86,6 +87,38 @@ const observation: ObservationDTO = {
   session: 'ny',
   level_kind: 'pdh',
   level_price_ticks: 76000,
+};
+
+const predictionDto: PredictionDTO = {
+  prediction_id: 'pred-1',
+  touch_id: 'touch-1',
+  observation_id: 'obs-1',
+  event_ts_utc: '2026-05-21T14:00:30Z',
+  predicted_class: 'up',
+  probabilities: { down: 0.1, hold: 0.3, up: 0.6 },
+  feature_values: { dist_to_level: 1.2 },
+  level_kind: 'pdh',
+  level_price_ticks: 76000,
+  direction: 'long',
+  session: 'ny',
+  is_eligible: true,
+  model_id: 'model-alpha',
+  contract_id: 'contract-1',
+  nan_count: 0,
+};
+
+const outcomeDto: OutcomeDTO = {
+  outcome_id: 'outcome-1',
+  prediction_id: 'pred-1',
+  touch_id: 'touch-1',
+  resolution_type: 'mae_first',
+  actual_class: 'up',
+  predicted_class: 'up',
+  correct: true,
+  max_mfe_pts: 12.5,
+  max_mae_pts: 3.25,
+  bars_to_resolution: 8,
+  resolved_ts_utc: '2026-05-21T14:05:00Z',
 };
 
 const feedStatus = (state = 'connected'): FeedStatusDTO => ({
@@ -167,10 +200,28 @@ describe('ChartWorkspace realtime chart dataflow', () => {
     act(() => sockets[0].message(envelope('levels.updated', { levels: [level] })));
     expect(lastChartProps().levels).toEqual([expect.objectContaining({ id: 'pdh:76000:2026-05-21:ny', price: 19000, eligible: true })]);
 
+    // Markers anchor onto the bar containing their event, so a bar must exist first.
+    act(() => sockets[0].message(envelope('market.bar.updated', { bars: [bar(147, false)] })));
     act(() => sockets[0].message(envelope('touch.detected', touch)));
     act(() => sockets[0].message(envelope('observation.updated', observation)));
 
     expect(lastChartProps().markers.map((marker) => marker.id)).toEqual(['touch:touch-1', 'observation:obs-1']);
+  });
+
+  it('adds prediction and outcome markers anchored to the touch bar', () => {
+    render(<ChartWorkspace />);
+    act(() => client.start());
+
+    act(() => sockets[0].message(envelope('market.bar.updated', { bars: [bar(147, false)] })));
+    act(() => sockets[0].message(envelope('prediction.created', { prediction: predictionDto })));
+
+    expect(lastChartProps().markers.map((marker) => marker.id)).toContain('prediction:pred-1');
+
+    act(() => sockets[0].message(envelope('prediction.resolved', { outcome: outcomeDto })));
+
+    const ids = lastChartProps().markers.map((marker) => marker.id);
+    expect(ids).toContain('prediction:pred-1');
+    expect(ids).toContain('outcome:outcome-1');
   });
 
   it('does not change chart bars or overlays on heartbeat and feed-status messages', () => {
