@@ -1,0 +1,43 @@
+name: backend-ci
+
+# Cold-install CI: catches dependency/portability regressions that PYTHONPATH-based
+# local runs miss — e.g. a git+ssh strategy-core pin (no SSH key on a fresh runner)
+# or an undeclared test dependency. Runs on pushes to main and on PRs.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: backend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: backend (cold install + ruff + pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Clean install from scratch. This resolves the strategy-core dependency from
+      # its git+https pin against the public Strategy-Core repo (anonymous, no key or
+      # token) and installs all runtime + dev dependencies. A git+ssh pin or a missing
+      # test dependency (e.g. pytest-asyncio) fails here rather than silently in prod.
+      - name: Install (cold)
+        run: pip install -e ".[dev]"
+
+      - name: Lint (ruff)
+        run: ruff check src tests
+
+      - name: Test (pytest)
+        run: pytest -q
