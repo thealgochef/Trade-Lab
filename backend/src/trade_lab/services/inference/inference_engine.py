@@ -155,7 +155,16 @@ class InferenceEngine:
     ) -> Prediction:
         contract = active.contract
         reference_price = Decimal(observation.level_price_ticks) * Decimal(str(contract.tick_size))
-        direction = _direction_from_contract(contract, observation.level_kind.value)
+        # audit #NN-1: consume the authoritative direction carried from the Strategy-Core
+        # touch (observation.direction) rather than re-deriving it from level_kind
+        # (= zone.names[0]), which inverts for mixed-side merged zones. The domain and
+        # inference LevelDirection share the long/short value convention, so a by-value
+        # rebuild lines the types up. Fall back to the contract-derived direction only for
+        # legacy observations that carry no direction.
+        if observation.direction is not None:
+            direction = LevelDirection(observation.direction.value)
+        else:
+            direction = _direction_from_contract(contract, observation.level_kind.value)
         level_ctx = LevelContext.from_contract(
             contract, reference_price=reference_price, direction=direction
         )

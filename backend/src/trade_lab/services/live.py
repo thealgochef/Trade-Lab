@@ -105,6 +105,10 @@ class LiveMarketDataService:
         self._task: asyncio.Task[None] | None = None
         self.strategy_core_live: CoreLiveRuntime | None = None
         self._seed_task: asyncio.Task[None] | None = None
+        # audit #NN-5: monotonic token identifying the current live/runtime generation.
+        # Each start() bumps it; an in-flight warm-up seed task carries the generation it
+        # was started for and no-ops if a disconnect+restart has since reset the runtime.
+        self._generation = 0
         self._feed: MarketDataFeed | None = None
         self._lock = asyncio.Lock()
 
@@ -169,6 +173,14 @@ class LiveMarketDataService:
             self._started_at_utc = datetime.now(UTC)
             self._stopped_at_utc = None
             self.strategy_core_live = None
+            # audit #NN-5: a restart resets the runtime below, so any warm-up seed task
+            # left running from a prior (auto-disconnected) connection is now stale. Bump
+            # the generation token and cancel the orphan so it cannot inject stale bars
+            # into the freshly reset runtime; the generation guard in _seed_and_broadcast
+            # is the backstop if the cancel loses the race with an in-flight fetch.
+            self._generation += 1
+            if self._seed_task is not None and not self._seed_task.done():
+                self._seed_task.cancel()
             if self.config.reset_runtime_on_start:
                 await self._emit(
                     self.runtime.reset(
@@ -221,7 +233,11 @@ class LiveMarketDataService:
             # connection is never blocked by the historical fetch. It is scheduled after
             # the runtime reset above so its bars are not cleared by the reset.
             if self._seed_service is not None and self._seed_service.enabled:
-                self._seed_task = asyncio.create_task(self._seed_and_broadcast())
+                # audit #NN-5: bind this seed task to the current generation so it can
+                # detect (and skip) seeding if a later restart resets the runtime.
+                self._seed_task = asyncio.create_task(
+                    self._seed_and_broadcast(self._generation)
+                )
             self._task = asyncio.create_task(self._wait_strategy_core_live())
 
     async def stop(self) -> None:
@@ -263,12 +279,27 @@ class LiveMarketDataService:
         self._stopped_at_utc = status.stopped_at_utc
         if status.state == CoreLiveState.DISCONNECTED and self._state == LiveState.RUNNING:
             self._state = LiveState.DISCONNECTED
+            # audit #NN-5: deliberately do NOT cancel self._seed_task here. A bare
+            # disconnect does not reset the runtime, so an in-flight warm-up is still
+            # valid for the current generation (the empty-feed-then-seed path relies on
+            # this). The orphaning race is closed instead at restart (start() cancels +
+            # bumps the generation) and by the generation guard in _seed_and_broadcast.
             await self._emit_status(FeedConnectionState.DISCONNECTED, "live feed disconnected")
         elif status.state == CoreLiveState.FAILED:
             self._state = LiveState.FAILED
+            # audit #N6: the migration dropped the old failure logger.error call, so a
+            # mid-stream live failure became invisible. Restore observable, secret-safe
+            # logging: status.last_message is already safe_text-redacted by Strategy-Core,
+            # and we additionally strip configured secret VALUES via the still-present
+            # _redact_configured_secrets helper so credentials are never leaked.
+            logger.error(
+                "live feed failed: exception_type=%s message=%s",
+                status.last_error,
+                _redact_configured_secrets(status.last_message, self.config.secret_values),
+            )
             await self._emit_status(FeedConnectionState.DISCONNECTED, "live feed failed")
 
-    async def _seed_and_broadcast(self) -> None:
+    async def _seed_and_broadcast(self, generation: int) -> None:
         service = self._seed_service
         if service is None:
             return
@@ -281,6 +312,12 @@ class LiveMarketDataService:
                 "historical warm-up seeding task failed: exception_type=%s", type(exc).__name__
             )
             bars = ()
+        # audit #NN-5: history fetch above runs off-thread and can outlive its
+        # connection. If a disconnect+restart advanced the generation while we were
+        # fetching, this task belongs to a torn-down runtime; drop the result rather
+        # than seed (possibly stale) bars or warnings into the freshly reset runtime.
+        if generation != self._generation:
+            return
         if bars:
             logger.info("historical warm-up seeded %d bars", len(bars))
             await self._emit(self.runtime.seed_closed_bars(bars))

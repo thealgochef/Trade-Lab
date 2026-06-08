@@ -24,6 +24,22 @@ class LevelKind(StrEnum):
     NY_LOW = "ny_low"
 
 
+class LevelDirection(StrEnum):
+    """Trade direction implied by which side of the level was touched.
+
+    audit #NN-1: this is the authoritative direction Strategy-Core resolves on the
+    MERGED ZONE side (low touch -> long, high touch -> short) and carries on
+    ``Touch.direction``. It must be carried through the touch -> observation ->
+    inference path rather than re-derived from ``level_kind`` (= ``zone.names[0]``,
+    the lowest-priced constituent), which inverts for mixed-side merged zones. The
+    ``long``/``short`` values match the inference ``LevelDirection`` convention so
+    the service layer maps between the two by value with no translation table.
+    """
+
+    LONG = "long"
+    SHORT = "short"
+
+
 SESSION_LEVELS: dict[SessionName, tuple[LevelKind, LevelKind]] = {
     SessionName.ASIA: (LevelKind.ASIA_HIGH, LevelKind.ASIA_LOW),
     SessionName.LONDON: (LevelKind.LONDON_HIGH, LevelKind.LONDON_LOW),
@@ -66,6 +82,9 @@ class TouchEvent:
     instrument_id: int | None
     created_observation: bool = True
     sequence_in_session: int = 1
+    # audit #NN-1: authoritative direction carried from Strategy-Core's Touch.direction.
+    # Defaults to None so existing constructions keep working; the adapter always sets it.
+    direction: LevelDirection | None = None
 
 
 @dataclass(frozen=True, slots=True)

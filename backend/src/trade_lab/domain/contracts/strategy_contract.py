@@ -10,12 +10,16 @@ the contract that later inference stages consume.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
+import strategy_core
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 CONTRACT_VERSION = "trade_lab_contract_v1"
+
+logger = logging.getLogger(__name__)
 
 
 class ContractError(ValueError):
@@ -157,6 +161,11 @@ class StrategyContract(_ContractModel):
     """A fully parsed, validated ``strategy.json`` for one model bundle."""
 
     contract_version: str = Field(min_length=1, max_length=64)
+    # audit N1: the Strategy-Core engine that produced this bundle. Optional so
+    # legacy bundles (authored before engine binding) still parse; the loader
+    # fails closed in load_strategy_contract when it is present but does not match
+    # the running strategy_core.ENGINE_VERSION.
+    engine_version: str | None = Field(default=None, max_length=64)
     strategy_id: str = Field(min_length=1, max_length=256)
     training_mode: str = Field(min_length=1, max_length=64)
     supported_by_runtime: bool
@@ -213,5 +222,23 @@ def load_strategy_contract(path: Path | str) -> StrategyContract:
         contract = StrategyContract.model_validate(payload)
     except ValueError as exc:
         raise ContractError(f"invalid strategy contract: {exc}") from exc
+
+    # audit N1: bind the bundle to the running engine. A bundle that declares an
+    # engine_version the runtime cannot match must never serve predictions, so we
+    # fail closed here. A legacy bundle (no engine_version) still loads but is
+    # flagged unbound so the gap is visible rather than silent.
+    if (
+        contract.engine_version is not None
+        and contract.engine_version != strategy_core.ENGINE_VERSION
+    ):
+        raise ContractError(
+            f"unsupported engine_version {contract.engine_version!r}; "
+            f"expected {strategy_core.ENGINE_VERSION!r}"
+        )
+    if contract.engine_version is None:
+        logger.warning(
+            "strategy contract has no engine_version; loading unbound against %s",
+            strategy_core.ENGINE_VERSION,
+        )
 
     return contract

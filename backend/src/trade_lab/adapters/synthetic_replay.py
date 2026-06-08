@@ -70,9 +70,15 @@ def _nq_demo_events(requested_symbol: str) -> Iterator[MarketEvent]:
             metadata={"source": "synthetic:nq-demo"},
         )
 
+    # London oscillates across a wide 68_000..68_040 band that repeatedly straddles
+    # the 68_020 Asia high. Because London's own session extremes (68_000 / 68_040)
+    # sit >3 pts from 68_020, the asia_high zone stays isolated under Strategy-Core's
+    # zone-merge band, so the engine-v3 availability guard (which would otherwise
+    # inherit London's later close instant and gate the touch) lets the first
+    # post-Asia-close London bar record the return touch and observation.
     london_start = datetime(2026, 1, 5, 8, 0, tzinfo=UTC)
     for i in range(2_120):
-        price = 68_020 if i == 3 else 68_010 + ((i * 7) % 8)
+        price = 68_000 + (i % 41)
         yield TradeEvent(
             event_ts_utc=london_start + timedelta(seconds=i),
             receive_ts_utc=None,

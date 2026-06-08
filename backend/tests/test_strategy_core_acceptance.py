@@ -38,11 +38,16 @@ def test_trade_lab_runtime_touch_matches_strategy_core_direct_runtime() -> None:
         tick_timeframes=(2,),
         observation_duration_seconds=300,
     )
+    # Asia sets a high at 68_020 (5 pts above its 68_000 low, so the two stay in
+    # separate zones). The London return bar straddles 68_020 with a wide range
+    # (68_007..68_033) so London's own session extremes land >3 pts from 68_020 and
+    # do NOT merge into the asia_high zone -- otherwise the engine-v3 availability
+    # guard would inherit London's later close instant and gate the touch.
     events = (
         (datetime(2026, 1, 5, 0, 0, tzinfo=UTC), 68_000),
         (datetime(2026, 1, 5, 0, 0, 1, tzinfo=UTC), 68_020),
-        (datetime(2026, 1, 5, 8, 0, tzinfo=UTC), 68_018),
-        (datetime(2026, 1, 5, 8, 0, 1, tzinfo=UTC), 68_022),
+        (datetime(2026, 1, 5, 8, 0, tzinfo=UTC), 68_007),
+        (datetime(2026, 1, 5, 8, 0, 1, tzinfo=UTC), 68_033),
     )
 
     core_update = None

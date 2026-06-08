@@ -22,11 +22,11 @@ until the runbook checks are performed and recorded.
 
 Latest verification:
 
-- Backend full pytest: `421 passed, 2 skipped`.
+- Backend full pytest: `435 passed, 1 skipped` (436 total).
 - Backend ruff: all checks passed.
 - Benchmark gate: passed.
 - Frontend lint, typecheck, test, and build: passed.
-- Frontend tests: `97 passed`.
+- Frontend tests: `137 passed`.
 
 ## Phase Scope
 

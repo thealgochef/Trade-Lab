@@ -20,6 +20,7 @@ from strategy_core.runtime.state import RuntimeUpdate as CoreUpdate
 from strategy_core.runtime.state import StrategyRuntime
 from strategy_core.types import Bar as CoreBar
 from strategy_core.types import CloseReason as CoreCloseReason
+from strategy_core.types import Direction as CoreDirection
 from strategy_core.types import Level as CoreLevel
 from strategy_core.types import Quote as CoreQuote
 from strategy_core.types import Touch as CoreTouch
@@ -27,9 +28,9 @@ from strategy_core.types import Trade as CoreTrade
 
 from trade_lab.domain.candles import Candle, CandleCloseReason
 from trade_lab.domain.data_quality import DataQualityWarning
-from trade_lab.domain.events import MarketEvent, TopOfBookEvent, TradeEvent
+from trade_lab.domain.events import MarketEvent, TopOfBookEvent, TradeEvent, TradeSide
 from trade_lab.domain.feed import FeedConnectionState, FeedStatus
-from trade_lab.domain.levels import DisplayLevel, LevelKind, TouchEvent
+from trade_lab.domain.levels import DisplayLevel, LevelDirection, LevelKind, TouchEvent
 from trade_lab.domain.prices import NQ_TICK_SIZE
 from trade_lab.domain.sessions import SessionName
 
@@ -38,6 +39,26 @@ __all__ = [
     "StrategyCoreSnapshot",
     "StrategyCoreUpdate",
 ]
+
+# audit #NN-1: Strategy-Core's Touch.direction is authoritative — it is resolved on the
+# MERGED ZONE side (low -> LONG, high -> SHORT), NOT on level_kind (= zone.names[0], the
+# lowest-priced constituent), so for a mixed-side merged zone re-deriving from level_kind
+# inverts it. Map the Core Direction straight onto the Trade-Lab LevelDirection and carry
+# it on the TouchEvent.
+_CORE_DIRECTION_TO_TRADE_LAB: dict[CoreDirection, LevelDirection] = {
+    CoreDirection.LONG: LevelDirection.LONG,
+    CoreDirection.SHORT: LevelDirection.SHORT,
+}
+
+# audit #7: encode the trade aggressor side using the canonical databento codes
+# (strategy_core.constants: 'B' = buy, 'A' = sell, 'N' = none/unknown). The previous
+# event.side.value.upper()[0] slicing produced 'S' for sell and 'U' for unknown, which
+# are not databento codes and would mis-signal any side-aware order-flow feature.
+_TRADE_SIDE_TO_CORE: dict[TradeSide, str] = {
+    TradeSide.BUY: "B",
+    TradeSide.SELL: "A",
+    TradeSide.UNKNOWN: "N",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,10 +99,13 @@ class StrategyCoreService:
         self._runtime = StrategyRuntime(
             requested_symbol=requested_symbol,
             timeframes=self._display_timeframes,
-            # StrategyRuntime defaults the decision bar to the smallest configured
-            # timeframe. With the production Trade-Lab defaults this is the 147t
-            # contract bar, preserving Strategy-Core bar-range touch semantics instead
-            # of reverting to a one-print exact-touch path.
+            # audit #5: PIN the decision bar to the smallest configured timeframe
+            # explicitly instead of relying on StrategyRuntime's implicit min() fallback.
+            # With the production Trade-Lab defaults this is the 147t contract bar,
+            # preserving Strategy-Core bar-range touch semantics. Pinning it means a
+            # future SMALLER display timeframe cannot silently shrink the decision bar
+            # and degenerate the bar-range touch back to a one-print exact-touch path.
+            decision_timeframe=min(self._display_timeframes),
             recent_closed_bar_limit=recent_closed_bar_limit,
             warning_limit=warning_limit,
         )
@@ -217,11 +241,17 @@ class StrategyCoreService:
             instrument_id=None if last_trade is None else last_trade.instrument_id,
             created_observation=True,
             sequence_in_session=sequence,
+            # audit #NN-1: carry the authoritative Strategy-Core direction instead of
+            # leaving downstream to re-derive it from level_kind (which inverts for
+            # mixed-side merged zones).
+            direction=_CORE_DIRECTION_TO_TRADE_LAB[touch.direction],
         )
 
 
 def _trade_to_core(event: TradeEvent) -> CoreTrade:
-    side = None if event.side is None else event.side.value.upper()[0]
+    # audit #7: map to canonical databento aggressor codes (B/A/N), not first-letter
+    # slicing of the TradeSide value (which gave 'S'/'U' for sell/unknown).
+    side = None if event.side is None else _TRADE_SIDE_TO_CORE[event.side]
     return CoreTrade(
         event_ts_utc=event.event_ts_utc,
         price_ticks=event.price_ticks,

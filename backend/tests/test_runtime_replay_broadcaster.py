@@ -131,10 +131,14 @@ def test_trade_events_advance_levels_touches_and_observations() -> None:
     runtime = _runtime()
 
     runtime.process_market_event(_trade(0, price_ticks=68_000))
-    # Keep the Asia high outside Strategy-Core's 3-point zone-merge band so this
-    # integration test isolates Trade-Lab touch/observation plumbing instead of
+    # Keep the Asia high (68_020) outside Strategy-Core's 3-point zone-merge band so
+    # this integration test isolates Trade-Lab touch/observation plumbing instead of
     # asserting legacy exact-level semantics for a merged Asia high/low zone.
     runtime.process_market_event(_trade(1, price_ticks=68_020))
+    # The London return bar straddles 68_020 with a wide 68_007..68_033 range so
+    # London's own session extremes land >3 pts from the Asia high and do NOT merge
+    # into the asia_high zone -- otherwise the engine-v3 availability guard would
+    # inherit London's later close instant and gate the return touch.
     runtime.process_market_event(
         TradeEvent(
             event_ts_utc=datetime(2026, 1, 5, 8, 0, tzinfo=UTC),
@@ -142,7 +146,7 @@ def test_trade_events_advance_levels_touches_and_observations() -> None:
             instrument_id=1,
             requested_symbol="NQ.c.0",
             raw_symbol="NQM6",
-            price_ticks=68_018,
+            price_ticks=68_007,
             size=1,
             source_schema="trades",
         )
@@ -154,7 +158,7 @@ def test_trade_events_advance_levels_touches_and_observations() -> None:
             instrument_id=1,
             requested_symbol="NQ.c.0",
             raw_symbol="NQM6",
-            price_ticks=68_022,
+            price_ticks=68_033,
             size=1,
             source_schema="trades",
         )
@@ -291,11 +295,14 @@ def test_broadcaster_emits_required_domain_envelopes_and_monotonic_sequences() -
     runtime = _runtime()
     first_update = runtime.process_market_event(_trade(0, price_ticks=68_000))
     closed_update = runtime.process_market_event(_trade(1, price_ticks=68_020))
+    # Wide London return bar (68_007..68_033) straddles the 68_020 Asia high while
+    # keeping London's own extremes >3 pts away, so the asia_high zone stays isolated
+    # and the engine-v3 availability guard does not gate the return touch.
     runtime.process_market_event(
-        TradeEvent(datetime(2026, 1, 5, 8, 0, tzinfo=UTC), None, 1, "NQ.c.0", "NQM6", 68_018, 1)
+        TradeEvent(datetime(2026, 1, 5, 8, 0, tzinfo=UTC), None, 1, "NQ.c.0", "NQM6", 68_007, 1)
     )
     touch_update = runtime.process_market_event(
-        TradeEvent(datetime(2026, 1, 5, 8, 0, 1, tzinfo=UTC), None, 1, "NQ.c.0", "NQM6", 68_022, 1)
+        TradeEvent(datetime(2026, 1, 5, 8, 0, 1, tzinfo=UTC), None, 1, "NQ.c.0", "NQM6", 68_033, 1)
     )
     warning_update = runtime.record_warning(
         DataQualityWarning(code=DataQualityCode.HISTORICAL_ONLY_FIELD_IGNORED, message="ignored")

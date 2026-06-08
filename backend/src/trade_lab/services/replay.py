@@ -407,9 +407,9 @@ def _coalesce_replay_updates(updates: list[RuntimeUpdate]) -> RuntimeUpdate:
     """Merge buffered per-trade deltas into one delta for a single broadcast.
 
     Snapshot-style fields (feed_status, current_bars, display_levels) keep the latest
-    non-empty value; event-style fields (closed_bars, touches, observations, warnings)
-    are concatenated so no completed bar is ever lost. Mirrors how the frontend
-    consumes each message type.
+    non-empty value; event-style fields (closed_bars, touches, observations, warnings,
+    predictions, outcomes) are concatenated so no completed bar or resolved outcome is
+    ever lost. Mirrors how the frontend consumes each message type.
     """
 
     if len(updates) == 1:
@@ -423,6 +423,9 @@ def _coalesce_replay_updates(updates: list[RuntimeUpdate]) -> RuntimeUpdate:
     touches = list(merged.touches)
     observations = list(merged.observations)
     predictions = list(merged.predictions)
+    # audit #N4: 'outcomes' is an event-style delta (prediction.resolved); accumulate
+    # it like 'predictions' so coalesced replay never drops resolved-outcome broadcasts.
+    outcomes = list(merged.outcomes)
     for update in updates:
         if update.feed_status is not None:
             feed_status = update.feed_status
@@ -440,6 +443,8 @@ def _coalesce_replay_updates(updates: list[RuntimeUpdate]) -> RuntimeUpdate:
             observations.extend(update.observations)
         if update.predictions:
             predictions.extend(update.predictions)
+        if update.outcomes:
+            outcomes.extend(update.outcomes)
     return RuntimeUpdate(
         feed_status=feed_status,
         warnings=tuple(warnings),
@@ -449,6 +454,7 @@ def _coalesce_replay_updates(updates: list[RuntimeUpdate]) -> RuntimeUpdate:
         touches=tuple(touches),
         observations=tuple(observations),
         predictions=tuple(predictions),
+        outcomes=tuple(outcomes),
     )
 
 

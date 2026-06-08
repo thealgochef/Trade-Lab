@@ -23,14 +23,14 @@ from trade_lab.api.dto import (
 from trade_lab.config import Settings, load_settings
 from trade_lab.services.broadcaster import WebSocketBroadcaster
 from trade_lab.services.inference.inference_engine import InferenceEngine
-from trade_lab.services.live import LiveConfig, LiveMarketDataService
+from trade_lab.services.live import LiveConfig, LiveMarketDataService, LiveState
 from trade_lab.services.model_registry import (
     ModelNotFoundError,
     ModelRegistry,
     ModelValidationError,
     is_safe_model_id,
 )
-from trade_lab.services.replay import HistoricalReplayService, ReplayConfig
+from trade_lab.services.replay import HistoricalReplayService, ReplayConfig, ReplayState
 from trade_lab.services.runtime import ApplicationRuntime
 from trade_lab.services.seed import HistoricalSeedService
 
@@ -167,6 +167,26 @@ def _live_status_payload(live: LiveMarketDataService) -> dict[str, object]:
         if status.stopped_at_utc is None
         else status.stopped_at_utc.isoformat(),
     }
+
+
+# audit #NN-2: live and replay share a single ApplicationRuntime, and starting either
+# one calls runtime.reset() to rebuild the engine. If one is started while the other is
+# active, that reset runs underneath the still-writing task and corrupts bars/levels/
+# touches. These predicates classify "active" using only the existing status() accessors
+# so the start endpoints can enforce mutual exclusion. Terminal states (idle/stopped/
+# completed/failed/disconnected/cancelled) are not active and never block a fresh start.
+_LIVE_ACTIVE_STATES = frozenset({LiveState.CONNECTING, LiveState.RUNNING})
+_REPLAY_ACTIVE_STATES = frozenset(
+    {ReplayState.LOADING, ReplayState.READY, ReplayState.RUNNING, ReplayState.PAUSED}
+)
+
+
+def _live_is_active(live: LiveMarketDataService) -> bool:
+    return live.status().state in _LIVE_ACTIVE_STATES
+
+
+def _replay_is_active(replay: HistoricalReplayService) -> bool:
+    return replay.status().state in _REPLAY_ACTIVE_STATES
 
 
 def _configured_secret_values(settings: Settings) -> tuple[str, ...]:
@@ -308,6 +328,12 @@ def create_app(
     @app.post("/api/v1/live/start")
     async def live_start(request: Request) -> dict[str, object]:
         _authorize_live_control(request, settings)
+        # audit #NN-2: refuse to start live while a replay is active; both share one
+        # runtime and live.start() resets/rebuilds the engine under the replay task.
+        if _replay_is_active(app.state.replay):
+            raise HTTPException(
+                status_code=409, detail="cannot start live feed while replay is active"
+            )
         try:
             await app.state.live.start()
         except RuntimeError as exc:
@@ -398,9 +424,18 @@ def create_app(
         }
 
     @app.post("/api/v1/replay/start")
-    async def replay_start(request: ReplayStartRequest) -> dict[str, object]:
-        _reject_path_like_source_id(request.source_id)
-        entry = app.state.replay_sources.get(request.source_id)
+    async def replay_start(payload: ReplayStartRequest, request: Request) -> dict[str, object]:
+        # audit #NN-6: replay controls are operator side effects on the shared runtime,
+        # so gate them exactly like live_start / the model endpoints do.
+        _authorize_live_control(request, settings)
+        _reject_path_like_source_id(payload.source_id)
+        # audit #NN-2: live and replay share one runtime; replay.start() resets/rebuilds
+        # the engine, which would corrupt bars/levels/touches if the live feed is writing.
+        if _live_is_active(app.state.live):
+            raise HTTPException(
+                status_code=409, detail="cannot start replay while live feed is active"
+            )
+        entry = app.state.replay_sources.get(payload.source_id)
         if entry is None:
             raise HTTPException(status_code=404, detail="unknown replay source id")
         definition, source = entry
@@ -408,13 +443,13 @@ def create_app(
             await app.state.replay.start(
                 source,
                 ReplayConfig(
-                    paths=definition.paths or (Path(request.source_id),),
+                    paths=definition.paths or (Path(payload.source_id),),
                     requested_symbol=definition.requested_symbol,
                     schema=definition.schema,
                     source_id=definition.source_id,
                     source_label=definition.label,
-                    speed=request.speed,
-                    max_events=request.max_events,
+                    speed=payload.speed,
+                    max_events=payload.max_events,
                 ),
             )
         except RuntimeError as exc:
@@ -422,17 +457,20 @@ def create_app(
         return _replay_status_payload(app.state.replay)
 
     @app.post("/api/v1/replay/pause")
-    async def replay_pause() -> dict[str, object]:
+    async def replay_pause(request: Request) -> dict[str, object]:
+        _authorize_live_control(request, settings)  # audit #NN-6
         await app.state.replay.pause()
         return _replay_status_payload(app.state.replay)
 
     @app.post("/api/v1/replay/resume")
-    async def replay_resume() -> dict[str, object]:
+    async def replay_resume(request: Request) -> dict[str, object]:
+        _authorize_live_control(request, settings)  # audit #NN-6
         await app.state.replay.resume()
         return _replay_status_payload(app.state.replay)
 
     @app.post("/api/v1/replay/stop")
-    async def replay_stop() -> dict[str, object]:
+    async def replay_stop(request: Request) -> dict[str, object]:
+        _authorize_live_control(request, settings)  # audit #NN-6
         await app.state.replay.stop()
         return _replay_status_payload(app.state.replay)
 

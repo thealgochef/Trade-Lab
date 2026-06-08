@@ -517,7 +517,13 @@ class ApplicationRuntime:
             if was_disconnected:
                 return RuntimeUpdate(feed_status=self._feed_status)
             return RuntimeUpdate()
-        return RuntimeUpdate()
+        # audit #9: one-sided quotes (_quote_to_core returns None, so the core adapter
+        # emits no feed_status) still arrived from the feed. Preserve the pre-migration
+        # behaviour for ANY quote: advance feed liveness (last_event_ts) and promote a
+        # DISCONNECTED feed to CONNECTED, without advancing bars/touches. Reuses
+        # _update_feed_context, which preserves replaying/connected state and only emits
+        # a delta on the disconnected->connected promotion.
+        return self._update_feed_context(quote.event_ts_utc, schema=quote.source_schema)
 
     def _process_trade(self, trade: TradeEvent) -> RuntimeUpdate:
         self.market_context.append_trade(

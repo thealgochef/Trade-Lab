@@ -9,7 +9,7 @@ from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from uuid import uuid4
 
-from trade_lab.domain.levels import LevelKind, TouchEvent
+from trade_lab.domain.levels import LevelDirection, LevelKind, TouchEvent
 from trade_lab.domain.sessions import SessionName
 
 
@@ -31,6 +31,10 @@ class Observation:
     session: SessionName
     level_kind: LevelKind
     level_price_ticks: int
+    # audit #NN-1: carried authoritative touch direction (None for legacy touches that
+    # predate direction carry); inference consumes this instead of re-deriving from
+    # level_kind so mixed-side merged zones are not inverted.
+    direction: LevelDirection | None = None
 
 
 class ObservationEngine:
@@ -51,6 +55,7 @@ class ObservationEngine:
             session=touch.session,
             level_kind=touch.level_kind,
             level_price_ticks=touch.level_price_ticks,
+            direction=touch.direction,  # audit #NN-1: carry authoritative direction
         )
         self._observations[obs.observation_id] = obs
         return obs
