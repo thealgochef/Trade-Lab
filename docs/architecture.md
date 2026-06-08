@@ -92,7 +92,9 @@ Preferred backend stack direction:
 
 - FastAPI/Starlette for HTTP and WebSocket API boundaries.
 - Strategy-Core for authoritative replay/live market-data runtime state, bars,
-  sessions, levels/zones, and touches.
+  sessions, levels/zones, and touches. Strategy-Core changes become Trade-Lab
+  runtime changes only through an explicit dependency pin bump and validation; see
+  `docs/strategy-core-alignment-runbook.md`.
 - Databento SDK for implemented opt-in live market data only. Historical replay
   uses the local Databento-export Parquet catalog/adapter under
   `TRADE_LAB_DATA_PATH`; it does not require or imply Databento SDK calls.

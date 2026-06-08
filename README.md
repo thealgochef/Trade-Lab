@@ -17,7 +17,8 @@ from the original plan is manual live validation during active market hours.
   and commands.
 - `frontend/` — workstation UI, charting client, safe replay controls, and an
   opt-in live Databento onboarding panel.
-- `docs/` — architecture notes and operating guides.
+- `docs/` — architecture notes and operating guides, including the Strategy-Core
+  promotion/alignment runbook for keeping research/runtime behavior synchronized.
 - `scripts/` — development and operational helpers.
 
 ## Current status

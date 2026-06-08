@@ -56,4 +56,5 @@
 
 - `docs/architecture.md` has the boundary invariants and out-of-scope modules.
 - `docs/market-data-contract.md` defines canonical event and tick-bar semantics.
+- `docs/strategy-core-alignment-runbook.md` defines the Strategy-Core pin/bump validation process for keeping Trade-Lab aligned with research/runtime changes.
 - `docs/live-databento-validation-runbook.md` is the source of truth for real live validation; the preflight script only performs safe GET checks and never starts live.

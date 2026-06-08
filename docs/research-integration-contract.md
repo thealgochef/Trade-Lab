@@ -48,6 +48,24 @@ Any research artifact trained under older Trade-Lab Chicago/exact-price touch
 semantics is not runtime-aligned and must be retrained, quarantined, or explicitly
 measured before live precision claims are trusted.
 
+## Strategy-Core Promotion and Trade-Lab Alignment
+
+Trade-Lab alignment is controlled through an explicit Strategy-Core dependency pin,
+not by silently following whatever local Strategy-Core checkout is present. When
+research changes strategy/runtime behavior, Strategy-Core must be committed and
+pushed first, then Trade-Lab must bump the pinned Strategy-Core commit in
+`backend/pyproject.toml`, reinstall the backend, and rerun backend/frontend/replay
+validation before the runtime is called aligned.
+
+The operational runbook is:
+
+```text
+docs/strategy-core-alignment-runbook.md
+```
+
+That runbook defines the aligned/not-aligned states, pin-bump process, validation
+commands, historical replay evidence requirements, and model-serving gate.
+
 ## Artifact Layout
 
 A model artifact package should contain:
