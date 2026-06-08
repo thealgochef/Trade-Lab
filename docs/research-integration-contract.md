@@ -1,12 +1,12 @@
-# Research Integration Contract — Phase 1
+# Research Integration Contract — Strategy-Core Runtime Boundary
 
-Trade-Lab consumes research outputs by versioned contract. Claude-Quant-Lab trains models and produces artifacts. Trade-Lab must not copy research code into runtime.
-
-Phase 1-4 does not load ML models. This document defines the future integration boundary so runtime and research can align before inference is introduced.
+Trade-Lab consumes research/model outputs by versioned contract. Quant-Lab trains
+models and produces artifacts. Trade-Lab must not copy research code into runtime;
+shared semantics belong in Strategy-Core.
 
 ## Contract Identity
 
-Initial contract name:
+Current contract family:
 
 ```text
 trade_lab_contract_v1
@@ -16,45 +16,45 @@ The contract must define:
 
 - data schema version;
 - canonical event assumptions;
-- session rules;
-- level rules;
-- touch rules;
+- Strategy-Core session rules;
+- Strategy-Core level/zone/touch rules;
 - bar settings;
-- feature schema;
+- feature schema and ordered feature list;
 - label mapping;
 - thresholds;
 - artifact checksums.
 
-## Current Alignment Warning
+## Runtime Semantics Source of Truth
 
-The existing research pipeline is not aligned with the Trade-Lab v1 runtime specification.
+Trade-Lab runtime bars, sessions, levels/zones, and touches are delegated to
+`strategy_core.runtime.StrategyRuntime` through
+`trade_lab.services.strategy_core_service.StrategyCoreService`.
 
-Known differences include:
+Current Strategy-Core v3 runtime requirements:
 
-- research sessions currently use Eastern-time assumptions;
-- research PDH/PDL currently use prior RTH session only;
-- research touch zones currently use 3-point zones and/or bar high-low touch logic;
-- research touch policy currently uses first touch per zone/day.
+- `US/Eastern` session logic;
+- trading-day boundary at `18:00 ET`;
+- sessions: Asia `19:00→02:45 ET`, London `03:00→08:00 ET`, NY `09:00→17:00 ET`;
+- tick bars only for runtime display/decision timeframes such as `147t`, `987t`,
+  and `2000t`;
+- PDH/PDL from complete prior Strategy-Core trading-day summaries;
+- levels within `3.0` points merge into zones;
+- touch fires when a closed Strategy-Core decision bar range intersects the zone
+  representative;
+- first touch is tracked per zone per Strategy-Core trading day;
+- quotes/top-of-book are context only and do not create bars or touches.
 
-Trade-Lab v1 requires:
-
-- `America/Chicago` session logic;
-- trading day `6:00 PM CT -> 4:00 PM CT`;
-- PDH/PDL from prior full trading day;
-- exact-price touch using last traded price only;
-- integer tick equality;
-- one touch per level per session;
-- tick bars only: `147t`, `987t`, `2000t`.
-
-Future research training must be updated to match `trade_lab_contract_v1` before models are considered aligned.
+Any research artifact trained under older Trade-Lab Chicago/exact-price touch
+semantics is not runtime-aligned and must be retrained, quarantined, or explicitly
+measured before live precision claims are trusted.
 
 ## Artifact Layout
 
-A future model artifact package should contain:
+A model artifact package should contain:
 
 ```text
-artifact.json
-feature_schema.json
+artifact.json or strategy.json
+feature_schema.json or embedded feature_set
 model.cbm
 training_report/
   evaluation.*
@@ -63,35 +63,34 @@ training_report/
 checksums.*
 ```
 
-The model file name may vary by model family, but `model.cbm` is the expected CatBoost artifact name if CatBoost is used.
+The model file name may vary by model family, but `model.cbm` is the expected
+CatBoost artifact name if CatBoost is used.
 
-## `artifact.json` Requirements
+## Artifact Metadata Requirements
 
-`artifact.json` should include:
+The artifact/strategy metadata should include:
 
-- artifact id;
-- artifact version;
-- contract name and version;
+- artifact id and version;
+- contract name/version;
 - data schema version;
 - model type;
 - training code version or commit id;
 - training data date range;
 - instrument/product;
-- bar type and bar sizes;
 - tick definition;
+- bar type and bar sizes;
 - session rules;
-- level rules;
-- touch rules;
+- level/zone/touch rules;
 - label mapping;
 - decision thresholds;
-- feature schema file reference;
+- feature schema reference or embedded schema;
 - model file reference;
 - evaluation report reference;
-- checksums for all files.
+- checksums for all required files.
 
-## `feature_schema.json` Requirements
+## Feature Schema Requirements
 
-`feature_schema.json` should define:
+The feature schema should define:
 
 - ordered feature column list;
 - feature names, types, units, and nullability;
@@ -101,44 +100,53 @@ The model file name may vary by model family, but `model.cbm` is the expected Ca
 - incompatible schema changes;
 - schema checksum.
 
-Feature order is part of the contract. Runtime inference must reject artifacts whose feature order or schema checksum does not match the registered contract.
+Feature order is part of the contract. Runtime inference must reject artifacts
+whose feature order or schema checksum does not match the registered contract.
 
 ## Runtime Validation Requirements
 
-When ML is added later, Trade-Lab should validate:
+Trade-Lab should validate:
 
 - contract name/version is supported;
 - data schema version is supported;
 - artifact checksum matches;
 - model checksum matches;
 - feature schema checksum matches;
-- runtime session/level/touch/bar settings match the artifact;
+- runtime session/level/touch/bar settings match Strategy-Core v3 or an explicitly
+  supported future Strategy-Core variant;
 - class mapping and thresholds are present;
 - model was trained on compatible instrument and tick definition.
 
-Invalid artifacts must fail closed and produce a visible data/model-quality warning.
+Invalid artifacts must fail closed and produce a visible data/model-quality
+warning.
 
 ## Architecture Boundary
 
-Future runtime integration should use ports such as:
+Runtime integration uses ports/services such as:
 
 - `ModelRegistry`: discovers and validates artifacts;
-- `FeatureBuilder`: builds contract-versioned features from runtime observations;
+- `FeatureBuilder`/feature registry: builds contract-versioned features from
+  runtime observations and L1/L0 context;
 - `InferenceEngine`: scores validated observations;
-- `PredictionPublisher`: emits predictions and diagnostics.
+- `PredictionPublisher`/WebSocket broadcaster: emits predictions and diagnostics.
 
-These ports are placeholders for future phases. Phase 1-4 should not load models, run inference, upload artifacts, or execute trades.
+Research alignment depends on the same Strategy-Core engine boundaries as
+runtime:
 
-Research alignment depends on the same engine boundaries as runtime:
-
-- Candles and candle-derived features used by research must come from the Trade-Lab `CandleEngine` contract or a bit-for-bit equivalent implementation.
-- Session, level, touch, and observation features must match the runtime contracts used by `SessionLevelEngine` and `ObservationEngine`.
-- Risk decisions, broker execution behavior, fills, rejects, slippage, and account outcomes are not part of model-training labels unless a future contract explicitly models those outcomes.
-- Signal/inference artifacts may produce probabilities or signal intent only; execution and risk outcomes remain separate runtime concerns.
+- Candles and candle-derived features used by research must come from
+  Strategy-Core candle contracts or bit-for-bit equivalent implementations.
+- Session, level, zone, touch, and observation features must match the runtime
+  contracts used by Strategy-Core and Trade-Lab’s `ObservationEngine`.
+- Risk decisions, broker execution behavior, fills, rejects, slippage, and account
+  outcomes are not part of model-training labels unless a future contract
+  explicitly models those outcomes.
+- Signal/inference artifacts may produce probabilities or signal intent only;
+  execution and risk outcomes remain separate runtime concerns.
 
 ## Open Questions
 
-- Final feature schema for exact-price touch observations.
-- Label definitions and prediction horizon.
-- Model threshold ownership: research artifact only, runtime override, or both with audit trail.
+- Final promoted feature schema for exact model-bundle parity fixtures.
+- Promotion policy for old bundles trained before Strategy-Core v3 alignment.
+- Model threshold ownership: research artifact only, runtime override, or both
+  with audit trail.
 - Required evaluation report format for model promotion.

@@ -13,12 +13,17 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import cast
+
+from strategy_core.runtime import LiveRuntime as CoreLiveRuntime
+from strategy_core.runtime import LiveState as CoreLiveState
 
 from trade_lab.domain.data_quality import (
     DataQualityCode,
     DataQualitySeverity,
     DataQualityWarning,
 )
+from trade_lab.domain.events import MarketEvent
 from trade_lab.domain.feed import FeedConnectionState, FeedStatus
 from trade_lab.ports.market_data import MarketDataFeed
 from trade_lab.services.runtime import ApplicationRuntime, RuntimeUpdate, _safe_text
@@ -98,6 +103,7 @@ class LiveMarketDataService:
         self._started_at_utc: datetime | None = None
         self._stopped_at_utc: datetime | None = None
         self._task: asyncio.Task[None] | None = None
+        self.strategy_core_live: CoreLiveRuntime | None = None
         self._seed_task: asyncio.Task[None] | None = None
         self._feed: MarketDataFeed | None = None
         self._lock = asyncio.Lock()
@@ -112,8 +118,22 @@ class LiveMarketDataService:
         self._on_update = callback
 
     def status(self) -> LiveStatus:
+        core_status = None if self.strategy_core_live is None else self.strategy_core_live.status()
+        state = self._state
+        events_processed = self._events_processed
+        last_event_ts_utc = self._last_event_ts_utc
+        last_error = self._last_error
+        started_at_utc = self._started_at_utc
+        stopped_at_utc = self._stopped_at_utc
+        if core_status is not None and core_status.state != CoreLiveState.IDLE:
+            state = _map_core_live_state(core_status.state, fallback=self._state)
+            events_processed = core_status.events_processed
+            last_event_ts_utc = core_status.last_event_ts_utc
+            last_error = core_status.last_error
+            started_at_utc = core_status.started_at_utc
+            stopped_at_utc = core_status.stopped_at_utc
         return LiveStatus(
-            state=self._state,
+            state=state,
             requested_symbol=self.config.requested_symbol,
             dataset=self.config.dataset,
             schemas=self.config.schemas,
@@ -125,11 +145,11 @@ class LiveMarketDataService:
                 and self.config.api_key_configured
                 and self.config.sdk_available is not False
             ),
-            events_processed=self._events_processed,
-            last_event_ts_utc=self._last_event_ts_utc,
-            last_error=self._last_error,
-            started_at_utc=self._started_at_utc,
-            stopped_at_utc=self._stopped_at_utc,
+            events_processed=events_processed,
+            last_event_ts_utc=last_event_ts_utc,
+            last_error=last_error,
+            started_at_utc=started_at_utc,
+            stopped_at_utc=stopped_at_utc,
         )
 
     async def start(self) -> None:
@@ -148,6 +168,7 @@ class LiveMarketDataService:
             self._last_event_ts_utc = None
             self._started_at_utc = datetime.now(UTC)
             self._stopped_at_utc = None
+            self.strategy_core_live = None
             if self.config.reset_runtime_on_start:
                 await self._emit(
                     self.runtime.reset(
@@ -160,7 +181,16 @@ class LiveMarketDataService:
             try:
                 feed = self._feed_factory(self.config)
                 self._feed = feed
-                await feed.start()
+                core_live = CoreLiveRuntime(
+                    feed,
+                    process_item=self._process_live_item,
+                    on_update=self._emit,
+                    is_warning=lambda item: isinstance(item, DataQualityWarning),
+                    is_event=lambda item: not isinstance(item, (DataQualityWarning, FeedStatus)),
+                    event_timestamp=lambda item: getattr(item, "event_ts_utc", None),
+                )
+                self.strategy_core_live = core_live
+                await core_live.start()
             except Exception as exc:
                 self._state = LiveState.FAILED
                 self._last_error = type(exc).__name__
@@ -192,7 +222,7 @@ class LiveMarketDataService:
             # the runtime reset above so its bars are not cleared by the reset.
             if self._seed_service is not None and self._seed_service.enabled:
                 self._seed_task = asyncio.create_task(self._seed_and_broadcast())
-            self._task = asyncio.create_task(self._run())
+            self._task = asyncio.create_task(self._wait_strategy_core_live())
 
     async def stop(self) -> None:
         async with self._lock:
@@ -200,44 +230,42 @@ class LiveMarketDataService:
                 self._seed_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await self._seed_task
+            core = self.strategy_core_live
+            if core is not None:
+                await core.stop()
             if self._task is not None and not self._task.done():
-                self._task.cancel()
                 with suppress(asyncio.CancelledError):
                     await self._task
-            if self._feed is not None:
+            if self._feed is not None and core is None:
                 await self._feed.stop()
             self._feed = None
             self._state = LiveState.STOPPED
             self._stopped_at_utc = datetime.now(UTC)
             await self._emit_status(FeedConnectionState.DISCONNECTED, "live feed stopped")
 
-    async def _run(self) -> None:
-        assert self._feed is not None
-        try:
-            async for item in self._feed.events():
-                if isinstance(item, FeedStatus):
-                    await self._emit(self.runtime.set_feed_status(item))
-                    continue
-                if isinstance(item, DataQualityWarning):
-                    await self._emit(self.runtime.record_warning(item))
-                    continue
-                self._events_processed += 1
-                self._last_event_ts_utc = item.event_ts_utc
-                await self._emit(self.runtime.process_market_event(item))
-                await asyncio.sleep(0)
-            if self._state == LiveState.RUNNING:
-                self._state = LiveState.DISCONNECTED
-                await self._emit_status(FeedConnectionState.DISCONNECTED, "live feed disconnected")
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
+    def _process_live_item(self, item: object) -> RuntimeUpdate:
+        if isinstance(item, FeedStatus):
+            return self.runtime.set_feed_status(item)
+        if isinstance(item, DataQualityWarning):
+            return self.runtime.record_warning(item)
+        return self.runtime.process_market_event(cast(MarketEvent, item))
+
+    async def _wait_strategy_core_live(self) -> None:
+        core = self.strategy_core_live
+        if core is None:
+            return
+        await core.wait_finished()
+        status = core.status()
+        self._events_processed = status.events_processed
+        self._last_event_ts_utc = status.last_event_ts_utc
+        self._last_error = status.last_error
+        self._started_at_utc = status.started_at_utc or self._started_at_utc
+        self._stopped_at_utc = status.stopped_at_utc
+        if status.state == CoreLiveState.DISCONNECTED and self._state == LiveState.RUNNING:
+            self._state = LiveState.DISCONNECTED
+            await self._emit_status(FeedConnectionState.DISCONNECTED, "live feed disconnected")
+        elif status.state == CoreLiveState.FAILED:
             self._state = LiveState.FAILED
-            self._last_error = type(exc).__name__
-            logger.error(
-                "live feed failed: exception_type=%s message=%s",
-                type(exc).__name__,
-                _redact_configured_secrets(str(exc), self.config.secret_values),
-            )
             await self._emit_status(FeedConnectionState.DISCONNECTED, "live feed failed")
 
     async def _seed_and_broadcast(self) -> None:
@@ -294,6 +322,17 @@ class LiveMarketDataService:
     async def _emit(self, update: RuntimeUpdate) -> None:
         if self._on_update is not None and update.has_deltas():
             await self._on_update(update)
+
+
+def _map_core_live_state(state: CoreLiveState, *, fallback: LiveState) -> LiveState:
+    return {
+        CoreLiveState.IDLE: fallback,
+        CoreLiveState.CONNECTING: LiveState.CONNECTING,
+        CoreLiveState.RUNNING: LiveState.RUNNING,
+        CoreLiveState.STOPPED: LiveState.STOPPED,
+        CoreLiveState.DISCONNECTED: LiveState.DISCONNECTED,
+        CoreLiveState.FAILED: LiveState.FAILED,
+    }[state]
 
 
 def _redact_configured_secrets(message: str, secrets: tuple[str, ...]) -> str:

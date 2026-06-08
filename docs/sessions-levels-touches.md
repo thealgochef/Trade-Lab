@@ -1,171 +1,143 @@
-# Sessions, Levels, Touches, and Observations — Phase 1
+# Sessions, Levels, Zones, Touches, and Observations — Strategy-Core Runtime
 
-This document defines Trade-Lab v1 session, level, touch, and observation semantics.
+Trade-Lab no longer owns independent session/level/touch strategy semantics. The
+runtime delegates authoritative bars, sessions, levels, merged zones, and touches
+to `strategy_core.runtime.StrategyRuntime` through
+`trade_lab.services.strategy_core_service.StrategyCoreService`. Trade-Lab maps the
+Strategy-Core output to API/WebSocket DTOs and starts observations from mapped
+`TouchEvent`s.
 
 ## Timezone and Trading Day
 
-All session logic uses `America/Chicago`.
-
-Trading day:
+Authoritative runtime session logic uses Strategy-Core
+`RESEARCH_SESSION_SCHEME`:
 
 ```text
-6:00 PM CT -> 4:00 PM CT next day
+Timezone: US/Eastern
+Trading-day boundary: 6:00 PM ET
+Trading-day label: local calendar date after applying the 6:00 PM ET boundary
 ```
 
-Trading-day labels should be deterministic and based on event timestamps, not wall-clock processing time. Internal event timestamps remain UTC.
-
-Trading-day label convention: use the calendar date of the 4:00 PM `America/Chicago` close. For example, the trading day that starts Sunday at 6:00 PM CT and closes Monday at 4:00 PM CT is labeled Monday.
+Internal event timestamps remain UTC. Session/trading-day labels must be derived
+from event timestamps, never wall-clock processing time.
 
 ## Sessions
 
-Sessions are defined in Chicago time:
+Strategy-Core v3 named session windows are ET-native and DST-aware:
 
-| Session | Start | End |
-| --- | ---: | ---: |
-| Asia | 6:00 PM | 2:00 AM |
-| London | 2:00 AM | 8:00 AM |
-| NY | 8:00 AM | 4:00 PM |
+| Session | Start | End | Notes |
+| --- | ---: | ---: | --- |
+| Asia | 7:00 PM ET | 2:45 AM ET | Crosses midnight. |
+| London | 3:00 AM ET | 8:00 AM ET | End-exclusive. |
+| NY | 9:00 AM ET | 5:00 PM ET | End-exclusive; aligns with the 17:00 ET forward-label cutoff. |
 
-Session boundaries are end-exclusive except where a trading-day close event is explicitly finalized.
+The ET gaps `18:00–19:00`, `02:45–03:00`, `08:00–09:00`, and `17:00–18:00`
+are intentionally unsessioned (`none`). They are still inside the trading-day
+calendar where applicable, but they are not named Asia/London/NY sessions.
 
 ## Levels
 
-Trade-Lab tracks these levels:
+Strategy-Core tracks the canonical level names that Trade-Lab maps to display
+DTOs today:
 
-- PDH: prior full trading day high;
-- PDL: prior full trading day low;
-- Asia High;
-- Asia Low;
-- London High;
-- London Low;
-- NY High;
-- NY Low.
+- `pdh`: prior trading-day high;
+- `pdl`: prior trading-day low;
+- `asia_high` / `asia_low`;
+- `london_high` / `london_low`.
 
-All level prices are integer ticks.
+NY is a Strategy-Core session label and forward-cutoff window, but current
+`StrategyLevelState` does not emit separate `ny_high` / `ny_low` levels. Add those
+in Strategy-Core before documenting or rendering them as active runtime levels.
+
+Trade-Lab DTOs expose prices as integer NQ ticks. Strategy-Core stores level and
+zone calculations in points internally and converts through the adapter boundary.
 
 ## PDH and PDL
 
-PDH/PDL are the high and low of the prior full trading day:
+PDH/PDL come from the complete prior Strategy-Core trading day. They are not a
+separate Trade-Lab Chicago/RTH-only calculation. Incomplete snippets, such as
+starting live processing mid-day, must not be promoted automatically into the
+next day’s PDH/PDL. Loaded/finalized summaries define which prior trading days
+are available until an exchange holiday/calendar source is added.
 
-```text
-prior 6:00 PM CT -> 4:00 PM CT trading day
-```
+## Level Availability
 
-They are not prior NY/RTH-only levels.
+Strategy-Core enforces `available_from` lookahead guards:
 
-PDH/PDL become available only after a complete prior trading day has been explicitly finalized by the runtime or loaded from replay/session summary data. Incomplete observed snippets, such as starting live processing mid-day, must not be promoted automatically to next-day PDH/PDL. Until an exchange holiday calendar is added, loaded/finalized summaries define the available prior trading days; the engine uses the latest complete summary before the current trading-day label, so a Friday summary can become Monday's PDH/PDL after a weekend gap.
+- PDH/PDL are available from the Strategy-Core trading-day start.
+- Asia high/low become signal-eligible only after Asia closes at 02:45 ET.
+- London high/low become signal-eligible only after London closes at 08:00 ET.
+- A merged zone uses the max `available_from` across its constituent levels.
 
-## Developing Session Levels
+Developing levels may be displayed for context, but they do not create touches
+before Strategy-Core marks them available.
 
-Asia, London, and NY highs/lows are developing levels during their own sessions.
+## Zones and Touch Eligibility
 
-Rules:
+Touch detection is zone-based, not exact Trade-Lab level equality:
 
-- A session high updates when a trade prints above the current high.
-- A session low updates when a trade prints below the current low.
-- Developing levels are display/context levels while their own session is forming.
-- Same-session developing levels are not signal/touch eligible.
+- Levels within `3.0` points merge into one zone.
+- The zone representative is the mean price of its constituent levels.
+- A touch fires when a closed Strategy-Core decision bar’s `[low, high]` range
+  intersects the zone representative.
+- First-touch state is tracked per zone per Strategy-Core trading day.
+- Quote/top-of-book events do not create bars or touches; only trade prints
+  advance Strategy-Core bars and touch detection.
 
-Example: Asia cannot sweep or touch its own high/low while Asia is forming.
+This replaces the old Trade-Lab-only exact-tick rule
+`trade.price_ticks == level.price_ticks`. Legacy exact-touch/domain modules may
+remain for compatibility tests, but `ApplicationRuntime` must not use them as the
+authoritative runtime path.
 
-## Display Levels vs Eligible Signal Levels
+## Touch Event Mapping
 
-The system must explicitly distinguish:
+A Strategy-Core touch is mapped to a Trade-Lab `TouchEvent` containing:
 
-- display levels: visible for context;
-- eligible signal levels: valid for touch detection and observation creation.
-
-Frontend overlays and intelligence panels should render this distinction clearly.
-
-Eligibility is computed from event timestamp, current session, level origin, and previous touch state.
-
-## Touch Eligibility
-
-All sessions allow touches, subject to level eligibility.
-
-Rules:
-
-- Touch source is last traded price only.
-- Top-of-book bid/ask does not trigger touches.
-- Touch zone is exact price only: `0` points.
-- No cutoff distance.
-- Use integer tick equality: `trade.price_ticks == level.price_ticks`.
-- One touch per level per session.
-- Same-session developing levels are not eligible while forming.
-- Other sessions can revisit prior/current eligible levels.
-
-Examples:
-
-- London can touch completed Asia High/Low from the same trading day.
-- NY can touch completed Asia or London levels from the same trading day.
-- NY cannot use NY High/Low as signal levels while NY is forming.
-- PDH/PDL may be eligible in any session if not already touched for that level in that session.
-
-## Touch Event
-
-A valid touch should produce a semantic event containing:
-
-- UTC event timestamp;
-- trading day;
-- current session;
-- level id/type;
-- level price ticks;
-- trade price ticks;
-- requested symbol/raw contract/instrument id, when available;
-- whether this created a new observation;
-- touch sequence metadata for that session.
+- UTC event timestamp from the touched decision bar;
+- Strategy-Core trading day and session label;
+- level/zone representative mapped to integer ticks;
+- latest trade price ticks for context;
+- requested symbol/raw contract/instrument id when available;
+- whether this created an observation;
+- sequence metadata for the mapped Trade-Lab session.
 
 ## Observation Lifecycle
 
-An observation starts on a valid touch.
+An observation starts from a valid Strategy-Core-derived touch.
 
-Initial proposed observation window:
+Default observation window:
 
 ```text
 5 minutes, configurable
 ```
 
-There is no ML prediction in Phase 1-4. Observations are used to prepare future model integration and to show post-touch market context.
+Observations are Trade-Lab runtime objects. They do not recompute touch
+eligibility. Inference, when active, runs only after observations expire and must
+use the active model contract.
 
-Observation state should include:
+Observation state includes:
 
 - observation id;
 - originating touch id;
 - start timestamp;
 - scheduled end timestamp;
-- current status: active, completed, cancelled, or expired;
-- associated level and session metadata.
+- current status: active, expired, cancelled, or completed/resolved where a
+  downstream workflow defines that transition;
+- associated level/zone and session metadata.
 
 ## Session Transitions
 
-At session start:
+Strategy-Core owns session/trading-day transitions, developing levels, level
+freezing, zone construction, and end-of-day bar finalization. Trade-Lab should
+publish/surface Strategy-Core-derived snapshots and deltas only; it should not
+run a second session/level/touch state machine for live or replay.
 
-- initialize new developing high/low from first trade in the session;
-- reset per-session touch state;
-- publish a session transition event.
+## Remaining Operational Questions
 
-At new trading-day start:
-
-- reinitialize developing Asia, London, and NY levels for the new trading day;
-- reset trading-day-scoped level/touch state;
-- prior trading-day session levels are not signal-eligible unless explicitly retained as historical display context;
-- PDH/PDL become the prior full trading-day high/low.
-
-At session end:
-
-- freeze that session's high/low for later sessions;
-- publish final session level values;
-- keep levels available for display and future eligibility where allowed.
-
-At trading-day end:
-
-- finalize any in-progress tick bar at last trade;
-- finalize NY levels;
-- compute completed trading-day high/low for the next day's PDH/PDL;
-- publish trading-day summary state.
-
-## Open Questions
-
-- Whether touch state should reset only per session or also across replay seeks.
-- Exact handling for days with incomplete historical coverage.
-- Observation cancellation rules if replay seeks backwards or a data gap is detected.
+- Manual live validation still needs to confirm the Strategy-Core-derived
+  session/touch stream during active market hours.
+- Replay seeks/backwards time travel remain controller concerns; current runtime
+  processing is forward-only and records timestamp regressions as data-quality
+  warnings.
+- Future model promotion must verify that each model’s `strategy.json` session,
+  level, touch, and bar settings match the Strategy-Core runtime contract.

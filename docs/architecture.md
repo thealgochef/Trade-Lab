@@ -12,15 +12,17 @@ The primary architectural goals are:
 
 ## Current status
 
-The original Phase 1-5 core plan is implemented. The backend domain/runtime path,
-safe replay controls, frontend workstation, and explicit opt-in Databento live
-market-data wiring are complete. The remaining original-plan work is manual live
-validation during active market hours; this should not be treated as complete until
-an operator performs and records the runbook checks.
+The original Phase 1-5 core plan is implemented, and the backend market-data
+runtime has been repointed through Strategy-Core for bars, ET sessions,
+levels/zones, and touches. Trade-Lab now acts as the FastAPI/WebSocket/operator
+control and presentation layer over `StrategyCoreService`; local domain types remain
+DTO/compatibility shapes for API and frontend payloads. Manual live validation
+during active market hours remains operator-run and must not be treated as complete
+until the runbook checks are performed and recorded.
 
 Latest verification:
 
-- Backend full pytest: `268 passed, 1 skipped`.
+- Backend full pytest: `421 passed, 2 skipped`.
 - Backend ruff: all checks passed.
 - Benchmark gate: passed.
 - Frontend lint, typecheck, test, and build: passed.
@@ -38,7 +40,10 @@ Latest verification:
 
 - Implement Databento live ingestion and local historical/replay ingestion.
 - Normalize to canonical events.
-- Build integer-tick price handling, tick bars, session levels, exact-price touches, and observations.
+- Build integer-tick price handling and route tick bars, sessions, levels/zones,
+  touches, and observations through the shared runtime path. Strategy-Core now owns
+  the authoritative bar/session/level/touch semantics; Trade-Lab maps them to API
+  DTOs.
 - Stream batched/throttled updates to the frontend.
 
 ### Phase 3
@@ -86,6 +91,8 @@ Node is limited to frontend development and build tooling. It is not the backend
 Preferred backend stack direction:
 
 - FastAPI/Starlette for HTTP and WebSocket API boundaries.
+- Strategy-Core for authoritative replay/live market-data runtime state, bars,
+  sessions, levels/zones, and touches.
 - Databento SDK for implemented opt-in live market data only. Historical replay
   uses the local Databento-export Parquet catalog/adapter under
   `TRADE_LAB_DATA_PATH`; it does not require or imply Databento SDK calls.
@@ -112,10 +119,10 @@ The implementation should follow ports-and-adapters boundaries.
 
 ```text
 backend/
-  domain/      # canonical events, bars, sessions, levels, touches, observations
+  domain/      # Trade-Lab DTO/compatibility event, bar, level, touch, observation types
   ports/       # MarketDataFeed, EventPublisher, Clock, ArtifactRegistry interfaces
   adapters/    # Databento live, local historical parquet replay, websocket publisher
-  services/    # pipeline orchestration, replay controller, snapshot service
+  services/    # Strategy-Core adapter, pipeline orchestration, replay/live controllers
   api/         # FastAPI routes, websocket endpoint, DTO translation
 ```
 
@@ -123,15 +130,15 @@ backend/
 
 Pure business rules. No Databento SDK objects, HTTP objects, database clients, or frontend DTO assumptions.
 
-Owns:
+Owns Trade-Lab-facing compatibility shapes for:
 
-- canonical market-data events;
+- canonical market-data event DTOs;
 - integer tick conversion;
-- tick-bar aggregation;
-- trading-day/session state;
-- level calculation;
-- touch eligibility and detection;
 - observation lifecycle.
+
+Authoritative tick-bar aggregation, session/trading-day state, level/zones, and
+touch detection are delegated to `strategy_core.runtime.StrategyRuntime` through
+`trade_lab.services.strategy_core_service.StrategyCoreService`.
 
 ### Ports
 
@@ -159,31 +166,34 @@ Adapters translate external systems into ports. The public replay control surfac
 Services orchestrate domain components and adapters:
 
 ```text
-MarketDataFeed source (Phase 4B: synthetic replay or allowlisted local historical replay)
+MarketDataFeed source (synthetic replay, allowlisted local historical replay, or opt-in live)
   -> canonical event normalization
-  -> integer tick conversion
-  -> tick bars
-  -> session/level updater
-  -> touch detector
+  -> StrategyCoreService / StrategyRuntime
+  -> Strategy-Core tick bars, ET session/trading-day state, levels/zones/touches
   -> observation tracker
   -> batched/throttled websocket publishing
 ```
 
 Live and replay must use the same `MarketDataFeed` contract and canonical event pipeline so semantics match.
 
-Phase 2C implements this as `ApplicationRuntime`, which owns `CandleEngine`,
-`SessionLevelEngine`, `ObservationEngine`, feed status, and warning state behind a
+Current `ApplicationRuntime` owns `ObservationEngine`, feed status, warning state,
+seed bars, predictions/outcomes, and a `StrategyCoreService` wrapper behind a
 single `process_market_event()` method. `HistoricalReplayService` consumes a
 `HistoricalMarketDataSource` and feeds only canonical live-compatible events into
 that runtime; warnings are recorded separately and broadcast as data-quality
-deltas. WebSocket fan-out serializes domain snapshots/deltas at the API boundary
-and uses bounded per-client queues so slow clients do not force raw tick buffering.
+deltas. WebSocket fan-out serializes Strategy-Core-derived snapshots/deltas at the
+API boundary and uses bounded per-client queues so slow clients do not force raw
+tick buffering.
 
 ## Bounded Engines and Services
 
 Trade-Lab separates market-data processing, signal generation, risk policy, and execution into bounded engines. Engines communicate through explicit domain events on an `EventBus` or equivalent port boundary. They must not form direct cyclic dependencies or exchange frontend/UI payloads.
 
-Phase 1-5 implements only the market-data foundations, `CandleEngine`, `SessionLevelEngine`, `ObservationEngine`, runtime/replay services, frontend workstation, and opt-in live market-data wiring. `RiskEngine`, `TradingEngine`/`ExecutionEngine`, and live inference are future modules, but their boundaries are reserved now so early engines do not grow execution or risk responsibilities.
+Phase 1-5 implements only the market-data foundations, Strategy-Core runtime
+adapter, `ObservationEngine`, runtime/replay services, frontend workstation, and
+opt-in live market-data wiring. `RiskEngine`, `TradingEngine`/`ExecutionEngine`,
+and live inference are future modules, but their boundaries are reserved now so
+early engines do not grow execution or risk responsibilities.
 
 ### MarketDataEngine / Adapter Layer
 
@@ -195,20 +205,21 @@ Phase 1-5 implements only the market-data foundations, `CandleEngine`, `SessionL
   may emit optional `TopOfBookEvent` context from level 0 bid/ask. Deeper MBP-10
   levels are intentionally ignored as runtime features.
 
-### CandleEngine
+### Strategy-Core Runtime / Candle Semantics
 
-- Builds tick bars from canonical `TradeEvent` records only.
+- Builds tick bars from canonical trade records only through Strategy-Core.
 - Owns deterministic bar aggregation for configured tick sizes such as `147t`, `987t`, and `2000t`.
 - Does not make trading, risk, or model decisions.
 - Must be deterministic and replayable: the same canonical trade stream must produce the same candle stream in live and replay.
 
-### SessionLevelEngine
+### Strategy-Core Level / Touch Semantics
 
-- Owns session state, developing levels, final level eligibility, and touch detection.
-- Uses canonical `TradeEvent` records as the authoritative input for session highs/lows and touch detection.
+- Owns ET session state, developing levels, level availability, merged zones, and
+  bar-range touch detection through Strategy-Core.
+- Uses canonical trade records as the authoritative input for session highs/lows and touch detection.
 - May consume candle snapshots only for display context, derived analytics, or other non-authoritative uses unless a future versioned contract explicitly changes level/touch semantics.
 - Must avoid timeframe-dependent level or touch behavior; changing the displayed candle size must not change authoritative session levels or touches.
-- Emits level, eligibility, and touch domain events.
+- Emits level, eligibility, and touch updates that Trade-Lab maps to DTOs.
 - Does not perform execution, account-risk checks, or order intent mutation.
 
 ### ObservationEngine
@@ -247,11 +258,12 @@ Phase 1-5 implements only the market-data foundations, `CandleEngine`, `SessionL
 
 ### Boundary Invariants
 
-- `CandleEngine` never imports or calls `RiskEngine`, `TradingEngine`/`ExecutionEngine`, or ML/inference modules.
+- The Strategy-Core runtime adapter never imports or calls `RiskEngine`,
+  `TradingEngine`/`ExecutionEngine`, or ML/inference modules.
 - `RiskEngine` never sends broker orders.
 - `TradingEngine`/`ExecutionEngine` cannot place orders without `RiskApproval`.
 - `SignalEngine`/`InferenceEngine` cannot bypass `RiskEngine`.
-- Replay and live use the same `CandleEngine` and `SessionLevelEngine` semantics.
+- Replay and live use the same Strategy-Core bar/session/level/touch semantics.
 - Engine outputs are domain events, not UI payloads. API/WebSocket adapters translate domain events into frontend DTOs.
 
 ## API Direction
@@ -286,13 +298,19 @@ Historical replay may be enabled only through the guarded local `TRADE_LAB_DATA_
 
 Phase 2 benchmark coverage is implemented and currently passes. Benchmarks use synthetic or sanitized inputs and must not require secrets, raw production data, or model binaries.
 
-For Phase 2A specifically, the opt-in backend domain hot-path benchmark processes synthetic `CandleEngine` + `SessionLevelEngine` events at `>= 100,000 events/sec` on the development workstation.
+For the original Phase 2A benchmark, the opt-in backend domain hot-path benchmark
+processed synthetic local candle/session-level events at `>= 100,000 events/sec`
+on the development workstation. New runtime performance gates should benchmark the
+Strategy-Core adapter path.
 
 The initial gates below are provisional but pass/fail. They may be recalibrated only with documented benchmark evidence that records the machine, Python version, dependency versions, dataset shape, measured live NQ peak rate where applicable, and the old and new thresholds.
 
 Initial acceptance criteria and phase ownership:
 
-- Phase 2A domain hot path: process synthetic canonical `TradeEvent` streams through `CandleEngine` and `SessionLevelEngine` at `>= 100,000 events/sec` on the development workstation while also passing normal unit tests. This includes tick-bar construction for the configured `147t`, `987t`, and `2000t` bars.
+- Runtime hot path: process synthetic canonical trade streams through
+  `StrategyCoreService` / `StrategyRuntime` at an explicitly measured threshold on
+  the development workstation while also passing normal unit tests. This includes
+  tick-bar construction for configured `147t`, `987t`, and `2000t` bars.
 - Replay streaming gate: read selected Parquet columns only. Replay code must not load full-day MBP files into memory to build runtime events. A one-day replay scan must stay below `1 GB` RSS on the development workstation. Replay throughput is measured during the replay implementation phase; until a baseline exists, the gate is `>= 5x` realtime for selected-column replay mode.
 - WebSocket output gate: do not broadcast raw ticks by default. Publish chart/status updates through capped or coalesced messages at no more than `10-20 Hz` per client. Under synthetic load, p95 server serialization plus enqueue latency must be `<= 50 ms`.
 - Queue and backpressure gate: runtime queues must be bounded with configured maximum depths. If a queue exceeds its threshold, the system must emit a data-quality/backpressure event and apply the configured policy, such as throttling, coalescing, or controlled dropping. Unbounded queue growth fails the gate.

@@ -25,13 +25,15 @@ the next roadmap after live validation.
 
 - [x] Phase 1 — new project foundation/specs/docs.
 - [x] Phase 2A — backend domain core: canonical events, integer tick-price
-  utilities, America/Chicago session calendar, `147t`/`987t`/`2000t` tick candle
-  engine, session level engine, touch/observation engine, and benchmark gate.
+  utilities, DTO compatibility types, observation engine, and benchmark gate.
+  Authoritative tick bars, sessions, levels/zones, and touches now come from
+  Strategy-Core rather than local Trade-Lab session/level engines.
 - [x] Phase 2B — FastAPI app, `/health`, `/api/v1/status`, `/ws/v1`, historical
   Parquet adapter foundation, market-data ports, bounded queues/backpressure, and
   DTOs.
-- [x] Phase 2C — `ApplicationRuntime`, `HistoricalReplayService`,
-  `WebSocketBroadcaster`, replay status, runtime snapshots, and backfill.
+- [x] Phase 2C — `ApplicationRuntime`, Strategy-Core replay/runtime controller
+  integration, `WebSocketBroadcaster`, replay status, runtime snapshots, and
+  backfill.
 - [x] Phase 3A — React/Vite/TypeScript workstation shell, API/WS clients, split
   stores, dark terminal layout, runtime/feed/status panels, and Event Blotter.
 - [x] Phase 3B — lightweight-charts chart rendering, tick-bar bars,
@@ -68,6 +70,12 @@ the next roadmap after live validation.
 - [x] MBP-10 replay projection constrained to live-compatible fields: trade action
   rows (`T`/`Trade` variants) produce `TradeEvent`; optional level 0 bid/ask
   produces `TopOfBookEvent`; deeper book levels are ignored as runtime features.
+- [x] Trade-Lab market-data runtime repointed through `StrategyCoreService` for
+  authoritative Strategy-Core v3 ET sessions, tick bars, levels/zones, and
+  bar-range zone touches.
+- [x] Replay and live lifecycle services now delegate controller state to
+  Strategy-Core runtime controllers while preserving Trade-Lab API/WebSocket
+  status, source allowlists, operator controls, and observation/inference DTOs.
 
 ## Latest verification
 

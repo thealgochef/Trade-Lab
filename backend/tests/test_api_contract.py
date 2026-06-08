@@ -384,14 +384,18 @@ def test_replay_control_api_failure_status_is_sanitized() -> None:
             FailingApiReplaySource(),
         )
     }
-    client = TestClient(app)
-
-    response = client.post("/api/v1/replay/start", json={"source_id": "synthetic:failing-test"})
-    for _ in range(200):
-        if replay.status().state.value == "failed":
-            break
-        time.sleep(0.001)
-    status = client.get("/api/v1/replay/status")
+    # Keep the TestClient portal alive while the background replay task raises;
+    # otherwise Starlette may cancel the task between per-request portals and report
+    # a cancellation instead of the sanitized failure this test is asserting.
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/replay/start", json={"source_id": "synthetic:failing-test"}
+        )
+        for _ in range(200):
+            if replay.status().state.value == "failed":
+                break
+            time.sleep(0.001)
+        status = client.get("/api/v1/replay/status")
 
     assert response.status_code == 200
     assert status.status_code == 200

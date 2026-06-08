@@ -1,17 +1,18 @@
 # Trade-Lab — Live Inference Integration Plan
 
-Status: **IMPLEMENTED through Stage 6** (Stages Q, 0–6) · **Stage 2b (strategy
-seam / research-aligned touch variant) DEFERRED** · Scope: Trade-Lab runtime +
-`strategy.json` emission in Claude-Quant-Lab.
+Status: **IMPLEMENTED through Stage 6** (Stages Q, 0–6) · **Strategy-Core
+runtime seam implemented** · Scope: Trade-Lab runtime + `strategy.json` emission
+in Claude-Quant-Lab.
 
-Implementation note: the inference vertical fires off Trade-Lab's **existing**
-domain engines (America/Chicago sessions, exact-tick touches). The contract's
-`session_scheme`/`touch_rule`/`level_scheme` are parsed and surfaced but do NOT
-yet drive behavior — that formal seam (Stage 2b) is deferred. Features, labels,
-thresholds, classes, windows, and the confidence gate ARE contract-driven.
-Therefore per-prediction feature math is faithful to training, but the *touch
-population* follows Trade-Lab semantics, not the research (ET / bar-intersect)
-touch rule — the documented drift to measure before trusting live precision.
+Implementation note: the inference vertical now runs on Trade-Lab's shared
+Strategy-Core runtime path for bars, ET sessions, levels/zones, and bar-range
+first touches. Trade-Lab parses and surfaces model-contract session/touch/level
+settings; Strategy-Core currently owns the active runtime implementation rather
+than hot-swapping multiple strategy variants per bundle. Features, labels,
+thresholds, classes, windows, and the confidence gate are contract-driven.
+Therefore per-prediction feature math and the touch population are aligned to the
+Strategy-Core v3 runtime contract; any model trained under old Chicago/exact-tick
+semantics must be treated as incompatible until retrained or explicitly measured.
 
 This plan implements live/replay CatBoost inference + outcome tracking in
 Trade-Lab, driven by a versioned **Strategy Contract** that ships with each
@@ -25,7 +26,7 @@ floor. It is grounded in the context report and the actual model bundle
 
 | # | Decision | Choice |
 |---|---|---|
-| B | Strategy semantics ownership | **B3 — contract-driven.** Sessions/touches/levels/windows/thresholds/features/classes are a versioned contract shipped with the model. Build a protocol **seam** + wrap Trade-Lab's existing tested engines as the default variant now; add research-aligned variants later only if measured drift warrants. |
+| B | Strategy semantics ownership | **B3 — shared Strategy-Core contract path.** Sessions/touches/levels/windows/thresholds/features/classes are versioned contract concepts. Runtime bars/sessions/levels/zones/touches are now delegated to Strategy-Core v3; Trade-Lab wraps that output for API/WebSocket/observation DTOs and keeps future variant selection behind the contract boundary. |
 | Scope | What this plan covers | **Trade-Lab runtime only**, plus `strategy.json` emission in Claude-Quant-Lab (Stage Q). |
 | Features | Inference feature set | **Schema-driven**, defaulting to the active model's 6: see §3. |
 | Output | What inference drives | **Intelligence + outcome tracking** (MAE-first). No execution, no risk. |
@@ -50,9 +51,10 @@ From `…iterations800_depth4/metadata.json` + `evaluation.json:454-515`:
 - Confidence gate (recommended): prob ≥ `0.70` → precision ~0.94 — `evaluation.json:399-401`
 
 **Consequence:** 3 of the 6 features are **approach (order-flow)** features over a
-30-min pre-touch window. They require top-of-book quotes + a rolling trade/quote
-buffer that Trade-Lab does not retain today (`runtime.py:168-219` routes
-`TopOfBookEvent` only to feed status). This buffer is the largest new piece.
+30-min pre-touch window. Trade-Lab now retains the required bounded L1/L0
+`MarketContextBuffer` of trades and top-of-book quotes on the shared live/replay
+runtime path; replay sources that lack quote-bearing context still produce NaN for
+spread-dependent approach features and should be surfaced as data-quality risk.
 
 ---
 
@@ -164,12 +166,16 @@ Each stage is independently shippable, gated on tests + the existing
 - **Tests (highest priority):** golden-vector fixtures; live==replay equivalence;
   each empty/edge case; ideally one cross-check vector exported from Claude-Quant-Lab.
 
-### Stage 2b — Strategy seam (default variant only)
-- Protocols `TouchRule` / `SessionScheme` / `LevelScheme` in `ports/`.
-- Default impl wraps Trade-Lab's existing tested engines (Chicago, exact-tick).
-- Contract selects the active variant at load. Research-aligned (ET/bar-intersect)
-  variant deferred until drift is measured.
-- **Tests:** default variant matches current engine behavior; contract selection wiring.
+### Stage 2b — Strategy-Core strategy seam (implemented default)
+- Runtime bars, sessions, levels/zones, and touches are delegated to
+  `StrategyCoreService` / `strategy_core.runtime.StrategyRuntime`.
+- Trade-Lab maps Strategy-Core snapshots/deltas to existing API/WebSocket DTOs;
+  it does not run a second authoritative Chicago/exact-touch engine.
+- Future contract-selected variants remain structural additions to Strategy-Core
+  or its adapter boundary, not rewrites of Trade-Lab runtime plumbing.
+- **Tests:** acceptance coverage compares direct Strategy-Core touch output with
+  Trade-Lab DTO/observation output and verifies old local engines are not used as
+  the authoritative runtime path.
 
 ### Stage 3 — `ModelRegistry` + `InferenceEngine` (with hot-swap)
 - `services/inference/model_registry.py`: discover bundles; **load + fail-closed
@@ -188,9 +194,10 @@ Each stage is independently shippable, gated on tests + the existing
 
 ### Stage 4 — `OutcomeTracker` (MAE-first, contract bar_type)
 - `services/inference/outcome_tracker.py`: per open prediction, consume contract
-  `bar_type` (147t) closed bars from `CandleEngine`; running max MFE/MAE vs level
-  by direction; **MAE first** (`mae≥sl → trap if mfe≥trap_min else blowthrough`;
-  else `mfe≥tp → tradeable`); RTH-close cutoff; session-end forced resolution;
+  `bar_type` (147t) closed bars from the Strategy-Core-backed runtime; running
+  max MFE/MAE vs level by direction; **MAE first** (`mae≥sl → trap if
+  mfe≥trap_min else blowthrough`; else `mfe≥tp → tradeable`); RTH-close cutoff;
+  session-end forced resolution;
   `actual_class`, `correct = predicted==actual`. Mirrors
   `dashboard_utility_labeling.py:44-108`; explicitly **not** v1's MFE-first tracker.
 - **Tests:** MAE-first ladder incl. same-bar SL+TP→loss; trap/blowthrough split;
@@ -235,15 +242,17 @@ Each stage is independently shippable, gated on tests + the existing
 ---
 
 ## 7. Risks
-- **Strategy-version skew:** a prediction is meaningful only under its contract.
-  Stamp every `Prediction`/`Outcome` with `contract_id`; hot-swap clears
-  prediction state; never mix bundles in one session.
+- **Strategy/runtime contract skew:** a prediction is meaningful only under the
+  Strategy-Core/runtime semantics used to create its touch population. Stamp every
+  `Prediction`/`Outcome` with `contract_id`; hot-swap clears prediction state;
+  never mix bundles in one session. Bundles trained under old Chicago/exact-tick
+  Trade-Lab semantics must be retrained or explicitly quarantined.
 - **Approach features need clean BBO:** trades-only replay → `app_max_spread` NaN
   every prediction. Catalog should prefer quote-bearing sources; warn otherwise.
-- **Touch-population drift (default variant):** Trade-Lab exact-tick touches ≠
-  research bar-intersect zone touches. Per-prediction features are correct;
-  aggregate calibration may shift. Instrument touch counts before trusting live
-  precision.
+- **Touch-population drift:** the runtime now uses Strategy-Core ET/bar-range
+  zone touches. Any saved evaluation calibrated on old Trade-Lab exact-level
+  touches is not directly comparable; verify/retrain under the v3 contract before
+  trusting live precision.
 - **Empty-case fidelity:** the 6 features have *different* missing-value rules
   (absorption→0.0, approach→NaN). Golden vectors are the guardrail.
 - **Never consume research caches:** `ml_features.parquet` / `ohlcv_1m*.parquet`
@@ -253,14 +262,10 @@ Each stage is independently shippable, gated on tests + the existing
 
 ---
 
-## 8. Next 10 tasks (ordered)
-1. Approve this plan / confirm Stage Q keep-or-revert.
-2. Stage Q: finish + verify `strategy.json` emission and the hand-authored file.
-3. Stage 0: Trade-Lab `StrategyContract` Pydantic + `ModelRegistry` discovery.
-4. Stage 1: `MarketContextBuffer` + quote routing.
-5. Stage 2: 6 `FeatureFn`s + golden/parity tests.
-6. Stage 2b: strategy seam + default variant.
-7. Stage 3: `ModelRegistry` fail-closed validation + `InferenceEngine` + hot-swap.
-8. Stage 4: MAE-first `OutcomeTracker`.
-9. Stage 5: DTOs/ws + model hot-swap REST + session/trading_day.
-10. Stage 6: frontend model picker + predictions panel + markers.
+## 8. Remaining validation tasks
+1. Retrain or verify model bundles against the Strategy-Core v3 runtime contract.
+2. Add golden-vector fixtures exported from Quant-Lab for the active model bundle.
+3. Run manual live Databento validation during active market hours.
+4. Verify quote-bearing replay sources for approach-feature coverage and surface
+   warnings when only trades are available.
+5. Keep execution/risk out of this vertical until explicitly approved.

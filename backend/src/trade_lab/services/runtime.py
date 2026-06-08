@@ -1,9 +1,9 @@
 """Runtime composition for live-compatible market events.
 
-The application runtime owns the Phase 2A engines so replay and future live feeds
-cannot accidentally diverge. Adapters may know where bytes came from, but only
-canonical events are allowed into this hot path and DTO mapping remains at the API
-edge.
+The application runtime delegates bars, sessions, levels, and touches to
+Strategy-Core so replay and live feeds cannot accidentally diverge. Adapters may
+know where bytes came from, but only canonical events are allowed into this hot
+path and DTO mapping remains at the API edge.
 """
 
 import logging
@@ -13,7 +13,7 @@ from datetime import date, timedelta
 from types import MappingProxyType
 from typing import Any
 
-from trade_lab.domain.candles import Candle, CandleEngine
+from trade_lab.domain.candles import Candle
 from trade_lab.domain.data_quality import DataQualityWarning
 from trade_lab.domain.events import (
     DailyStatisticEvent,
@@ -24,13 +24,13 @@ from trade_lab.domain.events import (
     TradeEvent,
 )
 from trade_lab.domain.feed import FeedConnectionState, FeedStatus
-from trade_lab.domain.levels import DisplayLevel, SessionLevelEngine, TouchEvent
+from trade_lab.domain.levels import DisplayLevel, TouchEvent
 from trade_lab.domain.market_context import DEFAULT_RETENTION_MINUTES, MarketContextBuffer
 from trade_lab.domain.observations import Observation, ObservationEngine, ObservationStatus
 from trade_lab.domain.outcomes import Outcome
-from trade_lab.domain.sessions import classify_session
 from trade_lab.services.inference.inference_engine import InferenceEngine, Prediction
 from trade_lab.services.inference.outcome_tracker import OutcomeTracker
+from trade_lab.services.strategy_core_service import StrategyCoreService
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +102,7 @@ class RuntimeSnapshot:
 
 
 class ApplicationRuntime:
-    """Compose domain engines behind one live/replay-compatible entry point."""
+    """Compose the Strategy-Core adapter and Trade-Lab DTO/inference state."""
 
     def __init__(
         self,
@@ -131,8 +131,15 @@ class ApplicationRuntime:
         if outcome_limit <= 0:
             raise ValueError("outcome_limit must be positive")
         self.requested_symbol = requested_symbol
-        self.candles = CandleEngine(tick_timeframes)
-        self.levels = SessionLevelEngine()
+        self.strategy_core_service = StrategyCoreService(
+            requested_symbol=requested_symbol,
+            tick_timeframes=tick_timeframes,
+            recent_closed_bar_limit=recent_closed_bar_limit,
+            warning_limit=warning_limit,
+        )
+        # Compatibility handles for tests/callers that load prior-day summaries through
+        # the runtime. New runtime semantics live in Strategy-Core.
+        self.levels = self.strategy_core_service
         self.observations = ObservationEngine(timedelta(seconds=observation_duration_seconds))
         # Rolling L1/L0 context for pre-touch order-flow features. Structurally cannot
         # hold depth, so inference downstream can never read more than trades + BBO.
@@ -187,8 +194,13 @@ class ApplicationRuntime:
 
         if requested_symbol is not None:
             self.requested_symbol = requested_symbol
-        self.candles = CandleEngine(self._tick_timeframes)
-        self.levels = SessionLevelEngine()
+        self.strategy_core_service = StrategyCoreService(
+            requested_symbol=self.requested_symbol,
+            tick_timeframes=self._tick_timeframes,
+            recent_closed_bar_limit=self._recent_closed_bar_limit,
+            warning_limit=self._warning_limit,
+        )
+        self.levels = self.strategy_core_service
         self.observations = ObservationEngine(
             timedelta(seconds=self._observation_duration_seconds)
         )
@@ -295,11 +307,8 @@ class ApplicationRuntime:
         than a fabricated value.
         """
 
-        last_event_ts = self._feed_status.last_event_ts_utc
-        if last_event_ts is None:
-            return None, None
-        info = classify_session(last_event_ts)
-        return info.session.value, info.trading_day
+        snapshot = self.strategy_core_service.snapshot()
+        return snapshot.session, snapshot.trading_day
 
     def _run_inference(
         self, changed_observations: tuple[Observation, ...]
@@ -460,12 +469,12 @@ class ApplicationRuntime:
         self._seed_closed_bars = trimmed
 
     def snapshot(self) -> RuntimeSnapshot:
-        candle_update = self.candles.snapshot_update(())
-        session, trading_day = self.session_state()
+        core_snapshot = self.strategy_core_service.snapshot()
+        session, trading_day = core_snapshot.session, core_snapshot.trading_day
         return RuntimeSnapshot(
-            current_bars=candle_update.current,
-            recent_closed_bars=tuple((*self._seed_closed_bars, *self._recent_closed_bars)),
-            display_levels=self.levels.display_levels(),
+            current_bars=core_snapshot.current_bars,
+            recent_closed_bars=tuple((*self._seed_closed_bars, *core_snapshot.recent_closed_bars)),
+            display_levels=core_snapshot.display_levels,
             active_observations=self.observations.active(),
             feed_status=self._feed_status,
             warnings=tuple(self._warnings),
@@ -487,50 +496,75 @@ class ApplicationRuntime:
         self.market_context.append_quote(
             quote.event_ts_utc, quote.bid_price_ticks, quote.ask_price_ticks
         )
-        return self._update_feed_context(quote.event_ts_utc, schema=quote.source_schema)
+        was_disconnected = self._feed_status.state == FeedConnectionState.DISCONNECTED
+        core_update = self.strategy_core_service.process_market_event(quote)
+        if core_update.feed_status is not None:
+            mapped = self._feed_status_for_mode(core_update.feed_status)
+            next_state = (
+                FeedConnectionState.CONNECTED if was_disconnected else self._feed_status.state
+            )
+            self._feed_status = FeedStatus(
+                state=next_state,
+                mode=mapped.mode,
+                requested_symbol=mapped.requested_symbol,
+                raw_symbol=mapped.raw_symbol,
+                dataset=mapped.dataset,
+                schema=mapped.schema,
+                last_event_ts_utc=mapped.last_event_ts_utc,
+                last_message=mapped.last_message,
+                metadata=dict(mapped.metadata),
+            )
+            if was_disconnected:
+                return RuntimeUpdate(feed_status=self._feed_status)
+            return RuntimeUpdate()
+        return RuntimeUpdate()
 
     def _process_trade(self, trade: TradeEvent) -> RuntimeUpdate:
         self.market_context.append_trade(
             trade.event_ts_utc, trade.price_ticks, trade.size, trade.side
         )
-        candle_update = self.candles.process_trade(trade)
-        if candle_update.completed:
-            self._recent_closed_bars.extend(candle_update.completed)
-            if len(self._recent_closed_bars) > self._recent_closed_bar_limit:
-                del self._recent_closed_bars[
-                    : len(self._recent_closed_bars) - self._recent_closed_bar_limit
-                ]
-        level_update = self.levels.process_trade(trade)
+        core_update = self.strategy_core_service.process_market_event(trade)
         changed_observations = list(self.observations.refresh(trade.event_ts_utc))
         # Run inference before appending the just-started observations: only the
         # observations completed by this trade are eligible for a prediction now.
         predictions = self._run_inference(tuple(changed_observations))
         # Resolve any open predictions against bars that just closed on this trade.
-        outcomes = self._track_outcomes(candle_update.completed)
-        for touch in level_update.touches:
+        outcomes = self._track_outcomes(core_update.closed_bars)
+        for touch in core_update.touches:
             changed_observations.append(self.observations.start_from_touch(touch))
-        self._feed_status = FeedStatus(
-            state=FeedConnectionState.CONNECTED
-            if self._feed_status.mode == "live"
-            else FeedConnectionState.REPLAYING,
-            mode=self._feed_status.mode if self._feed_status.mode != "idle" else "runtime",
-            requested_symbol=trade.requested_symbol,
-            raw_symbol=trade.raw_symbol,
-            dataset=self._feed_status.dataset,
-            schema=trade.source_schema or self._feed_status.schema,
-            last_event_ts_utc=trade.event_ts_utc,
-            last_message="trade processed",
-            metadata=dict(self._feed_status.metadata),
-        )
+        self._feed_status = self._feed_status_for_mode(core_update.feed_status, trade=trade)
         return RuntimeUpdate(
             feed_status=self._feed_status,
-            current_bars=candle_update.current,
-            closed_bars=candle_update.completed,
-            display_levels=level_update.display_levels,
-            touches=level_update.touches,
+            current_bars=core_update.current_bars,
+            closed_bars=core_update.closed_bars,
+            display_levels=core_update.display_levels,
+            touches=core_update.touches,
             observations=tuple(changed_observations),
             predictions=predictions,
             outcomes=outcomes,
+        )
+
+    def _feed_status_for_mode(
+        self, status: FeedStatus | None, *, trade: TradeEvent | None = None
+    ) -> FeedStatus:
+        base = status or self._feed_status
+        mode = self._feed_status.mode if self._feed_status.mode != "idle" else base.mode
+        state = FeedConnectionState.CONNECTED if mode == "live" else FeedConnectionState.REPLAYING
+        schema = (
+            (None if trade is None else trade.source_schema)
+            or base.schema
+            or self._feed_status.schema
+        )
+        return FeedStatus(
+            state=state,
+            mode=mode if mode != "idle" else "runtime",
+            requested_symbol=base.requested_symbol or self.requested_symbol,
+            raw_symbol=self._feed_status.raw_symbol if trade is None else trade.raw_symbol,
+            dataset=self._feed_status.dataset,
+            schema=schema,
+            last_event_ts_utc=base.last_event_ts_utc,
+            last_message=base.last_message,
+            metadata={**dict(self._feed_status.metadata), **dict(base.metadata)},
         )
 
     def _update_feed_context(self, event_ts_utc, *, schema: str | None) -> RuntimeUpdate:

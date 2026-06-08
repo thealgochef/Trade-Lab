@@ -52,9 +52,10 @@ Chart requirements:
 - tick bars only;
 - live in-progress bar;
 - completed bars emitted after configured trade count;
-- level overlays for PDH/PDL and Asia/London/NY highs/lows;
+- level overlays for PDH/PDL and Strategy-Core-emitted session highs/lows
+  (currently Asia/London);
 - visible distinction between eligible signal levels and display-only levels;
-- touch markers at exact traded-price touches;
+- touch markers at Strategy-Core bar-range zone touches;
 - session separators;
 - trading-day boundary markers;
 - data-quality overlays for stale feed, replay gaps, or unresolved instrument state.

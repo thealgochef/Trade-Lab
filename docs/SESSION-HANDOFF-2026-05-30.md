@@ -1,6 +1,9 @@
 # Trade-Lab Session Hand-Off — 2026-05-30
 
-Audience: the engineer or AI agent picking up this work in the next session with no memory of this one. This document is self-contained.
+Audience: historical hand-off. **Superseded 2026-06-08:** Strategy-Core v3 now owns
+Trade-Lab runtime bars, ET sessions, levels/zones, and bar-range zone touches; the
+old Stage 2b deferred / Chicago exact-touch warning below has been resolved by the
+Strategy-Core runtime migration.
 
 Branch: `trade-lab-v2`. Project root: `C:\Users\gonza\Documents\Trade-Lab`.
 
@@ -11,8 +14,11 @@ Branch: `trade-lab-v2`. Project root: `C:\Users\gonza\Documents\Trade-Lab`.
 - **Shipped:** A contract-driven CatBoost ML-inference subsystem layered onto the existing market-data runtime in Trade-Lab — strategy-contract trust boundary, fail-closed model registry, L1/L0 market-context buffer, six contract feature functions, an inference engine, an MAE-first outcome tracker, live warm-up seeding, plus REST/WebSocket hot-swap wiring and a full frontend (model picker + predictions panel + on-chart markers). The plan is **IMPLEMENTED through Stage 6**.
 - **Tests green:** Backend `415 passed, 1 skipped` (5.19s); benchmark `2 passed` (~137k events/sec median). Frontend `137 tests passed` (16 files), production build clean (`tsc --noEmit` + `vite build`).
 - **Inference is inert by default:** no model is active until an operator activates one via the API/UI — the runtime serves market data unchanged until then.
-- **Biggest open gap:** **Stage 2b (the strategy seam) is DEFERRED.** The contract's `session_scheme` / `touch_rule` / `level_scheme` are parsed and surfaced but do **not** yet drive behavior — inference still fires off Trade-Lab's existing engines (America/Chicago sessions, exact-tick touches), so the **touch population drifts** from the research bar-intersect/ET rule. Per-prediction feature math is faithful to training, but aggregate calibration must be measured before trusting live precision.
-- **Next:** Build Stage 2b (formal TouchRule/SessionScheme/LevelScheme protocols + research-aligned ET/bar-intersect variant), then validate live precision against a quote-bearing source.
+- **Strategy seam status:** The prior Stage 2b gap is now resolved outside this
+  historical session: Trade-Lab delegates bars, ET sessions, levels/zones, and
+  bar-range zone touches to Strategy-Core v3 and maps that output to DTOs.
+- **Next:** Retrain/verify model bundles against the Strategy-Core v3 contract,
+  then validate live precision against a quote-bearing source.
 
 ---
 
@@ -55,7 +61,7 @@ Scope was deliberately bounded to the **Trade-Lab runtime only**. Claude-Quant-L
 | `services/inference/features/__init__.py` | Feature package exports. |
 | `services/inference/__init__.py` | Inference package init. |
 | `adapters/databento_historical.py` | Databento Historical API source for live warm-up seeding (L0/L1 front-month trades → pandas DataFrame); import-safe (client built lazily, `frame_fetcher` injectable for tests). |
-| `services/seed.py` | `HistoricalSeedService`: vectorized warm-up tick-bar builder for last N sessions (~100x faster); `build_tick_bars_from_frame` reproduces CandleEngine semantics (parity-tested). |
+| `services/seed.py` | `HistoricalSeedService`: legacy vectorized warm-up display-bar builder for last N sessions; current authoritative live/replay bars, sessions, levels, and touches come from Strategy-Core. |
 
 **Edited files (inference-relevant):**
 
@@ -195,7 +201,11 @@ Related defaults: `market_context_retention_minutes=45` (covers approach 30 + in
 
 **Most important first.**
 
-1. **Stage 2b (strategy seam) DEFERRED — touch-population drift.** Formal `TouchRule`/`SessionScheme`/`LevelScheme` protocols + a research-aligned ET/bar-intersect variant were not built. The contract's `session_scheme`/`touch_rule`/`level_scheme` are parsed and surfaced but do **not** drive behavior. Inference fires off Trade-Lab's existing engines (America/Chicago sessions, **exact-tick** touches), which differ from the research **bar-intersect** zone touches (ET, zone_proximity 3.0pts, first_touch_per_zone_per_day). **Per-prediction feature math is faithful to training, but the touch population — and thus aggregate calibration/precision — may shift.** Instrument touch counts before trusting live precision.
+1. **Historical Stage 2b gap resolved after this handoff.** Trade-Lab now delegates
+   runtime bars, ET sessions, levels/zones, and bar-range first touches to
+   Strategy-Core v3. The remaining risk is model-bundle compatibility: any bundle
+   trained/evaluated under the old exact-touch/Chicago semantics must be retrained
+   or quarantined before live precision is trusted.
 
 2. **Approach features need quotes.** 3 of 6 features (`app_large_trade_vol_pct`, `app_avg_trade_size`, `app_max_spread`) are order-flow over the 30-min pre-touch window and require clean top-of-book BBO. A trades-only replay source makes `app_max_spread` (and approach features) **NaN on every prediction**. The catalog should prefer quote-bearing sources and warn otherwise.
 
@@ -221,11 +231,14 @@ Related defaults: `market_context_retention_minutes=45` (covers approach 30 + in
 
 ## 8. Recommended Next Steps (Prioritized)
 
-1. **Build Stage 2b — the strategy seam.** Define `TouchRule`/`SessionScheme`/`LevelScheme` protocols and a research-aligned ET / bar-intersect variant driven by the contract, so the *touch population* matches training (ET sessions, zone_proximity 3.0pts, first_touch_per_zone_per_day, 147t bar-intersect). This is the headline gap and the prerequisite for trustworthy precision.
-2. **Measure touch-population drift.** With Stage 2b in place, instrument touch counts under both the legacy (exact-tick / Chicago) and research (ET / bar-intersect) rules over the NQ replay set and compare. Quantify the calibration shift before trusting any live precision number.
+1. **Retrain or verify model bundles against Strategy-Core v3.** The runtime touch
+   population now matches Strategy-Core ET/bar-range zone semantics; bundles trained
+   under old exact-touch/Chicago behavior are not directly comparable.
+2. **Add golden-vector / bundle-parity fixtures** exported from Quant-Lab for the
+   active model bundle.
 3. **Prefer quote-bearing replay sources + warn.** Make the replay catalog prefer sources that carry top-of-book BBO; warn (or refuse) when a trades-only source would NaN the approach features.
 4. **Verify bundle checksum + fail-closed path.** Confirm the production bundle ships `model.cbm.sha256` and that `ModelRegistry` rejects a tampered/wrong-feature/wrong-tick model. Add a guard/alert for silently-missing `strategy.json` (Stage Q best-effort emission).
-5. **Run a manual live Databento session** to validate live==replay feature equivalence and measure live precision against the research touch rule.
+5. **Run a manual live Databento session** to validate live==replay feature equivalence and measure live precision under the Strategy-Core v3 contract.
 6. **(Optional) Frontend code-splitting** if the ~352 kB single bundle becomes a concern.
 
 ---
@@ -234,7 +247,7 @@ Related defaults: `market_context_retention_minutes=45` (covers approach 30 + in
 
 | Item | Path |
 |---|---|
-| Staged plan + status (IMPLEMENTED through Stage 6; 2b deferred) | `C:\Users\gonza\Documents\Trade-Lab\docs\inference-integration-plan.md` |
+| Staged plan + status (Strategy-Core runtime seam implemented) | `C:\Users\gonza\Documents\Trade-Lab\docs\inference-integration-plan.md` |
 | Memory: inference integration notes | `trade-lab-inference-integration.md` (auto-memory) |
 | Memory: Databento NQ store layout + multi-instrument contamination gotcha | `databento-nq-store.md` (auto-memory) |
 | Memory: tick-bar behavior + live seeding gotchas | `trade-lab-candle-fix.md` (auto-memory) |

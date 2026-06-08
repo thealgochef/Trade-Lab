@@ -2,16 +2,20 @@
 
 import asyncio
 import logging
-import queue
 import time
 from collections.abc import Awaitable, Callable, Iterable
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import cast
+
+from strategy_core.runtime import ReplayConfig as CoreReplayConfig
+from strategy_core.runtime import ReplayRuntime as CoreReplayRuntime
+from strategy_core.runtime import ReplayState as CoreReplayState
 
 from trade_lab.domain.data_quality import DataQualityCode, DataQualitySeverity, DataQualityWarning
+from trade_lab.domain.events import MarketEvent
 from trade_lab.domain.feed import FeedConnectionState, FeedStatus
 from trade_lab.ports.market_data import HistoricalMarketDataSource
 from trade_lab.services.runtime import (
@@ -29,13 +33,21 @@ logger = logging.getLogger(__name__)
 _REPLAY_FLUSH_INTERVAL_SECONDS = 0.05
 _REPLAY_MAX_PENDING_UPDATES = 4000
 
-# The historical scan (parquet decode + per-row normalization) is CPU-heavy and blocks in
-# ~batch-sized chunks. Running it on a worker thread feeding a bounded queue keeps a batch
-# boundary from freezing the event loop / WebSocket fan-out (which showed as replay
-# "stop-and-go"). The buffer absorbs decode stalls so the consumer never starves.
-_REPLAY_PRODUCER_QUEUE_DEPTH = 20_000
-_REPLAY_CONSUMER_CHUNK = 1_000
-_SCAN_DONE = object()
+class _StrategyCoreHistoricalSourceAdapter:
+    """Expose a Trade-Lab historical source as a Strategy-Core replay source."""
+
+    def __init__(self, source: HistoricalMarketDataSource, config: "ReplayConfig") -> None:
+        self._source = source
+        self._config = config
+
+    def events(self):
+        yield from self._source.scan(
+            self._config.paths,
+            requested_symbol=self._config.requested_symbol,
+            schema=self._config.schema,
+            start_ts_utc=self._config.start_ts_utc,
+            end_ts_utc=self._config.end_ts_utc,
+        )
 
 
 class ReplayState(StrEnum):
@@ -102,6 +114,7 @@ class HistoricalReplayService:
         self._failed_at_utc: datetime | None = None
         self._config: ReplayConfig | None = None
         self._task: asyncio.Task[None] | None = None
+        self.strategy_core_replay: CoreReplayRuntime | None = None
         self._pause_event = asyncio.Event()
         self._pause_event.set()
         self._stop_requested = False
@@ -126,19 +139,35 @@ class HistoricalReplayService:
         self._on_update = callback
 
     def status(self) -> ReplayStatus:
+        core_status = (
+            None if self.strategy_core_replay is None else self.strategy_core_replay.status()
+        )
+        state = self._state
+        if core_status is not None and core_status.state != CoreReplayState.IDLE:
+            state = _map_core_replay_state(core_status.state, fallback=self._state)
         return ReplayStatus(
-            state=self._state,
-            events_processed=self._events_processed,
-            warnings_recorded=self._warnings_recorded,
-            last_event_ts_utc=self._last_event_ts_utc,
-            last_error=self._last_error,
+            state=state,
+            events_processed=(
+                self._events_processed if core_status is None else core_status.events_processed
+            ),
+            warnings_recorded=(
+                self._warnings_recorded if core_status is None else core_status.warnings_recorded
+            ),
+            last_event_ts_utc=self._last_event_ts_utc
+            if core_status is None
+            else core_status.last_event_ts_utc,
+            last_error=self._last_error if core_status is None else core_status.last_error,
             requested_symbol=None if self._config is None else self._config.requested_symbol,
             schema=None if self._config is None else self._config.schema,
             source_id=None if self._config is None else self._config.source_id,
             source_label=None if self._config is None else self._config.source_label,
-            started_at_utc=self._started_at_utc,
-            completed_at_utc=self._completed_at_utc,
-            failed_at_utc=self._failed_at_utc,
+            started_at_utc=self._started_at_utc
+            if core_status is None
+            else core_status.started_at_utc,
+            completed_at_utc=self._completed_at_utc
+            if core_status is None
+            else core_status.completed_at_utc,
+            failed_at_utc=self._failed_at_utc if core_status is None else core_status.failed_at_utc,
         )
 
     async def start(self, source: HistoricalMarketDataSource, config: ReplayConfig) -> None:
@@ -154,6 +183,8 @@ class HistoricalReplayService:
         self._failed_at_utc = None
         self._stop_requested = False
         self._pause_event.set()
+        self._pending_updates = []
+        self._last_flush_monotonic = time.monotonic()
         self._state = ReplayState.LOADING
         await self._emit(
             self.runtime.reset(
@@ -173,185 +204,113 @@ class HistoricalReplayService:
                 )
             )
         )
+        adapter = _StrategyCoreHistoricalSourceAdapter(source, config)
+        self.strategy_core_replay = CoreReplayRuntime(
+            None,
+            adapter,
+            process_item=self._process_replay_item,
+            on_update=self._on_strategy_core_replay_update,
+            is_warning=lambda item: isinstance(item, DataQualityWarning),
+            event_timestamp=lambda item: getattr(item, "event_ts_utc", None),
+            on_timestamp_regression=self._timestamp_regression_update,
+        )
         self._state = ReplayState.READY
-        self._task = asyncio.create_task(self._run(source, config))
+        self._task = asyncio.create_task(self._run_strategy_core_replay(config))
 
     async def pause(self) -> None:
-        if self._state == ReplayState.RUNNING:
+        core = self.strategy_core_replay
+        if self._state == ReplayState.RUNNING and core is not None:
+            await core.pause()
             self._state = ReplayState.PAUSED
-            self._pause_event.clear()
             await self._emit_feed_status("historical replay paused")
 
     async def resume(self) -> None:
-        if self._state == ReplayState.PAUSED:
+        core = self.strategy_core_replay
+        if self._state == ReplayState.PAUSED and core is not None:
+            await core.resume()
             self._state = ReplayState.RUNNING
-            self._pause_event.set()
             await self._emit_feed_status("historical replay resumed")
 
     async def stop(self) -> None:
         self._stop_requested = True
         self._pause_event.set()
+        core = self.strategy_core_replay
+        if core is not None:
+            await core.stop()
         if self._task is not None and not self._task.done():
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                self._state = ReplayState.CANCELLED
-                await self._emit_terminal_feed_status("historical replay cancelled")
-                return
-        if self._state not in (ReplayState.COMPLETED, ReplayState.FAILED, ReplayState.CANCELLED):
+            await self._task
+        if self._state not in (
+            ReplayState.COMPLETED,
+            ReplayState.FAILED,
+            ReplayState.CANCELLED,
+            ReplayState.STOPPED,
+        ):
             self._state = ReplayState.STOPPED
             self._completed_at_utc = datetime.now(UTC)
             await self._emit_terminal_feed_status("historical replay stopped")
 
-    async def _run(self, source: HistoricalMarketDataSource, config: ReplayConfig) -> None:
+    def _process_replay_item(self, item: object) -> RuntimeUpdate:
+        if isinstance(item, DataQualityWarning):
+            return self.runtime.record_warning(item)
+        return self.runtime.process_market_event(cast(MarketEvent, item))
+
+    async def _on_strategy_core_replay_update(self, update: RuntimeUpdate) -> None:
+        self._accumulate(update)
+        await self._maybe_flush()
+
+    def _timestamp_regression_update(
+        self, item: object, _previous_ts: datetime
+    ) -> RuntimeUpdate:
+        event_ts = getattr(item, "event_ts_utc", None)
+        return self.runtime.record_warning(
+            DataQualityWarning(
+                code=DataQualityCode.TIMESTAMP_REGRESSION,
+                message="historical replay event timestamp regressed",
+                severity=DataQualitySeverity.WARNING,
+                source="historical-replay",
+                event_ts_utc=event_ts if isinstance(event_ts, datetime) else None,
+            )
+        )
+
+    async def _run_strategy_core_replay(self, config: ReplayConfig) -> None:
+        core = self.strategy_core_replay
+        if core is None:
+            raise RuntimeError("Strategy-Core replay runtime is not configured")
         self._state = ReplayState.RUNNING
-        self._pending_updates = []
-        self._last_flush_monotonic = time.monotonic()
-        raw_queue: queue.Queue = queue.Queue(maxsize=_REPLAY_PRODUCER_QUEUE_DEPTH)
-        producer_error: list[BaseException] = []
-        max_events = config.max_events
-
-        def _produce() -> None:
-            # Worker thread: pull canonical events from the blocking scan into the queue so
-            # the event loop never waits on parquet decode. Checks max_events BEFORE fetching
-            # so the source is never over-read (the max_events DoS guard), and honors stop.
-            produced = 0
-            try:
-                scan = iter(
-                    source.scan(
-                        config.paths,
-                        requested_symbol=config.requested_symbol,
-                        schema=config.schema,
-                        start_ts_utc=config.start_ts_utc,
-                        end_ts_utc=config.end_ts_utc,
-                    )
-                )
-                while not self._stop_requested:
-                    if max_events is not None and produced >= max_events:
-                        break
-                    try:
-                        produced_item = next(scan)
-                    except StopIteration:
-                        break
-                    produced += 1
-                    while not self._stop_requested:
-                        try:
-                            raw_queue.put(produced_item, timeout=0.1)
-                            break
-                        except queue.Full:
-                            continue
-            except Exception as exc:
-                producer_error.append(exc)
-            finally:
-                while not self._stop_requested:
-                    try:
-                        raw_queue.put(_SCAN_DONE, timeout=0.1)
-                        break
-                    except queue.Full:
-                        continue
-                else:
-                    with suppress(queue.Full):
-                        raw_queue.put_nowait(_SCAN_DONE)
-
-        def _drain() -> list[object]:
-            chunk: list[object] = [raw_queue.get()]
-            while len(chunk) < _REPLAY_CONSUMER_CHUNK:
-                try:
-                    chunk.append(raw_queue.get_nowait())
-                except queue.Empty:
-                    break
-            return chunk
-
-        producer = asyncio.create_task(asyncio.to_thread(_produce))
-        buffer: list[object] = []
-        buffer_index = 0
-        try:
-            previous_event_ts: datetime | None = None
-            emitted_items_processed = 0
-            while True:
-                if self._stop_requested:
-                    await self._flush_pending()
-                    self._state = ReplayState.STOPPED
-                    await self._emit_terminal_feed_status("historical replay stopped")
-                    return
-                if config.max_events is not None and emitted_items_processed >= config.max_events:
-                    break
-                await self._pause_event.wait()
-                if buffer_index >= len(buffer):
-                    buffer = await asyncio.to_thread(_drain)
-                    buffer_index = 0
-                item = buffer[buffer_index]
-                buffer_index += 1
-                if item is _SCAN_DONE:
-                    if producer_error:
-                        raise producer_error[0]
-                    break
-                if isinstance(item, DataQualityWarning):
-                    self._warnings_recorded += 1
-                    emitted_items_processed += 1
-                    self._accumulate(self.runtime.record_warning(item))
-                    await self._maybe_flush()
-                    continue
-                if previous_event_ts is not None and config.speed > 0:
-                    elapsed = max((item.event_ts_utc - previous_event_ts).total_seconds(), 0)
-                    delay = elapsed / config.speed
-                    await asyncio.sleep(min(delay, 0.25))
-                await self._pause_event.wait()
-                if self._stop_requested:
-                    await self._flush_pending()
-                    self._state = ReplayState.STOPPED
-                    await self._emit_terminal_feed_status("historical replay stopped")
-                    return
-                if previous_event_ts is not None and item.event_ts_utc < previous_event_ts:
-                    self._warnings_recorded += 1
-                    emitted_items_processed += 1
-                    self._accumulate(
-                        self.runtime.record_warning(
-                            DataQualityWarning(
-                                code=DataQualityCode.TIMESTAMP_REGRESSION,
-                                message="historical replay event timestamp regressed",
-                                severity=DataQualitySeverity.WARNING,
-                                source="historical-replay",
-                                event_ts_utc=item.event_ts_utc,
-                            )
-                        )
-                    )
-                    await self._maybe_flush()
-                    continue
-                self._events_processed += 1
-                emitted_items_processed += 1
-                self._last_event_ts_utc = item.event_ts_utc
-                previous_event_ts = item.event_ts_utc
-                self._accumulate(self.runtime.process_market_event(item))
-                await self._maybe_flush()
-                await asyncio.sleep(0)
-            await self._flush_pending()
+        await core.start(CoreReplayConfig(speed=config.speed, max_events=config.max_events))
+        await self._flush_pending()
+        status = core.status()
+        self._events_processed = status.events_processed
+        self._warnings_recorded = status.warnings_recorded
+        self._last_event_ts_utc = status.last_event_ts_utc
+        self._last_error = status.last_error
+        self._started_at_utc = status.started_at_utc or self._started_at_utc
+        self._completed_at_utc = status.completed_at_utc
+        self._failed_at_utc = status.failed_at_utc
+        if status.state == CoreReplayState.COMPLETED:
             self._state = ReplayState.COMPLETED
-            self._completed_at_utc = datetime.now(UTC)
             await self._emit_terminal_feed_status("historical replay completed")
-        except asyncio.CancelledError:
-            self._state = ReplayState.CANCELLED
+            return
+        if status.state == CoreReplayState.STOPPED:
+            self._state = ReplayState.STOPPED
             self._completed_at_utc = datetime.now(UTC)
-            await self._emit_terminal_feed_status("historical replay cancelled")
-            raise
-        except Exception as exc:
-            self._last_error = type(exc).__name__
+            await self._emit_terminal_feed_status("historical replay stopped")
+            return
+        if status.state == CoreReplayState.FAILED:
             self._state = ReplayState.FAILED
-            self._failed_at_utc = datetime.now(UTC)
-            sanitized_message = _safe_text(str(exc))
+            config = self._config or config
             logger.error(
                 "historical replay failed: exception_type=%s message=%s "
                 "schema=%s symbol=%s events=%s state=%s",
-                type(exc).__name__,
-                sanitized_message,
+                status.last_error,
+                _safe_text(status.last_message),
                 _safe_text(config.schema),
                 _safe_text(config.requested_symbol),
                 self._events_processed,
                 self._state.value,
                 extra={
-                    "exception_type": type(exc).__name__,
-                    "sanitized_message": sanitized_message,
+                    "exception_type": status.last_error,
+                    "sanitized_message": _safe_text(status.last_message),
                     "schema": _safe_text(config.schema),
                     "requested_symbol": _safe_text(config.requested_symbol),
                     "source_labels": [_safe_source(str(path)) for path in config.paths],
@@ -360,11 +319,7 @@ class HistoricalReplayService:
                 },
             )
             await self._emit_terminal_feed_status("historical replay failed")
-        finally:
-            # Signal the scan thread to stop and let it unwind (it exits within ~0.1s).
-            self._stop_requested = True
-            with suppress(BaseException):
-                await producer
+            return
 
     async def _emit_feed_status(self, message: str) -> None:
         await self._flush_pending()
@@ -435,6 +390,17 @@ class HistoricalReplayService:
         self.updates.put_nowait(update)
         if self._on_update is not None:
             await self._on_update(update)
+
+
+def _map_core_replay_state(state: CoreReplayState, *, fallback: ReplayState) -> ReplayState:
+    return {
+        CoreReplayState.IDLE: fallback,
+        CoreReplayState.RUNNING: ReplayState.RUNNING,
+        CoreReplayState.PAUSED: ReplayState.PAUSED,
+        CoreReplayState.COMPLETED: ReplayState.COMPLETED,
+        CoreReplayState.FAILED: ReplayState.FAILED,
+        CoreReplayState.STOPPED: ReplayState.STOPPED,
+    }[state]
 
 
 def _coalesce_replay_updates(updates: list[RuntimeUpdate]) -> RuntimeUpdate:

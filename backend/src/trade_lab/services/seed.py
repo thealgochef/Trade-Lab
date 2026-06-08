@@ -7,9 +7,9 @@ bars **vectorized** (PyArrow/pandas), which is ~100x faster than per-trade Pytho
 keeps a multi-day warm-up to tens of seconds. It is intentionally synchronous/blocking
 — callers run it off the event loop (e.g. ``asyncio.to_thread``).
 
-``build_tick_bars_from_frame`` deliberately reproduces ``CandleEngine`` semantics
-(trading-day classification, N-trades-per-bar, day-boundary closes); a parity test
-guards the two paths against drift.
+``build_tick_bars_from_frame`` is a legacy warm-up helper for display context only;
+authoritative live/replay runtime bars, sessions, levels, and touches are produced
+by Strategy-Core.
 """
 
 import logging
@@ -42,12 +42,12 @@ _TICK_SIZE = float(NQ_TICK_SIZE)
 def build_tick_bars_from_frame(
     frame: "pd.DataFrame", timeframes: tuple[int, ...]
 ) -> list[Candle]:
-    """Vectorized equivalent of feeding ``frame``'s trades through ``CandleEngine``.
+    """Build display seed bars from historical trades without starting live replay.
 
     ``frame`` must have ``ts_event`` (UTC), ``price`` (tick-aligned dollars) and
-    ``size``. Trades in the 16:00-18:00 CT closed window are dropped (no trading day),
-    matching ``CandleEngine``. The most recent session's trailing partial is emitted as
-    an END_OF_DAY bar, identical to ``CandleEngine.finalize_trading_day``.
+    ``size``. Trades in the 16:00-18:00 CT closed window are dropped for backward
+    compatibility with existing chart warm-up behavior. The most recent session's
+    trailing partial is emitted as an END_OF_DAY display bar.
     """
 
     import numpy as np

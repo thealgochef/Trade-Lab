@@ -344,6 +344,12 @@ def _trade(ts: datetime, price_ticks: int) -> TradeEvent:
     )
 
 
+def _drive_pdh_touch(runtime: ApplicationRuntime, day0: datetime) -> None:
+    runtime.levels.load_prior_day_summary((day0 - timedelta(days=1)).date(), 68_010, 67_990)
+    runtime.process_market_event(_trade(day0, 68_008))
+    runtime.process_market_event(_trade(day0 + timedelta(seconds=1), 68_012))
+
+
 def test_status_session_derived_from_latest_event(tmp_path: Path) -> None:
     runtime = ApplicationRuntime(
         requested_symbol="NQ.c.0", tick_timeframes=(2,), observation_duration_seconds=300
@@ -367,8 +373,7 @@ def test_prediction_created_and_resolved_envelopes_validate(tmp_path: Path) -> N
     # carries a prediction; then map it through the broadcaster the way the live ws
     # fan-out does (mirrors test_api_contract's messages_for_update assertions).
     day0 = datetime(2026, 1, 5, 14, 30, tzinfo=UTC)
-    runtime.levels.load_prior_day_summary((day0 - timedelta(days=1)).date(), 68_010, 67_990)
-    runtime.process_market_event(_trade(day0, 68_010))
+    _drive_pdh_touch(runtime, day0)
     completion = runtime.process_market_event(_trade(day0 + timedelta(minutes=6), 68_011))
     assert completion.predictions, "expected a prediction on observation completion"
 
@@ -407,8 +412,7 @@ def test_resolved_outcome_envelope_validates_when_a_forward_bar_closes(tmp_path:
     _client, runtime, broadcaster = _runtime_app_with_active_model(tmp_path)
 
     day0 = datetime(2026, 1, 5, 14, 30, tzinfo=UTC)
-    runtime.levels.load_prior_day_summary((day0 - timedelta(days=1)).date(), 68_010, 67_990)
-    runtime.process_market_event(_trade(day0, 68_010))
+    _drive_pdh_touch(runtime, day0)
     runtime.process_market_event(_trade(day0 + timedelta(minutes=6), 68_011))
 
     # Synthesize an outcome envelope directly from the runtime API to validate the

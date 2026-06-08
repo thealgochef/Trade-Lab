@@ -30,9 +30,9 @@
 
 ## Architecture Boundaries
 
-- `backend/src/trade_lab/domain` is pure market-data/domain logic; keep FastAPI, Pydantic DTOs, Databento SDK objects, filesystem paths, and frontend payload assumptions out of it.
-- Live and replay must both feed canonical events through `ApplicationRuntime.process_market_event()`; do not add separate candle/level/touch semantics for one mode.
-- Only `TradeEvent` increments tick bars and creates authoritative level/touch behavior; quote/book/status/definition/statistics events are context only.
+- `backend/src/trade_lab/domain` is pure Trade-Lab DTO/compatibility logic; keep FastAPI, Pydantic DTOs, Databento SDK objects, filesystem paths, and frontend payload assumptions out of it.
+- Live and replay must both feed canonical events through `ApplicationRuntime.process_market_event()` and then `StrategyCoreService`; do not add separate candle/level/touch semantics for one mode.
+- Only trade events increment Strategy-Core tick bars and create authoritative level/touch behavior; quote/book/status/definition/statistics events are context only.
 - Prices are integer ticks for NQ (`0.25` points); do not compare or round price-like values with binary floats in backend domain code.
 - API/WebSocket DTO mapping belongs at the API boundary; WebSocket envelopes are versioned as `ws.v1`.
 

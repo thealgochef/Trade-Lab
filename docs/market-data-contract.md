@@ -1,6 +1,9 @@
-# Market Data Contract — Phase 1
+# Market Data Contract — Strategy-Core Runtime Boundary
 
-This document defines the Trade-Lab v1 market-data contract for live and replay. The contract is designed so historical/replay interpretation matches live interpretation.
+This document defines the Trade-Lab market-data contract for live and replay. The
+contract is designed so historical/replay interpretation matches live
+interpretation. Authoritative bar, session, level/zone, and touch semantics are now
+owned by Strategy-Core and mapped to Trade-Lab API/WebSocket DTOs at the boundary.
 
 ## Instrument
 
@@ -75,14 +78,18 @@ remain hidden.
 
 Trade-Lab must not build production semantics from fields unavailable in the live
 v1 feed. Historical/replay and live modes must interpret events through the same
-canonical event stream. MBP-10 replay therefore projects only live-compatible
-fields: trade action rows (`T`/`Trade` variants) may produce `TradeEvent`, level 0
-bid/ask may produce optional `TopOfBookEvent` context, and deeper book levels are
-ignored as runtime features.
+canonical event stream and Strategy-Core runtime semantics. MBP-10 replay therefore
+projects only live-compatible fields: trade action rows (`T`/`Trade` variants) may
+produce trade events, level 0 bid/ask may produce optional top-of-book context, and
+deeper book levels are ignored as runtime features.
 
 ## Canonical Event Stream
 
-All live and replay inputs must be normalized into canonical event types before domain processing.
+All live and replay inputs must be normalized into canonical event types before
+runtime processing. Trade-Lab may use local DTO classes at its API/service boundary,
+but `ApplicationRuntime` converts market-data events into Strategy-Core neutral
+`Trade`/`Quote` objects through `StrategyCoreService` before authoritative bar,
+session, level, zone, or touch state is updated.
 
 ### `TradeEvent`
 
@@ -158,7 +165,9 @@ Required fields:
 ## Time Semantics
 
 - Internal event timestamps: UTC.
-- Session logic timezone: `America/Chicago`.
+- Session logic timezone: Strategy-Core `RESEARCH_SESSION_SCHEME`, currently
+  `US/Eastern` with an 18:00 ET trading-day boundary, Asia 19:00→02:45 ET,
+  London 03:00→08:00 ET, and NY 09:00→17:00 ET.
 - Frontend may display local/session time, but API payloads should carry UTC timestamps plus session/trading-day labels where relevant.
 
 ## Tick Bars
@@ -182,6 +191,25 @@ Rules:
 - A completed bar is emitted after exactly `N` canonical `TradeEvent` records for the selected tick size.
 - At trading-day end, the current bar closes at the last trade even if incomplete.
 - No time-based primary candles in v1.
+
+Strategy-Core owns tick-bar aggregation. Trade-Lab frontend/API fields such as
+`Candle`, `bar_id`, and `timeframe_ticks` are DTO mappings of Strategy-Core bars,
+not separate runtime semantics.
+
+## Levels, Zones, and Touches
+
+Runtime levels and touches follow Strategy-Core v3 semantics:
+
+- PDH/PDL come from the full prior trading-day high/low when loaded.
+- Asia/London levels are available only after their defining session has closed.
+- Levels within 3.0 points merge into a zone; the touch price is the zone's
+  representative mean price.
+- A touch fires when a completed decision bar's closed `[low, high]` range
+  intersects the zone representative price.
+- First-touch scope is per merged zone per trading day.
+
+Legacy exact-trade-price level touches remain only in compatibility/test modules
+and must not be used for new replay/live runtime paths.
 
 ## Data Quality and Warnings
 

@@ -386,6 +386,7 @@ async def _run_live_fake_feed() -> None:
     status = live.status()
     assert status.state == LiveState.DISCONNECTED
     assert status.events_processed == 2
+    assert live.strategy_core_live is not None
     assert runtime.snapshot().current_bars[0].trade_count == 1
     assert runtime.snapshot().feed_status.schema == "trades"
     assert len(updates) >= 3

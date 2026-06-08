@@ -17,6 +17,7 @@ from trade_lab.domain.events import (
     TopOfBookEvent,
     TradeEvent,
 )
+from trade_lab.domain.feed import FeedConnectionState, FeedStatus
 from trade_lab.services.broadcaster import WebSocketBroadcaster
 from trade_lab.services.replay import HistoricalReplayService, ReplayConfig, ReplayState
 from trade_lab.services.runtime import ApplicationRuntime
@@ -107,19 +108,53 @@ def test_runtime_only_trades_advance_bars() -> None:
     assert runtime.snapshot().recent_closed_bars == second.closed_bars
 
 
+def test_replay_quote_preserves_replaying_feed_state() -> None:
+    runtime = _runtime()
+    runtime.set_feed_status(
+        FeedStatus(
+            state=FeedConnectionState.REPLAYING,
+            mode="replay",
+            requested_symbol="NQ.c.0",
+            schema="trades",
+        )
+    )
+
+    update = runtime.process_market_event(_quote(1))
+
+    assert update.feed_status is None
+    assert runtime.snapshot().feed_status.state == FeedConnectionState.REPLAYING
+    assert runtime.snapshot().feed_status.mode == "replay"
+    assert runtime.snapshot().feed_status.schema == "mbp-1"
+
+
 def test_trade_events_advance_levels_touches_and_observations() -> None:
     runtime = _runtime()
 
     runtime.process_market_event(_trade(0, price_ticks=68_000))
-    runtime.process_market_event(_trade(1, price_ticks=68_004))
-    touch_update = runtime.process_market_event(
+    # Keep the Asia high outside Strategy-Core's 3-point zone-merge band so this
+    # integration test isolates Trade-Lab touch/observation plumbing instead of
+    # asserting legacy exact-level semantics for a merged Asia high/low zone.
+    runtime.process_market_event(_trade(1, price_ticks=68_020))
+    runtime.process_market_event(
         TradeEvent(
             event_ts_utc=datetime(2026, 1, 5, 8, 0, tzinfo=UTC),
             receive_ts_utc=None,
             instrument_id=1,
             requested_symbol="NQ.c.0",
             raw_symbol="NQM6",
-            price_ticks=68_004,
+            price_ticks=68_018,
+            size=1,
+            source_schema="trades",
+        )
+    )
+    touch_update = runtime.process_market_event(
+        TradeEvent(
+            event_ts_utc=datetime(2026, 1, 5, 8, 0, 1, tzinfo=UTC),
+            receive_ts_utc=None,
+            instrument_id=1,
+            requested_symbol="NQ.c.0",
+            raw_symbol="NQM6",
+            price_ticks=68_022,
             size=1,
             source_schema="trades",
         )
@@ -254,10 +289,13 @@ def test_broadcaster_maps_runtime_update_to_versioned_domain_deltas() -> None:
 
 def test_broadcaster_emits_required_domain_envelopes_and_monotonic_sequences() -> None:
     runtime = _runtime()
-    runtime.process_market_event(_trade(0, price_ticks=68_000))
-    closed_update = runtime.process_market_event(_trade(1, price_ticks=68_004))
+    first_update = runtime.process_market_event(_trade(0, price_ticks=68_000))
+    closed_update = runtime.process_market_event(_trade(1, price_ticks=68_020))
+    runtime.process_market_event(
+        TradeEvent(datetime(2026, 1, 5, 8, 0, tzinfo=UTC), None, 1, "NQ.c.0", "NQM6", 68_018, 1)
+    )
     touch_update = runtime.process_market_event(
-        TradeEvent(datetime(2026, 1, 5, 8, 0, tzinfo=UTC), None, 1, "NQ.c.0", "NQM6", 68_004, 1)
+        TradeEvent(datetime(2026, 1, 5, 8, 0, 1, tzinfo=UTC), None, 1, "NQ.c.0", "NQM6", 68_022, 1)
     )
     warning_update = runtime.record_warning(
         DataQualityWarning(code=DataQualityCode.HISTORICAL_ONLY_FIELD_IGNORED, message="ignored")
@@ -265,7 +303,8 @@ def test_broadcaster_emits_required_domain_envelopes_and_monotonic_sequences() -
     broadcaster = WebSocketBroadcaster(runtime)
 
     messages = (
-        _json_messages(broadcaster, warning_update)
+        _json_messages(broadcaster, first_update)
+        + _json_messages(broadcaster, warning_update)
         + _json_messages(broadcaster, closed_update)
         + _json_messages(broadcaster, touch_update)
     )

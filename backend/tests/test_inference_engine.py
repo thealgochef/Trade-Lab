@@ -347,18 +347,28 @@ def _trade(ts: datetime, price_ticks: int, size: int = 1):
     )
 
 
+def _drive_pdh_touch(
+    runtime: ApplicationRuntime, day0: datetime, *, level_ticks: int = 68_010
+):
+    """Close a decision bar whose range intersects PDH under Strategy-Core rules."""
+
+    runtime.levels.load_prior_day_summary(
+        (day0 - timedelta(days=1)).date(), level_ticks, level_ticks - 20
+    )
+    runtime.process_market_event(_trade(day0, level_ticks - 2))
+    return runtime.process_market_event(_trade(day0 + timedelta(seconds=1), level_ticks + 2))
+
+
 def test_runtime_produces_prediction_when_observation_completes(tmp_path: Path) -> None:
     registry = _active_registry(tmp_path)
     runtime = _runtime_with_engine(registry)
 
     # Build a real touch + observation via the hot path, then drive the clock past the
     # 5-minute observation window so it completes and inference fires.
-    # Establish a prior-day level (PDH) the runtime will detect a touch against.
+    # Establish a prior-day level (PDH), then close a decision bar whose range
+    # intersects it without relying on the deprecated one-print exact-touch path.
     day0 = datetime(2026, 1, 5, 14, 30, tzinfo=UTC)
-    runtime.levels.load_prior_day_summary((day0 - timedelta(days=1)).date(), 68_010, 67_990)
-    # First touch the PDL at 68_000 region is not set; touch PDH at 68_010.
-    touch_trade = _trade(day0, 68_010)
-    update = runtime.process_market_event(touch_trade)
+    update = _drive_pdh_touch(runtime, day0)
     assert update.touches, "expected a touch to seed an observation"
 
     # No prediction yet (observation still active).
@@ -380,9 +390,7 @@ def test_runtime_without_active_model_serves_market_data_without_predictions(
     registry = ModelRegistry(tmp_path)  # discovery only, nothing active
     runtime = _runtime_with_engine(registry)
     day0 = datetime(2026, 1, 5, 14, 30, tzinfo=UTC)
-    runtime.levels.load_prior_day_summary((day0 - timedelta(days=1)).date(), 68_010, 67_990)
-
-    runtime.process_market_event(_trade(day0, 68_010))
+    _drive_pdh_touch(runtime, day0)
     completion = runtime.process_market_event(_trade(day0 + timedelta(minutes=6), 68_011))
 
     assert completion.predictions == ()
@@ -394,8 +402,7 @@ def test_hot_swap_clears_prediction_state_but_not_market_data(tmp_path: Path) ->
     registry = _active_registry(tmp_path)
     runtime = _runtime_with_engine(registry)
     day0 = datetime(2026, 1, 5, 14, 30, tzinfo=UTC)
-    runtime.levels.load_prior_day_summary((day0 - timedelta(days=1)).date(), 68_010, 67_990)
-    runtime.process_market_event(_trade(day0, 68_010))
+    _drive_pdh_touch(runtime, day0)
     runtime.process_market_event(_trade(day0 + timedelta(minutes=6), 68_011))
     assert runtime.predictions, "a prediction should have been produced"
     bars_before = runtime.snapshot().display_levels
@@ -414,8 +421,7 @@ def test_runtime_reset_clears_predictions(tmp_path: Path) -> None:
     registry = _active_registry(tmp_path)
     runtime = _runtime_with_engine(registry)
     day0 = datetime(2026, 1, 5, 14, 30, tzinfo=UTC)
-    runtime.levels.load_prior_day_summary((day0 - timedelta(days=1)).date(), 68_010, 67_990)
-    runtime.process_market_event(_trade(day0, 68_010))
+    _drive_pdh_touch(runtime, day0)
     runtime.process_market_event(_trade(day0 + timedelta(minutes=6), 68_011))
     assert runtime.predictions
 
