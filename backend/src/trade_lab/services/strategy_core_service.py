@@ -109,10 +109,9 @@ class StrategyCoreService:
             decision_timeframe=min(self._display_timeframes),
             recent_closed_bar_limit=recent_closed_bar_limit,
             warning_limit=warning_limit,
-            # B2 PART 2: flag-gated plugin routing. Default OFF (SC_PLUGIN_ROUTING unset) ->
-            # touch_reversal_kwargs() returns {} -> the verbatim None path, byte-identical to
-            # today. Flag ON -> attaches the registered touch_reversal plugin + its section.
-            # The plugin is imported (and registered) ONLY inside the helper's ON branch.
+            # B3: the touch strategy runs through the Strategy-Core plugin (the sole path;
+            # the flag and the hardwired None path were removed). touch_reversal_kwargs()
+            # unconditionally attaches the registered touch_reversal plugin + its section.
             **touch_reversal_kwargs(),
         )
         self._last_trade: TradeEvent | None = None
