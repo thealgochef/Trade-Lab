@@ -18,6 +18,7 @@ from strategy_core.runtime.state import FeedStatus as CoreFeedStatus
 from strategy_core.runtime.state import RuntimeSnapshot as CoreSnapshot
 from strategy_core.runtime.state import RuntimeUpdate as CoreUpdate
 from strategy_core.runtime.state import StrategyRuntime
+from strategy_core.runtime.wiring import touch_reversal_kwargs
 from strategy_core.types import Bar as CoreBar
 from strategy_core.types import CloseReason as CoreCloseReason
 from strategy_core.types import Direction as CoreDirection
@@ -108,6 +109,11 @@ class StrategyCoreService:
             decision_timeframe=min(self._display_timeframes),
             recent_closed_bar_limit=recent_closed_bar_limit,
             warning_limit=warning_limit,
+            # B2 PART 2: flag-gated plugin routing. Default OFF (SC_PLUGIN_ROUTING unset) ->
+            # touch_reversal_kwargs() returns {} -> the verbatim None path, byte-identical to
+            # today. Flag ON -> attaches the registered touch_reversal plugin + its section.
+            # The plugin is imported (and registered) ONLY inside the helper's ON branch.
+            **touch_reversal_kwargs(),
         )
         self._last_trade: TradeEvent | None = None
         self._last_schema: str | None = None
