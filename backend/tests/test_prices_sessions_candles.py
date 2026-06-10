@@ -1,4 +1,4 @@
-﻿from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import MappingProxyType
