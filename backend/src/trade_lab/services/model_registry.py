@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from trade_lab.domain.contracts import ContractError, StrategyContract, load_strategy_contract
+from strategy_core import ENGINE_VERSION, ContractError, StrategyContract, load_strategy_contract
 
 if TYPE_CHECKING:
     from catboost import CatBoostClassifier
@@ -132,7 +132,7 @@ def _describe_bundle(directory: Path, model_id: str) -> ModelBundle | None:
         return None
 
     try:
-        contract = load_strategy_contract(strategy_file)
+        contract = load_strategy_contract(strategy_file, expected_engine_version=ENGINE_VERSION)
     except ContractError as exc:
         logger.warning("ignored model bundle with invalid strategy contract: %s", exc)
         return None
@@ -283,7 +283,9 @@ class ModelRegistry:
     @staticmethod
     def _load_contract(directory: Path) -> StrategyContract:
         try:
-            return load_strategy_contract(directory / STRATEGY_FILE)
+            return load_strategy_contract(
+                directory / STRATEGY_FILE, expected_engine_version=ENGINE_VERSION
+            )
         except ContractError as exc:
             raise ModelValidationError(f"invalid strategy contract: {exc}") from exc
 

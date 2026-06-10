@@ -16,7 +16,7 @@ dependencies = [
   "pyarrow>=18.0",
   "pydantic>=2.10",
   "pydantic-settings>=2.6",
-  "strategy-core @ git+https://github.com/thealgochef/Strategy-Core.git@cbf9b991d7202dc61030229ea4d681caf9990900",
+  "strategy-core @ git+https://github.com/thealgochef/Strategy-Core.git@c615e40ec13ef5a34d69910a78d144c677b138a8",
   "uvicorn[standard]>=0.32",
 ]
 

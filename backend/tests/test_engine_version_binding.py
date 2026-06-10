@@ -1,9 +1,13 @@
-"""Regression coverage for audit N1: engine_version fail-closed binding.
+"""Regression coverage for the engine_version fail-closed gate.
 
-A strategy.json that declares an engine_version the runtime cannot match must be
-rejected (fail closed), a matching one must load, and a legacy bundle without the
-field must still load (unbound). These mirror the contract-loading style in
-``test_strategy_contract.py`` (read the real fixture, mutate, write to tmp_path).
+TL loads contracts through SC's ``load_strategy_contract`` with the
+``expected_engine_version=ENGINE_VERSION`` hook — the exact call shape used by
+``model_registry`` at both its loader entries (discovery and activation). A
+contract that declares a mismatched engine_version OR omits the field entirely
+must be rejected fail-closed; only a matching one loads. The old local loader's
+legacy loads-unbound path (no engine_version -> load with a warning) is retired.
+These mirror the contract-loading style in ``test_strategy_contract.py`` (read
+the real fixture, mutate, write to tmp_path).
 """
 
 import json
@@ -11,12 +15,7 @@ from pathlib import Path
 
 import pytest
 import strategy_core
-
-from trade_lab.domain.contracts import (
-    ContractError,
-    StrategyContract,
-    load_strategy_contract,
-)
+from strategy_core import ContractError, StrategyContract, load_strategy_contract
 
 _FIXTURE_STRATEGY = Path(__file__).parent / "fixtures" / "strategy.json"
 
@@ -35,7 +34,9 @@ def test_matching_engine_version_loads(tmp_path: Path) -> None:
     target = tmp_path / "strategy.json"
     _write_strategy(target, payload)
 
-    contract = load_strategy_contract(target)
+    contract = load_strategy_contract(
+        target, expected_engine_version=strategy_core.ENGINE_VERSION
+    )
 
     assert isinstance(contract, StrategyContract)
     assert contract.engine_version == strategy_core.ENGINE_VERSION
@@ -43,20 +44,19 @@ def test_matching_engine_version_loads(tmp_path: Path) -> None:
 
 def test_mismatched_engine_version_fails_closed(tmp_path: Path) -> None:
     payload = _load_real_payload()
-    payload["engine_version"] = "strategy_core_engine_v0_does_not_match"
+    payload["engine_version"] = "strategy_core_engine_v2"
     target = tmp_path / "strategy.json"
     _write_strategy(target, payload)
 
     with pytest.raises(ContractError, match="engine_version"):
-        load_strategy_contract(target)
+        load_strategy_contract(target, expected_engine_version=strategy_core.ENGINE_VERSION)
 
 
-def test_legacy_bundle_without_engine_version_still_loads(tmp_path: Path) -> None:
+def test_absent_engine_version_fails_closed(tmp_path: Path) -> None:
     payload = _load_real_payload()
-    payload.pop("engine_version", None)  # fixture is already legacy; be explicit
+    payload.pop("engine_version", None)
     target = tmp_path / "strategy.json"
     _write_strategy(target, payload)
 
-    contract = load_strategy_contract(target)
-
-    assert contract.engine_version is None
+    with pytest.raises(ContractError, match="engine_version"):
+        load_strategy_contract(target, expected_engine_version=strategy_core.ENGINE_VERSION)

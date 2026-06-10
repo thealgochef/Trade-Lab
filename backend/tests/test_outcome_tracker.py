@@ -15,8 +15,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
 
+from strategy_core import load_strategy_contract
+
 from trade_lab.domain.candles import Candle, CandleCloseReason
-from trade_lab.domain.contracts import load_strategy_contract
 from trade_lab.domain.outcomes import ResolutionType
 from trade_lab.services.inference.inference_engine import Prediction
 from trade_lab.services.inference.outcome_tracker import OutcomeTracker

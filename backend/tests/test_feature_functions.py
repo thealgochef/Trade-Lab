@@ -14,8 +14,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from strategy_core import load_strategy_contract
 
-from trade_lab.domain.contracts.strategy_contract import load_strategy_contract
 from trade_lab.domain.events import TradeSide
 from trade_lab.domain.market_context import MarketContextBuffer
 from trade_lab.services.inference.features import (

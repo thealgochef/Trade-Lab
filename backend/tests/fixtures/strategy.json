@@ -1,5 +1,6 @@
 {
   "contract_version": "trade_lab_contract_v1",
+  "engine_version": "strategy_core_engine_v3",
   "strategy_id": "NQ_20260405_147t_5m_30m_multiclass-250602-260220-iterations800_depth4",
   "training_mode": "dashboard_utility",
   "supported_by_runtime": true,
@@ -91,6 +92,7 @@
   "label_policy": {
     "resolution": "mae_first",
     "entry_reference": "level_representative_price",
+    "decision_offset_minutes": 5,
     "tp_points": 15.0,
     "sl_points": 30.0,
     "trap_mfe_min": 5.0,

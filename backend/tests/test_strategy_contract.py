@@ -3,13 +3,8 @@ from dataclasses import asdict
 from pathlib import Path
 
 import pytest
+from strategy_core import CONTRACT_VERSION, ContractError, StrategyContract, load_strategy_contract
 
-from trade_lab.domain.contracts import (
-    CONTRACT_VERSION,
-    ContractError,
-    StrategyContract,
-    load_strategy_contract,
-)
 from trade_lab.services.model_registry import (
     ModelBundle,
     discover_model_bundles,

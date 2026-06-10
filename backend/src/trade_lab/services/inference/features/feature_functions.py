@@ -29,7 +29,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
-    from trade_lab.domain.contracts.strategy_contract import StrategyContract
+    from strategy_core import StrategyContract
+
     from trade_lab.domain.market_context import (
         BufferedQuote,
         MarketContextBuffer,

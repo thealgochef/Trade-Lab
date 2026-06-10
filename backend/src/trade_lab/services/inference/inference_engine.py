@@ -22,7 +22,8 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from trade_lab.domain.contracts import StrategyContract
+from strategy_core import StrategyContract
+
 from trade_lab.services.inference.features import (
     DEFAULT_FEATURE_REGISTRY,
     FeatureFunctionRegistry,

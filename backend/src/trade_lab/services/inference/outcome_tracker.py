@@ -25,8 +25,9 @@ from decimal import Decimal
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from strategy_core import StrategyContract
+
 from trade_lab.domain.candles import Candle
-from trade_lab.domain.contracts import StrategyContract
 from trade_lab.domain.outcomes import Outcome, ResolutionType
 from trade_lab.services.inference.inference_engine import Prediction
 

@@ -16,8 +16,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 from catboost import CatBoostClassifier, Pool
+from strategy_core import load_strategy_contract
 
-from trade_lab.domain.contracts import load_strategy_contract
 from trade_lab.domain.levels import LevelKind
 from trade_lab.domain.observations import Observation, ObservationStatus
 from trade_lab.domain.sessions import SessionName
