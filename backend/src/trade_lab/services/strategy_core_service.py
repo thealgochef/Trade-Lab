@@ -9,7 +9,7 @@ compatibility types. It must not recompute session/level/touch strategy meaning.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from types import MappingProxyType
 from uuid import uuid4
 
@@ -135,6 +135,12 @@ class StrategyCoreService:
             high_ticks=high_ticks,
             low_ticks=low_ticks,
         )
+
+    def trade_price_at(self, ts_utc: datetime) -> float | None:
+        """D1a: the honest decision-time fill query, backed by the Strategy-Core
+        runtime's bounded trade ring (most recent price>0 print at/before ``ts_utc``
+        within the 30-minute lookback)."""
+        return self._runtime.trade_price_at(ts_utc)
 
     def display_levels(self) -> tuple[DisplayLevel, ...]:
         return self.snapshot().display_levels

@@ -13,6 +13,8 @@ from datetime import date, timedelta
 from types import MappingProxyType
 from typing import Any
 
+from strategy_core import StreamDrop, StreamingHonestResolver, StreamResolution
+
 from trade_lab.domain.candles import Candle
 from trade_lab.domain.data_quality import DataQualityWarning
 from trade_lab.domain.events import (
@@ -29,7 +31,7 @@ from trade_lab.domain.market_context import DEFAULT_RETENTION_MINUTES, MarketCon
 from trade_lab.domain.observations import Observation, ObservationEngine, ObservationStatus
 from trade_lab.domain.outcomes import Outcome
 from trade_lab.services.inference.inference_engine import InferenceEngine, Prediction
-from trade_lab.services.inference.outcome_tracker import OutcomeTracker
+from trade_lab.services.inference.outcome_tracker import OutcomeTracker, _parse_bar_type
 from trade_lab.services.strategy_core_service import StrategyCoreService
 
 logger = logging.getLogger(__name__)
@@ -164,6 +166,14 @@ class ApplicationRuntime:
         self._seed_bar_limit_per_timeframe = seed_bar_limit_per_timeframe
         self._tick_timeframes = tick_timeframes
         self._observation_duration_seconds = observation_duration_seconds
+        # D1a DARK seat: the SC streaming honest resolver runs alongside the tracker at
+        # the same lifecycle points, accumulating into a parallel dark ring (same cap as
+        # outcomes) consumed ONLY by the gate-B characterization harness — no
+        # RuntimeUpdate/snapshot/DTO/WS surface reads it.
+        self._dark_outcomes: list[StreamResolution | StreamDrop] = []
+        self._honest_resolver: StreamingHonestResolver | None = self._build_honest_resolver(
+            inference_engine
+        )
         self._warnings: list[DataQualityWarning] = []
         self._recent_closed_bars: list[Candle] = []
         # Historical warm-up bars kept separate from the rolling live buffer so live
@@ -209,6 +219,9 @@ class ApplicationRuntime:
         self._outcomes.clear()
         if self._outcome_tracker is not None:
             self._outcome_tracker.reset()
+        if self._honest_resolver is not None:
+            self._honest_resolver.reset()
+        self._dark_outcomes.clear()
         if not preserve_warnings:
             self._warnings.clear()
         self._recent_closed_bars.clear()
@@ -241,7 +254,9 @@ class ApplicationRuntime:
         self._inference_engine = engine
         self._predictions.clear()
         self._outcomes.clear()
+        self._dark_outcomes.clear()
         self._outcome_tracker = self._build_outcome_tracker(engine)
+        self._honest_resolver = self._build_honest_resolver(engine)
 
     @staticmethod
     def _build_outcome_tracker(engine: InferenceEngine | None) -> OutcomeTracker | None:
@@ -258,6 +273,93 @@ class ApplicationRuntime:
             return None
         return OutcomeTracker(contract)
 
+    def _build_honest_resolver(
+        self, engine: InferenceEngine | None
+    ) -> StreamingHonestResolver | None:
+        """Construct the contract-specific SC streaming honest resolver (D1a, DARK).
+
+        Mirrors ``_build_outcome_tracker``'s lifecycle exactly (same activation /
+        hot-swap / reset points, same active contract). Entry prints come from the
+        Strategy-Core runtime's trade ring via a late-binding closure so the seam
+        survives ``reset()`` swapping the service. Construction FAILS LOUD when the
+        contract's forward bar type is not among the runtime's configured tick
+        timeframes — the recon's silent-never-resolve hole — so a bad activation is
+        rejected instead of silently tracking nothing. Returns ``None`` when no
+        engine/model is active.
+        """
+
+        if engine is None:
+            return None
+        contract = engine.active_contract
+        if contract is None:
+            return None
+        policy = contract.label_policy
+        if policy.decision_offset_minutes * 60 != self._observation_duration_seconds:
+            logger.warning(
+                "contract label_policy.decision_offset_minutes (%s min) != configured "
+                "observation_duration_seconds (%s s): the dark resolver anchors decisions "
+                "on the contract offset while predictions register on the config window",
+                policy.decision_offset_minutes,
+                self._observation_duration_seconds,
+            )
+        return StreamingHonestResolver(
+            forward_timeframe_ticks=_parse_bar_type(policy.forward_bar_type),
+            tick_size=contract.tick_size,
+            tp_points=policy.tp_points,
+            sl_points=policy.sl_points,
+            trap_mfe_min=policy.trap_mfe_min,
+            decision_offset_minutes=policy.decision_offset_minutes,
+            trade_price_at=lambda ts_utc: self.strategy_core_service.trade_price_at(ts_utc),
+            available_timeframes=self._tick_timeframes,
+        )
+
+    @property
+    def dark_outcomes(self) -> tuple[StreamResolution | StreamDrop, ...]:
+        """The D1a dark ring (gate-B characterization harness only; no DTO/WS surface)."""
+
+        return tuple(self._dark_outcomes)
+
+    def _append_dark(self, emitted: tuple[StreamResolution | StreamDrop, ...]) -> None:
+        if not emitted:
+            return
+        self._dark_outcomes.extend(emitted)
+        if len(self._dark_outcomes) > self._outcome_limit:
+            del self._dark_outcomes[: len(self._dark_outcomes) - self._outcome_limit]
+
+    def _register_dark(
+        self,
+        resolver: StreamingHonestResolver,
+        prediction: Prediction,
+        observation: Observation,
+    ) -> None:
+        """Register one prediction with the dark resolver off its TOUCH anchors.
+
+        The decision anchor is the touch's bar-close instant + trading day carried on
+        the observation/touch chain (``Observation.start_ts_utc`` = the SC touch's
+        ``bar_ts_utc``) — NEVER the prediction's ``event_ts_utc`` (= touch + the
+        observation window). Fails loud if the chain did not carry them.
+        """
+
+        if observation.start_ts_utc is None or observation.trading_day is None:
+            raise ValueError(
+                "dark resolver registration requires the touch bar ts + trading_day "
+                "carried on the observation chain; refusing to approximate with the "
+                "prediction event_ts"
+            )
+        try:
+            drop = resolver.register(
+                prediction.prediction_id,
+                touch_bar_ts_utc=observation.start_ts_utc,
+                trading_day=observation.trading_day,
+                direction=prediction.direction,
+            )
+        except Exception:
+            # The dark seat must never break the market-data hot path.
+            logger.warning("dark honest-resolver registration failed", exc_info=False)
+            return
+        if drop is not None:
+            self._append_dark((drop,))
+
     def clear_predictions(self) -> None:
         """Drop accumulated predictions + outcomes (e.g. on model hot-swap)."""
 
@@ -265,6 +367,9 @@ class ApplicationRuntime:
         self._outcomes.clear()
         if self._outcome_tracker is not None:
             self._outcome_tracker.reset()
+        if self._honest_resolver is not None:
+            self._honest_resolver.reset()
+        self._dark_outcomes.clear()
 
     @property
     def predictions(self) -> tuple[Prediction, ...]:
@@ -324,6 +429,9 @@ class ApplicationRuntime:
         if engine is None or not engine.has_active_model:
             return ()
         produced: list[Prediction] = []
+        # (prediction, observation) pairs: the dark resolver registers off the TOUCH
+        # anchors carried on the observation chain, not off the prediction timestamps.
+        produced_pairs: list[tuple[Prediction, Observation]] = []
         for observation in changed_observations:
             if observation.status is not ObservationStatus.EXPIRED:
                 continue
@@ -335,6 +443,7 @@ class ApplicationRuntime:
                 continue
             if prediction is not None:
                 produced.append(prediction)
+                produced_pairs.append((prediction, observation))
         if produced:
             self._predictions.extend(produced)
             if len(self._predictions) > self._prediction_limit:
@@ -343,6 +452,11 @@ class ApplicationRuntime:
             if tracker is not None:
                 for prediction in produced:
                     tracker.register(prediction)
+            resolver = self._honest_resolver
+            if resolver is not None:
+                # D1a dark seat: mirror every tracker registration one-for-one.
+                for prediction, observation in produced_pairs:
+                    self._register_dark(resolver, prediction, observation)
         return tuple(produced)
 
     def _track_outcomes(self, closed_bars: tuple[Candle, ...]) -> tuple[Outcome, ...]:
@@ -353,8 +467,21 @@ class ApplicationRuntime:
         hot path, so failures are swallowed.
         """
 
+        if not closed_bars:
+            return ()
+        resolver = self._honest_resolver
+        if resolver is not None:
+            # D1a dark seat: advance the SC streaming honest resolver from the same
+            # closed-bars hook the tracker consumes; emissions land in the dark ring only.
+            for bar in closed_bars:
+                try:
+                    self._append_dark(resolver.on_bar(bar))
+                except Exception:
+                    logger.warning(
+                        "dark honest-resolver advance failed for a closed bar", exc_info=False
+                    )
         tracker = self._outcome_tracker
-        if tracker is None or not closed_bars:
+        if tracker is None:
             return ()
         resolved: list[Outcome] = []
         for bar in closed_bars:

@@ -325,8 +325,11 @@ def test_no_active_model_produces_no_prediction(tmp_path: Path) -> None:
 
 
 def _runtime_with_engine(registry: ModelRegistry) -> ApplicationRuntime:
+    # D1a: the contract's forward bar type (147t) must be among the configured
+    # timeframes — activation fails loud otherwise. The 2t decision bar still
+    # drives the touch/observation flow (decision timeframe pins to min()).
     runtime = ApplicationRuntime(
-        requested_symbol="NQ.c.0", tick_timeframes=(2,), observation_duration_seconds=300
+        requested_symbol="NQ.c.0", tick_timeframes=(2, 147), observation_duration_seconds=300
     )
     runtime.set_inference_engine(InferenceEngine(registry))
     return runtime

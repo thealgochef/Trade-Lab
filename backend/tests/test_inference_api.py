@@ -447,8 +447,10 @@ def _runtime_app_with_active_model(
     tmp_path: Path,
 ) -> tuple[TestClient, ApplicationRuntime, WebSocketBroadcaster]:
     _write_bundle(tmp_path, "good-model", _train_model(_CONTRACT_FEATURES))
+    # D1a: the contract's forward bar type (147t) must be among the configured
+    # timeframes — activation fails loud otherwise; 2t remains the decision bar.
     runtime = ApplicationRuntime(
-        requested_symbol="NQ.c.0", tick_timeframes=(2,), observation_duration_seconds=300
+        requested_symbol="NQ.c.0", tick_timeframes=(2, 147), observation_duration_seconds=300
     )
     broadcaster = WebSocketBroadcaster(runtime)
     app = create_app(
