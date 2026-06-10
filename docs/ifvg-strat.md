@@ -1,9 +1,9 @@
-# AlgoChef SMC HTF FVG → Parent FVG → 1m iFVG Strategy
+# AlgoChef IFVG Strategy
 
-## Surgical Technical Specification — Strategy-Only v4.1
+## Technical Specification 
 
 **Generated:** 2026-06-02 18:14 UTC  
-**Audience:** AlgoChef, strategy reviewers, and trading-model validators who need the exact rule set, assumptions, caveats, validation plan, and do-not-break rules.  
+**Audience:** AlgoChef, strategy reviewers, and trading-model validators who need the exact rule set, assumptions, caveats, validation plan.
 **Purpose:** Define the complete strategy logic, defaults, assumptions, caveats, open questions, validation plan, and do-not-break rules for the SMC HTF FVG → Parent FVG → 1m iFVG strategy. This revision incorporates delegated reviews of strategy logic, risk/backtest mechanics, known gaps, and technical-writing clarity.
 
 ---
@@ -15,12 +15,12 @@ This is a deterministic 1-minute execution strategy built around a multi-timefra
 1. Price retests a valid unfilled 1H or 4H Fair Value Gap.
 2. That higher-timeframe retest creates directional context only; it is not an entry by itself.
 3. A same-direction parent Fair Value Gap must confirm on 3m, 5m, 10m, 15m, or 30m inside the reaction window.
-4. Before parent retest, the highest valid parent timeframe wins: 30m > 15m > 10m > 5m > 3m.
+4. Before parent retest, the highest valid parent timeframe wins (current decision but open to changing this to align better what actually should happen in reality - DISCUSSION POINT #1): 30m > 15m > 10m > 5m > 3m.
 5. Once 1m price retests the selected parent Fair Value Gap, the parent locks and cannot be replaced.
 6. After parent lock, the strategy waits for an opposing 1m Fair Value Gap near or inside the parent zone.
 7. That opposing 1m Fair Value Gap must invert by a body close through its boundary.
 8. A new same-direction 1m Fair Value Gap after inversion confirms the final entry.
-9. Final entry is allowed only during enabled New-York-time sessions.
+9. Final entry is allowed only during enabled sessions.
 10. Default stop-loss is the manipulation swing from parent retest through entry.
 11. Default break-even trigger is a candle-body close through the parent internal high or low.
 12. Default take-profit is fixed 1R.
@@ -31,7 +31,7 @@ The compressed strategy thesis is:
 
 > Fresh higher-timeframe imbalance retest → same-direction parent displacement → parent retest/manipulation → failed opposing 1m displacement → same-direction continuation entry.
 
-This specification defines the trading model. It does not prove profitability. The current strategy should be treated as signal research until validated with realistic costs, robust sample testing, manual trade audit, and out-of-sample review.
+This specification defines the trading model. The current strategy should be treated as signal research until validated with realistic costs, robust sample testing, manual trade audit, and out-of-sample review.
 
 ---
 
@@ -52,7 +52,7 @@ This document covers:
 - Caveats around backtests and execution realism.
 - Validation scenarios and acceptance criteria.
 
-### 2.2 Out of scope
+### 2.2 Out of scope (using this document we will discuss these topics given you now have context of strategy-core, trade-lab, quant-lab and the design architecture.)
 
 This document does not cover:
 
@@ -68,27 +68,27 @@ This document does not cover:
 
 ## 3. Strategy Thesis: Why This Model Could Have Edge
 
-The model is not “trade every FVG.” The intended edge comes from requiring several market-structure events to occur in order.
+The model is not “trade every FVG.” The intended edge comes from requiring several market-structure (ICT concepts) events to occur in order.
 
 ### 3.1 Higher-timeframe imbalance provides context
 
-A 1H or 4H Fair Value Gap is treated as evidence of prior higher-timeframe displacement. When price retests that imbalance, the zone may become a reaction area where larger participants defend, rebalance, or resume the prior displacement.
+A 1H or 4H Fair Value Gap is treated as evidence of prior higher-timeframe displacement. When price retests that imbalance, the zone may become a reaction area where larger participants defend, rebalance, or resume the prior displacement. A higher-timeframe imbalance could also be a major key level like New York Low, New York High, Asia High, Asia Low, London High, London Low, PDL, PDH - an fvg doesn't have to form inside those levels for this strategy to execute  and be valid, but the same execution criteria still applies.
 
 The higher-timeframe Fair Value Gap is context only. By itself, it is too broad and too early to justify entry.
 
-### 3.2 Parent Fair Value Gap confirms lower-timeframe displacement
+### 3.2 Parent Fair Value Gap confirms lower-timeframe displacement (see IMAGE-3.2)
 
 After the higher-timeframe retest, the strategy requires a same-direction parent Fair Value Gap on 3m, 5m, 10m, 15m, or 30m.
 
 The parent gap is intended to show that price did not merely touch a higher-timeframe zone; it actually displaced in the intended direction after the reaction context began.
 
-### 3.3 Parent retest prevents chasing
+### 3.3 Parent retest prevents chasing (see IMAGE-3.3)
 
 The strategy does not enter immediately after the parent Fair Value Gap forms. It waits for 1m price to retest the selected parent zone.
 
 This attempts to force execution near the displacement zone rather than chasing away from it.
 
-### 3.4 Opposing 1m FVG models the manipulation/counter-move
+### 3.4 Opposing 1m FVG models the manipulation/counter-move (see IMAGE-3.4)
 
 After the parent retest, the strategy waits for a 1m Fair Value Gap opposite the intended trade direction.
 
@@ -97,7 +97,7 @@ For a bearish setup, the strategy waits for a bullish 1m Fair Value Gap.
 
 This opposing gap is interpreted as a counter-displacement, sweep, manipulation attempt, or temporary failed move against the intended direction.
 
-### 3.5 Inversion confirms the opposing move failed
+### 3.5 Inversion confirms the opposing move FAILED (see IMAGE 3.5)
 
 The opposing 1m Fair Value Gap must invert by a candle-body close through its boundary.
 
@@ -106,13 +106,13 @@ For a bearish setup, price must close below the bottom of the bullish opposing g
 
 This inversion is the core iFVG concept: the opposing imbalance fails and becomes evidence for continuation in the original direction.
 
-### 3.6 Final same-direction 1m FVG confirms renewed displacement
+### 3.6 Final same-direction 1m FVG confirms renewed displacement (see IMAGE 3.6)
 
 The strategy still does not enter immediately on inversion. It waits for a new 1m Fair Value Gap in the original direction after the inversion bar.
 
 This final same-direction gap is the entry confirmation. It is meant to prove that price has resumed displacement after the opposing gap failed.
 
-### 3.7 Manipulation-swing stop aligns risk with the thesis
+### 3.7 Manipulation-swing stop aligns risk with the thesis (see IMAGE 3.7)
 
 The default stop-loss is not simply behind the entry gap. It is placed beyond the lowest low or highest high from parent retest through entry.
 
@@ -128,16 +128,17 @@ This ties the stop to the failure point of the counter-move. If price breaches t
 ### 4.1 Execution chart
 
 - The strategy is designed for a 1-minute chart.
-- Entries should be disabled or considered invalid on non-1-minute charts.
+- Entries should be disabled or considered invalid on non-1-minute charts (valid for now - later we will experiment on tick charts - DISCUSSION POINT #2).
 - Standard candles should be used for validation.
 - Synthetic charts can distort Fair Value Gaps, fills, stop behavior, and backtest results.
 
 ### 4.2 Timeframes
 
-Higher-timeframe key levels:
+Higher-timeframe key levels (in general these are just key liquidity levels):
 
 - 1H
 - 4H
+- New York Low, New York High, Asia High, Asia Low, London High, London Low, PDL, PDH
 
 Parent timeframes:
 
@@ -154,16 +155,15 @@ Execution timeframe:
 ### 4.3 Session timezone
 
 - All sessions use America/New_York.
-- Sessions gate final entry only.
 - Setup formation can occur outside session.
-- Trade management continues after session ends.
+- Trade management can continue after session ends.
 
 ### 4.4 Trade concurrency
 
 - One active setup at a time.
 - One open trade at a time.
 - No pyramiding.
-- No reversal while a position is open.
+- No reversal while a position is open on a single account.
 
 ### 4.5 Data confirmation principle
 
@@ -227,7 +227,7 @@ Full fill:
 
 ### 5.4 Retest / touch
 
-A retest occurs when the 1m candle’s wick range overlaps a zone.
+A retest occurs when the 1m candle’s wick range overlaps a zone. (this is a discretionary decision we need to explore if ML can help us with this type of decision making - DISCUSSION POINT #3)
 
 For any zone:
 
@@ -248,7 +248,7 @@ For bearish zones:
 
 - Full fill occurs when price trades to or above the zone top.
 
-### 5.6 Overlap and distance
+### 5.6 Overlap and distance (this is a discretionary decision we need to explore if ML can help us with this type of decision making - DISCUSSION POINT #4)
 
 Two zones overlap when their vertical price intervals intersect.
 
@@ -308,16 +308,16 @@ Default stop-loss is placed beyond this swing with a buffer.
 
 ## 6. Current Tuned Defaults
 
-These are the current v4.1 tuned defaults. They should be preserved unless AlgoChef explicitly retunes them.
+These are the current defaults, but nothing is set in stone and can change based on the discussions points and decisions we make about ML integration.
 
 ### 6.1 Direction and timeframes
 
 | Parameter | Current default | Strategic meaning |
 |---|---:|---|
 | Enable longs | Yes | Long setups are allowed. |
-| Enable shorts | Yes | Short setups are allowed. |
+| Enable shorts | No | Short setups are allowed. |
 | Use 1H higher-timeframe FVGs | Yes | 1H zones can create context. |
-| Use 4H higher-timeframe FVGs | Yes | 4H zones can create context and outrank 1H on same-candle taps. |
+| Use 4H higher-timeframe FVGs | Yes | 4H zones can create context and outrank 1H on same-candle taps. (discussion point #5 - maybe we can allow both or something, im opened to changing this if it yields more trades so we have more data to look at) |
 | Use 3m parent FVGs | Yes | 3m parent structures can qualify. |
 | Use 5m parent FVGs | Yes | 5m parent structures can qualify. |
 | Use 10m parent FVGs | Yes | 10m parent structures can qualify. |
@@ -328,19 +328,19 @@ These are the current v4.1 tuned defaults. They should be preserved unless AlgoC
 
 | Parameter | Current default | Strategic meaning |
 |---|---:|---|
-| Minimum Fair Value Gap size | 8 ticks | Filters out tiny gaps/noise. |
-| Parent reaction window | 24 parent bars | Parent FVG must confirm within this window after HTF tap. |
+| Minimum Fair Value Gap size | 4 ticks | Filters out tiny gaps/noise. |
+| Parent reaction window | 40 parent bars (this is a discretionary decision we need to explore if ML can help us with this type of decision making - DISCUSSION POINT #6)| Parent FVG must confirm within this window after HTF tap. |
 | Parent priority | 30m > 15m > 10m > 5m > 3m | Higher parent timeframe wins before lock. |
 | Parent must be near selected HTF zone | Yes | Parent must be vertically tied to HTF context. |
-| Parent ↔ HTF max distance | 80 ticks | Max allowed distance if parent/HTF do not overlap. |
-| Invalidate parent on 1m full fill before entry | Yes | Parent cannot be fully mitigated before entry. |
-| Opposing 1m FVG proximity to parent | 80 ticks | Opposing execution gap must be near/inside parent. |
-| Entry FVG must be near parent | No | Final entry gap can occur away from parent under current default. |
-| Max bars after inversion to find entry FVG | 30 bars | Post-inversion entry search expires after 30 1m bars. |
-| Max active HTF FVG records | 1 | Strategy behaves like a freshest-retained-HTF filter, with caveats. |
+| Parent ↔ HTF max distance | 80 ticks (this is a discretionary decision we need to explore if ML can help us with this type of decision making - DISCUSSION POINT #7) | Max allowed distance if parent/HTF do not overlap. |
+| Invalidate parent on 1m full fill before entry | Yes | Parent cannot be fully mitigated before entry. (this is a discretionary decision we need to explore if ML can help us with this type of decision making, entries are not always perfect but can still be valid - DISCUSSION POINT #8) |
+| Opposing 1m FVG proximity to parent | 80 ticks | Opposing execution gap must be near/inside parent. (this is a discretionary decision we need to explore if ML can help us with this type of decision making - DISCUSSION POINT #9) |
+| Entry FVG must be near parent | Yes | Final entry gap can occur away from parent under current default. (this is a discretionary decision we need to explore if ML can help us with this type of decision making - DISCUSSION POINT #10) |
+| Max bars after inversion to find entry FVG | 80 bars | Post-inversion entry search expires after 80 1m bars. (this is a discretionary decision we need to explore if ML can help us with this type of decision making - DISCUSSION POINT #11) |
+| Max active HTF FVG records | 1 | Strategy behaves like a freshest-retained-HTF filter, with caveats. (this is a discretionary decision we need to explore if ML can help us with this type of decision making - DISCUSSION POINT #12) |
 
 ### 6.3 Risk settings
-
+(most of the time this is a discretionary decision when i trade live (usually i just go 1:1R which is like 20-35points (NQ)) we need to explore if ML can help us with this type of decision making - DISCUSSION POINT #12)
 | Parameter | Current default | Strategic meaning |
 |---|---:|---|
 | Stop-loss model | Manipulation swing | Stop is beyond parent-retest-through-entry sweep area. |
@@ -361,8 +361,6 @@ Timezone: America/New_York
 | New York | 08:00–14:00 | Yes |
 
 Session rule:
-
-- Sessions gate final entry only.
 - Higher-timeframe scanning, parent formation, parent retest, opposing gap selection, inversion, and trade management can occur outside these windows.
 - Open trades remain managed after session end.
 
@@ -483,7 +481,7 @@ Bearish setup:
 Eligibility:
 
 - Opposing gap must form after parent retest context begins.
-- Opposing gap must overlap the parent zone or be within 80 ticks by default.
+- Opposing gap must overlap the parent zone or be within 80 ticks (discretionary decision needs discussion) by default.
 - The strategy must check whether the currently selected opposing gap inverted before replacing it with a newer opposing gap.
 
 Current caveat:
@@ -538,24 +536,24 @@ Bearish setup:
 Entry requirements:
 
 1. Final entry gap occurs after the inversion bar.
-2. Entry occurs during an enabled New-York-time session.
+2. Entry occurs during an enabled session.
 3. Chart is 1m.
 4. No position is open.
 5. Risk is at least one tick.
 6. Entry does not violate active setup/trade constraints.
-7. Post-inversion max bars has not expired.
+7. Post-inversion max bars has not expired (discretionary decision needs discussion).
 
 Current default:
 
-- Final entry gap does not need to be near the parent zone.
+- Final entry gap does not need to be near the parent zone (discretionary decision needs discussion).
 
 This is a major strategic choice. It gives the strategy more freedom to enter after confirmation but can also allow entries far away from the parent structure.
 
 Outside-session behavior:
 
-- A final entry gap outside the enabled session does not trigger a trade.
-- It should not be queued for a later session.
-- Current behavior should be trade-audited to ensure outside-session final entry events do not confuse setup identity.
+- A final entry gap outside the enabled session does not trigger a trade (discretionary decision needs discussion).
+- It should not be queued for a later session (discretionary decision needs discussion).
+- Current behavior should be trade-audited to ensure outside-session final entry events do not confuse setup identity (discretionary decision needs discussion).
 
 Transition:
 
@@ -607,7 +605,7 @@ HTF reuse:
 | Parent retest / lock | Wait for 1m retest of parent | Parent locks | Parent invalidates/fills before entry |
 | Opposing 1m FVG | Find counter-direction gap near parent | Opposing gap selected | No hard timeout currently |
 | Inversion | Confirm opposing gap failure | Body close through opposing boundary | No hard timeout currently |
-| Final entry FVG | Confirm same-direction continuation | Valid entry during session | 30-bar post-inversion expiry, invalid risk, outside session |
+| Final entry FVG | Confirm same-direction continuation | Valid entry during session | 80-bar post-inversion expiry (discretionary needs discussion), invalid risk, outside session |
 | In trade | Manage SL/TP/BE | Position closes | SL/TP/BE outcome |
 
 ---
@@ -625,9 +623,9 @@ HTF reuse:
 | Parent candidate or locked parent | Parent-timeframe close beyond zone before entry | Remove/reset depending on lock state |
 | Opposing 1m FVG selection | No opposing gap appears | No hard timeout currently |
 | Inversion wait | Opposing gap does not invert | No hard timeout currently |
-| Final entry wait | No same-direction entry gap within 30 bars after inversion | Reset setup |
+| Final entry wait | No same-direction entry gap within 80 bars after inversion (discretionary needs discussion) | Reset setup |
 | Entry validation | Risk less than one tick | Reset / no trade |
-| Entry validation | Final entry gap outside enabled session | No entry; should not queue signal |
+| Entry validation | Final entry gap outside enabled session (discretionary needs discussion) | No entry; should not queue signal |
 | Trade management | Stop-loss, take-profit, or break-even-adjusted stop reached | Close trade and reset |
 
 ---
@@ -642,7 +640,6 @@ Caveat:
 
 - Live execution may not fill exactly at the confirmation close.
 - Slippage, spread, queueing, and broker execution can materially affect results.
-- Backtest results should not be interpreted as live fills unless cost and fill assumptions are modeled.
 
 ### 11.2 Default stop-loss: manipulation swing
 
@@ -692,7 +689,7 @@ Implication:
 - Fixed 1R may cap large winners.
 - If the signal quality is noisy, fixed 1R can make the strategy look structurally unattractive.
 
-Variants worth testing:
+Variants worth testing (needs more exploration and need to find better ways to test a different variations fast to see what works best):
 
 - 1.5R or 2R fixed targets.
 - Partial at 1R and runner.
@@ -733,7 +730,7 @@ Open questions:
 
 Current results should not be judged only by raw net profit unless position sizing is explicitly normalized.
 
-The more useful performance unit is R-multiple expectancy:
+The more useful performance unit is R-multiple expectancy (this is minimal but we need to collect as much data as we can about the setups so we can learn more about ML integration paths - DISCUSSION POINT #13):
 
 - Average R per trade.
 - Median R.
@@ -771,7 +768,7 @@ The strategy should expose enough information to answer these questions on any c
 15. Did BE trigger, and if so, where?
 16. Why did the setup reset if no trade occurred?
 
-### 12.1 Required audit evidence
+### 12.1 Required audit evidence (need to surface more data than this if possible DISCUSSION POINT #14)
 
 The audit display should make the following obvious:
 
@@ -820,7 +817,7 @@ Recommended status-display fields:
 
 ### 12.3 Historical audit requirement
 
-Completed trades should remain auditable during debugging.
+Completed trades should remain auditable during replay.
 
 If historical setup evidence disappears immediately on reset, it becomes impossible to diagnose whether a losing trade was caused by:
 
@@ -857,13 +854,13 @@ A wick overlap is easy to satisfy. The model assumes that a wick retest of the p
 
 The opposing 1m Fair Value Gap is the execution trigger’s core. It should represent a real counter-move, not just a tiny mechanical imbalance.
 
-The 8-tick minimum FVG filter helps, but it may not be enough by itself.
+The 4-tick minimum FVG filter helps, but it may not be enough by itself.
 
 ### 13.5 Inversion must happen in the right context
 
 A body-close inversion of the opposing gap should happen while the setup context remains fresh. If inversion occurs too late, the original parent/HTF thesis may no longer matter.
 
-### 13.6 Final entry should not chase too far
+### 13.6 Final entry should not chase too far (discretionary decision that needs discussion)
 
 Current default allows the final entry Fair Value Gap to be away from the parent. This improved results in current tuning, but it can also detach the entry from the original displacement zone.
 
@@ -899,7 +896,7 @@ Example issue:
 - Opposing 1m FVG confirms on bar N+1.
 - That opposing FVG may use bar N-1 as Candle A, meaning part of the structure existed before the parent retest.
 
-Decision required:
+Decision required: (Discretionary decision we need to discuss this further same thing as all the other discussion points)
 
 - Is confirmation after the trigger enough?
 - Or must the entire three-candle structure form after the trigger?
@@ -918,7 +915,7 @@ Potential benefits:
 - Reduces clutter.
 - Forces focus on the freshest retained HTF imbalance.
 
-Potential problems:
+Potential problems: (Discretionary decision we need to discuss this further same thing as all the other discussion points)
 
 - Older unfilled HTF zones are ignored even if still relevant.
 - Same-rank bull/bear conflicts may be hidden if only one record is retained.
@@ -932,7 +929,7 @@ Decision required:
 
 ### 14.2A HTF maintenance order and reset-bar event risk
 
-Delegated logic review identified two related maintenance risks that should be treated as validation items, not cosmetic issues.
+Review identified two related maintenance risks that should be treated as validation items, not cosmetic issues.
 
 First, if a trade closes and the strategy resets on the same candle that a new higher-timeframe Fair Value Gap confirms, the new event can be skipped if timestamp bookkeeping advances before the post-reset scan consumes it. The same class of issue can allow a filled retained higher-timeframe zone to remain available if fill maintenance is skipped during a reset bar.
 
@@ -947,9 +944,9 @@ Decision required:
 
 ### 14.3 Setup staleness
 
-Current hard expiry exists after inversion only:
+Current hard expiry exists after inversion only: (Discretionary decision we need to discuss this further same thing as all the other discussion points)
 
-- If no final entry Fair Value Gap appears within 30 bars after inversion, setup resets.
+- If no final entry Fair Value Gap appears within 80 bars after inversion, setup resets.
 
 But there is no hard timeout for:
 
@@ -964,7 +961,7 @@ Decision required:
 - Should every phase have a max age?
 - Should timeouts be measured in 1m bars, session time, parent bars, or volatility-adjusted time?
 
-### 14.4 Wick-overlap retest may be too loose
+### 14.4 Wick-overlap retest may be too loose (Discretionary decision we need to discuss this further same thing as all the other discussion points)
 
 HTF tap and parent retest currently use wick overlap.
 
@@ -981,7 +978,7 @@ Decision required:
 
 - Should retest require any wick overlap, minimum penetration, midpoint touch, body close behavior, rejection candle, or displacement after touch?
 
-### 14.5 Parent proximity is vertical, not fully causal
+### 14.5 Parent proximity is vertical, not fully causal (Discretionary decision we need to discuss this further same thing as all the other discussion points)
 
 The parent ↔ HTF relationship currently uses vertical price distance/overlap.
 
@@ -997,7 +994,7 @@ Decision required:
 - Should parent formation require price to first touch HTF and then displace from that same reaction leg?
 - Should parent require its entire three-candle structure after HTF tap?
 
-### 14.6 Entry locality disabled by default
+### 14.6 Entry locality disabled by default (Discretionary decision we need to discuss this further same thing as all the other discussion points)
 
 Current default:
 
@@ -1019,7 +1016,7 @@ Decision required:
 - Should final entry gap have its own proximity rule?
 - Should it be allowed away from parent only if risk/reward remains acceptable?
 
-### 14.7 Opposing FVG replacement may alter intent
+### 14.7 Opposing FVG replacement may alter intent (Discretionary decision we need to discuss this further same thing as all the other discussion points)
 
 Before inversion, newer eligible opposing gaps can replace older ones.
 
@@ -1040,13 +1037,13 @@ Decision required:
 
 ### 14.8 Outside-session final entry behavior
 
-Sessions gate final entry only. Setup formation and inversion can happen outside session.
+Setup formation and inversion can happen outside session.
 
 If a final entry gap appears outside session:
 
 - It does not trigger a trade.
 - It should not be queued for later.
-- The setup may continue waiting until the 30-bar post-inversion expiry.
+- The setup may continue waiting until the 80-bar post-inversion expiry.
 
 Potential issue:
 
@@ -1061,7 +1058,7 @@ Decision required:
 
 ### 14.9 Same-bar event ambiguity
 
-Historical 1m candles cannot reveal true intrabar order.
+Historical 1m candles cannot reveal true intrabar order (this should be a none-issue with python - was only an issue in tradingview).
 
 Ambiguous cases:
 
@@ -1108,7 +1105,7 @@ Decision required:
 - Should fixed 1R remain the base case?
 - Should the strategy test larger R targets or liquidity-based exits?
 
-### 14.11A Break-even trigger may already be crossed at entry
+### 14.11A Break-even trigger may already be crossed at entry (idk what this means, but probably a none-issue in python)
 
 The default break-even trigger is the parent internal high for longs and parent internal low for shorts. In some valid sequences, price may already be beyond that level by the time the final entry Fair Value Gap confirms.
 
@@ -1120,7 +1117,7 @@ Decision required:
 - Or is it acceptable for BE to activate on the first post-entry candle if price is already beyond the trigger?
 - Should BE have an off mode for expectancy comparison?
 
-### 14.12 No discretionary quality filters
+### 14.12 No discretionary quality filters (ML as a discretionary filter needs to be discussed)
 
 The deterministic model currently does not include many discretionary filters that an SMC trader might use:
 
@@ -1265,7 +1262,7 @@ For each, record:
 - R expectancy difference.
 - Audit quality difference.
 
-### 16.4 Parameter robustness tests
+### 16.4 Parameter robustness tests (new defaults are going TBD, these defaults are old so dont waste time trying to surface gaps around discrepencies that dont fully align in this doc, i did my best to correct them.)
 
 Run controlled sweeps around current defaults:
 
@@ -1314,9 +1311,7 @@ Test with realistic assumptions:
 - Worse exit fill than ideal stop/target.
 - Break-even trades becoming small net losers.
 
-If a 1R strategy only works with perfect fills and no costs, it is not live-ready.
-
-### 16.7 Walk-forward validation
+### 16.7 Walk-forward validation (need to harden this plan, this is just minimal)
 
 Suggested process:
 
@@ -1419,9 +1414,10 @@ These are the core invariants that must remain true unless AlgoChef intentionall
 
 ## 19. Strategic Interpretation of Current Defaults
 
-Some settings are not merely technical parameters. They materially change the trading thesis.
+Some settings are not merely technical parameters. They materially change the trading thesis. These were only 
+the defaults used in tradingview and we will revisit new defaults when we talk about the integration of this strategy.
 
-### 19.1 Minimum FVG size = 8 ticks
+### 19.1 Minimum FVG size = 4 ticks
 
 Interpretation:
 
@@ -1512,7 +1508,7 @@ Potential improvement:
 
 ## 20. Current Base-Case Assessment
 
-This section incorporates the delegated logic, risk/backtest, and documentation reviews. The reviewers agreed that the conceptual model is coherent and auditable, but not yet proven profitable or production-ready. The key weakness is not the headline thesis; it is whether the deterministic filters preserve the discretionary edge without creating stale, loose, or cost-sensitive entries.
+This section incorporates the delegated logic, risk/backtest, and documentation reviews. The reviewers agreed that the conceptual model is coherent and auditable, but not yet proven production-ready. The key weakness is not the headline thesis; it is whether the deterministic filters preserve the discretionary edge without creating stale, loose, or cost-sensitive entries.
 
 ### 20.1 What is strong
 
@@ -1536,6 +1532,7 @@ This section incorporates the delegated logic, risk/backtest, and documentation 
 - Fixed 1R may not capture enough edge.
 - Costs/slippage can materially degrade performance.
 - 1m historical bars cannot resolve all intrabar event order.
+- Not all HTF key levels are equal so its mostly discrtionary
 
 ### 20.3 Most likely reasons current performance could look poor
 
@@ -1556,7 +1553,7 @@ If improving profitability is the goal, prioritize these in order:
 
 1. Decide strict causality: full structure after trigger vs confirmation after trigger.
 2. Add/compare timeouts for parent retest, opposing gap, and inversion.
-3. Analyze performance by parent timeframe and session.
+3. Analyze performance by parent timeframe and session and handle discrtionary decisions better.
 4. Compare entry locality on/off.
 5. Compare max HTF records 1 vs 2/5/20.
 6. Compare fixed 1R vs larger/liquidity targets.
@@ -1613,10 +1610,10 @@ A trade is valid only if every item below is true.
 
 This strategy is now sufficiently specified to be reviewed, debugged, and improved systematically. The next useful work is not more narrative; it is controlled validation: trade audits, R-normalized segment analysis, cost/slippage sensitivity, causality A/B tests, and targeted regression tests for the gaps identified above.
 
-The most important distinction is between a mechanically valid FVG chain and a high-quality SMC setup. The current rules define the mechanical chain. The remaining work is to determine whether the mechanical chain captures the discretionary edge AlgoChef actually wants, or whether it needs stricter causality, better context filters, stronger timeouts, and more realistic exit logic.
+The most important distinction is between a mechanically valid FVG chain and a high-quality SMC setup. The current rules define the mechanical chain. The remaining work is to determine whether the mechanical chain captures the discretionary edge AlgoChef actually wants, or whether it needs stricter causality, better context filters, and more realistic exit logic.
 
 The highest-value deceptively simple question is:
 
 > Are we trading a true post-HTF-reaction displacement sequence, or are we sometimes trading structures that merely confirmed after the reaction but partially formed before it?
 
-That single distinction may explain a large part of the difference between a discretionary idea that looks convincing on a chart and an unprofitable mechanical backtest.
+That single distinction may explain a large part of the difference between a discretionary idea that looks convincing on a chart and an unprofitable mechanical backtest which is why ML can help solve and algin to the same discretionary decisions are trader would make live.
