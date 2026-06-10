@@ -119,8 +119,20 @@ class StrategyCoreService:
         self._touch_sequence: dict[tuple[date, str], int] = {}
 
     @property
-    def engine_version(self) -> str:
-        return strategy_core.ENGINE_VERSION
+    def platform_version(self) -> str:
+        return strategy_core.PLATFORM_VERSION
+
+    @property
+    def plugin_strategy_id(self) -> str:
+        """The wired plugin's registry id (E2: activation guards contracts against it)."""
+
+        return self._runtime._plugin.strategy_id
+
+    @property
+    def plugin_strategy_version(self) -> str:
+        """The wired plugin's declared strategy_version (the E2 strategy axis)."""
+
+        return self._runtime._plugin.strategy_version
 
     def reset(self, *, requested_symbol: str | None = None) -> StrategyCoreUpdate:
         if requested_symbol is not None:
@@ -223,7 +235,7 @@ class StrategyCoreService:
             session=snapshot.session,
             trading_day=snapshot.trading_day,
             metadata=MappingProxyType(
-                {"strategy_core_engine_version": strategy_core.ENGINE_VERSION}
+                {"strategy_core_platform_version": strategy_core.PLATFORM_VERSION}
             ),
         )
 
@@ -379,6 +391,6 @@ def _feed_status_to_trade_lab(
         last_message=status.last_message,
         metadata={
             **dict(status.metadata),
-            "strategy_core_engine_version": strategy_core.ENGINE_VERSION,
+            "strategy_core_platform_version": strategy_core.PLATFORM_VERSION,
         },
     )

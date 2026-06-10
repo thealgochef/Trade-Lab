@@ -273,7 +273,9 @@ def test_prediction_is_deterministic_and_well_formed(tmp_path: Path) -> None:
     assert first.probabilities[first.predicted_class] == max(first.probabilities.values())
     assert abs(sum(first.probabilities.values()) - 1.0) < 1e-6
     assert set(first.feature_values) == set(_CONTRACT_FEATURES)
-    assert first.contract_id.startswith("NQ_")
+    # E2: the per-bundle stamp is the ACTIVE BUNDLE id (the dir name) — the
+    # contract's strategy_id is now the shared registry router key.
+    assert first.contract_id == "good-model"
     assert first.model_id == "good-model"
     assert first.direction == "long"  # ny_low -> touched from above -> long reversal
     assert first.nan_count == 0

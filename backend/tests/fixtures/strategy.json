@@ -1,7 +1,8 @@
 {
-  "contract_version": "trade_lab_contract_v1",
-  "engine_version": "strategy_core_engine_v3",
-  "strategy_id": "NQ_20260405_147t_5m_30m_multiclass-250602-260220-iterations800_depth4",
+  "contract_version": "trade_lab_contract_v2",
+  "platform_version": "strategy_core_platform_v1",
+  "strategy_id": "touch_reversal",
+  "strategy_version": "1",
   "training_mode": "dashboard_utility",
   "supported_by_runtime": true,
   "instrument": "NQ",
@@ -87,7 +88,7 @@
     "within_band_pts": 2.0,
     "level_proximity_pts": 0.5,
     "large_trade_threshold": 10,
-    "mid_price_source": "top_of_book"
+    "mid_price_source": "trade_price"
   },
   "label_policy": {
     "resolution": "mae_first",

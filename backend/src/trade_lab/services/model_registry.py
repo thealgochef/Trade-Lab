@@ -23,7 +23,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from strategy_core import ENGINE_VERSION, ContractError, StrategyContract, load_strategy_contract
+# E2: the explicit registration import — the registry is empty on a bare
+# `import strategy_core`; routing needs the production plugin registered. This is
+# TL's first (intended) import of the strategy registry.
+import strategy_core.strategies.touch_reversal  # noqa: F401
+from strategy_core import PLATFORM_VERSION, ContractError, StrategyContract, load_strategy_contract
+from strategy_core.strategies.registry import get_strategy
 
 if TYPE_CHECKING:
     from catboost import CatBoostClassifier
@@ -132,9 +137,16 @@ def _describe_bundle(directory: Path, model_id: str) -> ModelBundle | None:
         return None
 
     try:
-        contract = load_strategy_contract(strategy_file, expected_engine_version=ENGINE_VERSION)
+        contract = load_strategy_contract(strategy_file, expected_platform_version=PLATFORM_VERSION)
     except ContractError as exc:
         logger.warning("ignored model bundle with invalid strategy contract: %s", exc)
+        return None
+
+    # E2: the strategy axis gates discovery exactly like the platform hook —
+    # an unroutable/mismatched/unservable bundle is skipped with a warning.
+    binding_error = _strategy_binding_error(contract)
+    if binding_error is not None:
+        logger.warning("ignored model bundle: %s", binding_error)
         return None
 
     validation_ok, validation_detail = _validate_against_metadata(metadata_file, contract)
@@ -150,6 +162,31 @@ def _describe_bundle(directory: Path, model_id: str) -> ModelBundle | None:
         validation_ok=validation_ok,
         validation_detail=validation_detail,
     )
+
+
+def _strategy_binding_error(contract: StrategyContract) -> str | None:
+    """E2 router gate: resolve + equality-check the contract's strategy axis.
+
+    Returns a precise, path-free error string when the contract (i) names a
+    ``strategy_id`` unknown to the SC registry, (ii) carries a
+    ``strategy_version`` that mismatches the registered plugin's declared
+    version, or (iii) declares itself unservable; ``None`` when the binding
+    holds. Callers fail closed (discovery skips; activation raises).
+    """
+
+    try:
+        plugin_cls = get_strategy(contract.strategy_id)
+    except ContractError as exc:
+        return str(exc)
+    if plugin_cls.strategy_version != contract.strategy_version:
+        return (
+            f"strategy_version mismatch for {contract.strategy_id!r}: contract declares "
+            f"{contract.strategy_version!r} but the registered plugin is "
+            f"{plugin_cls.strategy_version!r}"
+        )
+    if contract.supported_by_runtime is not True:
+        return "contract declares supported_by_runtime=false; the bundle is not servable"
+    return None
 
 
 def _validate_against_metadata(metadata_file: Path, contract) -> tuple[bool, str]:
@@ -215,8 +252,14 @@ class ModelRegistry:
     model descriptor.
     """
 
-    def __init__(self, models_path: Path | None) -> None:
+    def __init__(
+        self, models_path: Path | None, *, serving_strategy_id: str | None = None
+    ) -> None:
+        # E2 check (iv): the running service's wired plugin id. When supplied,
+        # activation refuses a contract routed to ANY other strategy — the
+        # hardcoded touch_reversal wiring stays, now guarded instead of implicit.
         self._models_path = models_path
+        self._serving_strategy_id = serving_strategy_id
         self._lock = threading.RLock()
         self._active: ActiveModel | None = None
 
@@ -248,6 +291,21 @@ class ModelRegistry:
             raise ModelNotFoundError("unknown model id")
         directory = self._resolve_bundle_dir(model_id)
         contract = self._load_contract(directory)
+        # E2 router gate (between contract load and model load), fail-closed:
+        # (i) strategy_id resolves in the SC registry, (ii) strategy_version
+        # equals the registered plugin's, (iii) the bundle is servable, and
+        # (iv) the contract routes to the strategy this service actually runs.
+        binding_error = _strategy_binding_error(contract)
+        if binding_error is not None:
+            raise ModelValidationError(binding_error)
+        if (
+            self._serving_strategy_id is not None
+            and contract.strategy_id != self._serving_strategy_id
+        ):
+            raise ModelValidationError(
+                f"contract strategy_id {contract.strategy_id!r} does not match the "
+                f"running service's plugin {self._serving_strategy_id!r}"
+            )
         model = self._load_and_validate_model(directory, contract)
         active = ActiveModel(model_id=model_id, model=model, contract=contract)
         with self._lock:
@@ -284,7 +342,7 @@ class ModelRegistry:
     def _load_contract(directory: Path) -> StrategyContract:
         try:
             return load_strategy_contract(
-                directory / STRATEGY_FILE, expected_engine_version=ENGINE_VERSION
+                directory / STRATEGY_FILE, expected_platform_version=PLATFORM_VERSION
             )
         except ContractError as exc:
             raise ModelValidationError(f"invalid strategy contract: {exc}") from exc

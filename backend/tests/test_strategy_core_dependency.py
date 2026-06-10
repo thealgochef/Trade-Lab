@@ -1,4 +1,4 @@
-def test_strategy_core_dependency_imports_engine_version() -> None:
+def test_strategy_core_dependency_imports_platform_version() -> None:
     import strategy_core
 
-    assert strategy_core.ENGINE_VERSION.startswith("strategy_core_engine_")
+    assert strategy_core.PLATFORM_VERSION.startswith("strategy_core_platform_")

@@ -228,7 +228,12 @@ def create_app(
     # invokes inference on completed observations only once an operator activates a
     # model (Stage 5). No model is active by default, so the runtime just serves
     # market data until then.
-    model_registry = ModelRegistry(settings.models_path)
+    model_registry = ModelRegistry(
+        settings.models_path,
+        # E2 check (iv): activation refuses contracts routed to any strategy other
+        # than the one the runtime's wired plugin actually serves.
+        serving_strategy_id=runtime.strategy_core_service.plugin_strategy_id,
+    )
     inference_engine = InferenceEngine(model_registry)
     runtime.set_inference_engine(inference_engine)
     app.state.model_registry = model_registry

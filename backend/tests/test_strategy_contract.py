@@ -80,8 +80,9 @@ def test_load_real_strategy_contract_parses_all_sections() -> None:
 
 
 def test_load_rejects_unsupported_contract_version(tmp_path: Path) -> None:
+    # E1: v1 is now the UNSUPPORTED version (the shape break migrated v1 -> v2).
     payload = _load_real_payload()
-    payload["contract_version"] = "trade_lab_contract_v2"
+    payload["contract_version"] = "trade_lab_contract_v1"
     target = tmp_path / "strategy.json"
     _write_strategy(target, payload)
 

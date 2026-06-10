@@ -206,7 +206,11 @@ class InferenceEngine:
             session=session,
             is_eligible=is_eligible,
             model_id=active.model_id,
-            contract_id=contract.strategy_id,
+            # E2: contract.strategy_id is now the registry ROUTER key (identical
+            # across bundles), so the per-bundle stamp moves to the ACTIVE BUNDLE
+            # id (the dir name) — byte-compatible with pre-E observed values,
+            # where the contract restated the bundle name.
+            contract_id=active.model_id,
             nan_count=nan_count,
         )
 
