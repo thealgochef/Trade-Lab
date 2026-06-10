@@ -48,6 +48,7 @@ export function IntelligencePanel() {
 function PredictionRow({ prediction }: { prediction: Prediction }) {
   const probEntries = Object.entries(prediction.probabilities).sort(([, a], [, b]) => b - a);
   const outcome = prediction.outcome;
+  const dropped = prediction.dropped;
   return (
     <div className="intel-prediction">
       <div className="intel-prediction-head">
@@ -66,6 +67,12 @@ function PredictionRow({ prediction }: { prediction: Prediction }) {
           <span>MFE {outcome.maxMfePts.toFixed(2)} pts</span>
           <span>MAE {outcome.maxMaePts.toFixed(2)} pts</span>
           <span>{outcome.resolutionType.replaceAll('_', ' ')}</span>
+        </div>
+      )}
+      {dropped && (
+        <div className="intel-outcome">
+          <span className="intel-badge dropped">dropped</span>
+          <span>{dropped.reason.replaceAll('_', ' ')}</span>
         </div>
       )}
     </div>

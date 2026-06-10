@@ -107,6 +107,7 @@ button { font: inherit; }
 .intel-badge.ineligible { color:var(--amber); border-color:rgba(242,184,75,.45); background:rgba(242,184,75,.08); }
 .intel-badge.correct { color:var(--green); border-color:rgba(54,211,153,.45); background:rgba(54,211,153,.08); }
 .intel-badge.incorrect { color:var(--red); border-color:rgba(255,107,107,.45); background:rgba(255,107,107,.08); }
+.intel-badge.dropped { color:var(--muted); border-color:rgba(148,163,184,.45); background:rgba(148,163,184,.08); }
 .intel-probs { display:flex; flex-wrap:wrap; gap:8px; margin-top:4px; color:var(--muted); font-size:11px; font-variant-numeric: tabular-nums; }
 .intel-prediction-meta { margin-top:4px; color:var(--muted); font-size:11px; }
 .intel-outcome { margin-top:4px; display:flex; flex-wrap:wrap; gap:8px; align-items:center; font-size:11px; color:var(--muted); }

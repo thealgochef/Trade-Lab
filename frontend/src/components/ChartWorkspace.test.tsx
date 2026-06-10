@@ -119,6 +119,7 @@ const outcomeDto: OutcomeDTO = {
   max_mae_pts: 3.25,
   bars_to_resolution: 8,
   resolved_ts_utc: '2026-05-21T14:05:00Z',
+  entry_price: 19000.25,
 };
 
 const feedStatus = (state = 'connected'): FeedStatusDTO => ({

@@ -20,6 +20,7 @@ const prediction = (overrides: Partial<Prediction> = {}): Prediction => ({
   contractId: 'contract-1',
   nanCount: 0,
   outcome: null,
+  dropped: null,
   ...overrides,
 });
 
@@ -35,6 +36,7 @@ const outcome = (overrides: Partial<Outcome> = {}): Outcome => ({
   maxMaePts: 3.25,
   barsToResolution: 8,
   timeUtc: '2026-05-21T14:05:00Z',
+  entryPrice: 19000.25,
   ...overrides,
 });
 
@@ -96,5 +98,22 @@ describe('IntelligencePanel', () => {
     expect(screen.getByText('ineligible')).toBeInTheDocument();
     expect(screen.getByText('incorrect')).toBeInTheDocument();
     expect(screen.getByText('actual down')).toBeInTheDocument();
+  });
+
+  it('renders a dropped prediction with a distinct dropped badge and its reason', () => {
+    predictionStore.setState({
+      predictions: [
+        prediction({
+          dropped: { predictionId: 'pred-1', touchId: 'touch-1', reason: 'no_fill', decisionTsUtc: '2026-05-21T14:05:00Z', entryPrice: null },
+        }),
+      ],
+    });
+    render(<IntelligencePanel />);
+
+    expect(screen.getByText('dropped')).toBeInTheDocument();
+    expect(screen.getByText('no fill')).toBeInTheDocument();
+    // A drop is not a resolution: no correctness badge renders.
+    expect(screen.queryByText('correct')).not.toBeInTheDocument();
+    expect(screen.queryByText('incorrect')).not.toBeInTheDocument();
   });
 });

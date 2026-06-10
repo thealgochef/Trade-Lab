@@ -10,6 +10,7 @@ export type MessageType =
   | 'observation.updated'
   | 'prediction.created'
   | 'prediction.resolved'
+  | 'prediction.dropped'
   | 'model.status';
 
 export type BarDTO = {
@@ -117,6 +118,15 @@ export type OutcomeDTO = {
   max_mae_pts: number;
   bars_to_resolution: number;
   resolved_ts_utc: string;
+  entry_price: number;
+};
+
+export type DroppedPredictionDTO = {
+  prediction_id: string;
+  touch_id: string;
+  reason: string;
+  decision_ts_utc: string;
+  entry_price: number | null;
 };
 
 export type ModelStatusDTO = {
@@ -140,6 +150,7 @@ export type SnapshotPayloadDTO = {
   warnings: DataQualityWarningDTO[];
   predictions: PredictionDTO[];
   outcomes: OutcomeDTO[];
+  dropped?: DroppedPredictionDTO[];
   model_status: ModelStatusDTO;
   session: string | null;
   trading_day: string | null;

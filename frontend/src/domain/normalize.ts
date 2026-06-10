@@ -1,6 +1,6 @@
 import type { LiveStatusDTO, ModelBundleDTO, ReplaySourceDTO, ReplayStatusDTO, RuntimeStatusDTO } from '../api/types';
-import type { BarDTO, DataQualityWarningDTO, DisplayLevelDTO, ModelStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, TouchDTO } from '../realtime/types';
-import type { LiveStatus, MarketBar, MarketLevel, MarketTouch, ModelBundle, ModelStatus, Observation, Outcome, Prediction, ReplaySource, ReplayStatus, RuntimeSummary, Timeframe, Warning, WarningMetadata } from './models';
+import type { BarDTO, DataQualityWarningDTO, DisplayLevelDTO, DroppedPredictionDTO, ModelStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, TouchDTO } from '../realtime/types';
+import type { DroppedPrediction, LiveStatus, MarketBar, MarketLevel, MarketTouch, ModelBundle, ModelStatus, Observation, Outcome, Prediction, ReplaySource, ReplayStatus, RuntimeSummary, Timeframe, Warning, WarningMetadata } from './models';
 
 // API DTOs stay at the transport boundary; components consume these narrower
 // workstation models so future backend contract changes do not leak everywhere.
@@ -129,6 +129,7 @@ export const normalizePrediction = (dto: PredictionDTO): Prediction => ({
   contractId: dto.contract_id,
   nanCount: dto.nan_count,
   outcome: null,
+  dropped: null,
 });
 
 export const normalizeOutcome = (dto: OutcomeDTO): Outcome => ({
@@ -143,6 +144,15 @@ export const normalizeOutcome = (dto: OutcomeDTO): Outcome => ({
   maxMaePts: dto.max_mae_pts,
   barsToResolution: dto.bars_to_resolution,
   timeUtc: dto.resolved_ts_utc,
+  entryPrice: dto.entry_price,
+});
+
+export const normalizeDropped = (dto: DroppedPredictionDTO): DroppedPrediction => ({
+  predictionId: dto.prediction_id,
+  touchId: dto.touch_id,
+  reason: dto.reason,
+  decisionTsUtc: dto.decision_ts_utc,
+  entryPrice: dto.entry_price ?? null,
 });
 
 export const normalizeModelStatus = (dto: ModelStatusDTO): ModelStatus => ({

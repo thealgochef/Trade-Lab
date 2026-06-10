@@ -425,7 +425,9 @@ def _coalesce_replay_updates(updates: list[RuntimeUpdate]) -> RuntimeUpdate:
     predictions = list(merged.predictions)
     # audit #N4: 'outcomes' is an event-style delta (prediction.resolved); accumulate
     # it like 'predictions' so coalesced replay never drops resolved-outcome broadcasts.
+    # 'dropped' (prediction.dropped) is event-style for the same reason.
     outcomes = list(merged.outcomes)
+    dropped = list(merged.dropped)
     for update in updates:
         if update.feed_status is not None:
             feed_status = update.feed_status
@@ -445,6 +447,8 @@ def _coalesce_replay_updates(updates: list[RuntimeUpdate]) -> RuntimeUpdate:
             predictions.extend(update.predictions)
         if update.outcomes:
             outcomes.extend(update.outcomes)
+        if update.dropped:
+            dropped.extend(update.dropped)
     return RuntimeUpdate(
         feed_status=feed_status,
         warnings=tuple(warnings),
@@ -455,6 +459,7 @@ def _coalesce_replay_updates(updates: list[RuntimeUpdate]) -> RuntimeUpdate:
         observations=tuple(observations),
         predictions=tuple(predictions),
         outcomes=tuple(outcomes),
+        dropped=tuple(dropped),
     )
 
 

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { RealtimeClient } from './client';
 import { blotterStore, connectionStore, intelligenceStore, liveStore, marketStore, predictionStore, replayStore, runtimeStore } from '../state/stores';
-import type { BarDTO, DataQualityWarningDTO, Envelope, FeedStatusDTO, ModelStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, SnapshotPayloadDTO, TouchDTO } from './types';
+import type { BarDTO, DataQualityWarningDTO, DroppedPredictionDTO, Envelope, FeedStatusDTO, ModelStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, SnapshotPayloadDTO, TouchDTO } from './types';
 import { MAX_BARS_PER_TIMEFRAME } from '../chart/viewModels';
 import { normalizeBar, normalizeWarning } from '../domain/normalize';
 
@@ -145,6 +145,16 @@ const outcome = (overrides: Partial<OutcomeDTO> = {}): OutcomeDTO => ({
   max_mae_pts: 3.0,
   bars_to_resolution: 8,
   resolved_ts_utc: '2026-05-21T14:10:00Z',
+  entry_price: 19000.25,
+  ...overrides,
+});
+
+const droppedDto = (overrides: Partial<DroppedPredictionDTO> = {}): DroppedPredictionDTO => ({
+  prediction_id: 'pred-1',
+  touch_id: 'touch-1',
+  reason: 'flatten',
+  decision_ts_utc: '2026-05-21T20:41:00Z',
+  entry_price: null,
   ...overrides,
 });
 
@@ -272,6 +282,18 @@ describe('RealtimeClient', () => {
     expect(blotterStore.getSnapshot().events.some((event) => event.message === 'Model status updated')).toBe(true);
   });
 
+  it('routes prediction.dropped deltas into the dropped ring and annotates the prediction', () => {
+    client.start();
+
+    sockets[0].message(envelope('prediction.created', { prediction: prediction() }));
+    sockets[0].message(envelope('prediction.dropped', { dropped: droppedDto() }));
+
+    expect(predictionStore.getSnapshot().dropped[0]).toMatchObject({ predictionId: 'pred-1', reason: 'flatten', entryPrice: null });
+    expect(predictionStore.getSnapshot().predictions[0]).toMatchObject({ id: 'pred-1', outcome: null, dropped: expect.objectContaining({ reason: 'flatten' }) });
+    expect(predictionStore.getSnapshot().outcomes).toHaveLength(0);
+    expect(blotterStore.getSnapshot().events.some((event) => event.message === 'Prediction dropped (flatten)')).toBe(true);
+  });
+
   it('bounds recent predictions and outcomes to the newest entries', () => {
     client.start();
 
@@ -294,6 +316,7 @@ describe('RealtimeClient', () => {
 
     expect(predictionStore.getSnapshot().predictions).toHaveLength(0);
     expect(predictionStore.getSnapshot().outcomes).toHaveLength(0);
+    expect(predictionStore.getSnapshot().dropped).toHaveLength(0);
   });
 
   it('converts provider warning metadata into blotter code, source, and safe details only', () => {

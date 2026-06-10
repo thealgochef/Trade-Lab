@@ -126,8 +126,9 @@ class InferenceEngine:
     def active_contract(self) -> StrategyContract | None:
         """The contract the active model was validated against, or ``None``.
 
-        Lets the runtime build a contract-specific OutcomeTracker without reaching
-        into the registry, so a hot-swap re-derives forward thresholds/bar type.
+        Lets the runtime build the contract-specific honest resolver without
+        reaching into the registry, so a hot-swap re-derives forward
+        thresholds/bar type.
         """
 
         active = self._registry.active()

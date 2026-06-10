@@ -15,6 +15,7 @@ from trade_lab.api.dto import (
     MessageType,
     SnapshotPayload,
     bars_payload,
+    dropped_payload,
     feed_status_to_dto,
     levels_payload,
     make_envelope,
@@ -106,6 +107,8 @@ class WebSocketBroadcaster:
             )
         for outcome in update.outcomes:
             messages.append(self.envelope_bytes("prediction.resolved", outcome_payload(outcome)))
+        for dropped in update.dropped:
+            messages.append(self.envelope_bytes("prediction.dropped", dropped_payload(dropped)))
         model_status_message = self._model_status_message_if_changed()
         if model_status_message is not None:
             messages.append(model_status_message)

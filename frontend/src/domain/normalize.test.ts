@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { normalizeBar, normalizeLevel, normalizeModelBundle, normalizeModelStatus, normalizeOutcome, normalizePrediction, normalizeRuntimeStatus, normalizeWarning } from './normalize';
+import { normalizeBar, normalizeDropped, normalizeLevel, normalizeModelBundle, normalizeModelStatus, normalizeOutcome, normalizePrediction, normalizeRuntimeStatus, normalizeWarning } from './normalize';
 import type { ModelBundleDTO, RuntimeStatusDTO } from '../api/types';
 import type { BarDTO, DisplayLevelDTO, ModelStatusDTO, OutcomeDTO, PredictionDTO } from '../realtime/types';
 
@@ -126,6 +126,7 @@ describe('inference DTO normalization', () => {
       max_mae_pts: 3.0,
       bars_to_resolution: 8,
       resolved_ts_utc: '2026-05-21T14:10:00Z',
+      entry_price: 19000.25,
     };
 
     expect(normalizeOutcome(dto)).toEqual({
@@ -140,6 +141,25 @@ describe('inference DTO normalization', () => {
       maxMaePts: 3.0,
       barsToResolution: 8,
       timeUtc: '2026-05-21T14:10:00Z',
+      entryPrice: 19000.25,
+    });
+  });
+
+  it('maps dropped predictions to domain shape', () => {
+    expect(
+      normalizeDropped({
+        prediction_id: 'pred-1',
+        touch_id: 'touch-1',
+        reason: 'flatten',
+        decision_ts_utc: '2026-05-21T20:41:00Z',
+        entry_price: null,
+      }),
+    ).toEqual({
+      predictionId: 'pred-1',
+      touchId: 'touch-1',
+      reason: 'flatten',
+      decisionTsUtc: '2026-05-21T20:41:00Z',
+      entryPrice: null,
     });
   });
 

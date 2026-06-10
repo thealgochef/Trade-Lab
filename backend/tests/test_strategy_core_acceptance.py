@@ -94,8 +94,6 @@ def test_deleted_shadow_engines_stay_deleted_across_backend_src() -> None:
         context; its Chicago-clock divergence from Strategy-Core's ET sessions is a
         named debt). It may use ``SessionClassifier``/``make_bar_id`` but never the
         deleted engines.
-      * ``services/inference/outcome_tracker.py`` — the tracker's local RTH-cutoff
-        wall-clock math (contract-parameterized) dies WITH the tracker at D1b.
       * ``services/strategy_core_service.py`` — display-flag re-derivation
         (``is_eligible``/``is_developing`` off Strategy-Core ``available_from``) on
         the DTO seam.

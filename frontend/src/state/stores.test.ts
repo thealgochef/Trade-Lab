@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { addBlotterEvent, addOutcome, addPrediction, blotterStore, clearPredictions, connectionStore, intelligenceStore, marketStore, predictionStore, runtimeStore, setModelStatus } from './stores';
-import type { Outcome, Prediction } from '../domain/models';
+import { addBlotterEvent, addDropped, addOutcome, addPrediction, blotterStore, clearPredictions, connectionStore, intelligenceStore, marketStore, predictionStore, runtimeStore, setModelStatus } from './stores';
+import type { DroppedPrediction, Outcome, Prediction } from '../domain/models';
 
 const resetStores = () => {
   runtimeStore.reset();
@@ -27,6 +27,7 @@ const makePrediction = (id: string): Prediction => ({
   contractId: 'NQM6',
   nanCount: 0,
   outcome: null,
+  dropped: null,
 });
 
 const makeOutcome = (predictionId: string): Outcome => ({
@@ -41,6 +42,15 @@ const makeOutcome = (predictionId: string): Outcome => ({
   maxMaePts: 3.0,
   barsToResolution: 8,
   timeUtc: '2026-05-21T14:10:00Z',
+  entryPrice: 19000.25,
+});
+
+const makeDropped = (predictionId: string): DroppedPrediction => ({
+  predictionId,
+  touchId: 'touch-1',
+  reason: 'flatten',
+  decisionTsUtc: '2026-05-21T20:41:00Z',
+  entryPrice: null,
 });
 
 describe('workstation stores', () => {
@@ -127,15 +137,43 @@ describe('workstation stores', () => {
     expect(predictionStore.getSnapshot().outcomes.filter((entry) => entry.predictionId === 'pred-104')).toHaveLength(1);
   });
 
-  it('clears predictions and outcomes while keeping model status', () => {
+  it('annotates the matching prediction when it is dropped, leaving outcome null', () => {
+    addPrediction(makePrediction('pred-1'));
+    addPrediction(makePrediction('pred-2'));
+
+    addDropped(makeDropped('pred-1'));
+
+    const state = predictionStore.getSnapshot();
+    expect(state.dropped[0]).toMatchObject({ predictionId: 'pred-1', reason: 'flatten' });
+    expect(state.predictions.find((entry) => entry.id === 'pred-1')?.dropped).toMatchObject({ reason: 'flatten' });
+    expect(state.predictions.find((entry) => entry.id === 'pred-1')?.outcome).toBeNull();
+    expect(state.predictions.find((entry) => entry.id === 'pred-2')?.dropped).toBeNull();
+  });
+
+  it('bounds dropped history to the newest 100 and de-dupes by prediction id', () => {
+    for (let index = 0; index < 105; index += 1) {
+      addDropped(makeDropped(`pred-${index}`));
+    }
+
+    const dropped = predictionStore.getSnapshot().dropped;
+    expect(dropped).toHaveLength(100);
+    expect(dropped[0]).toMatchObject({ predictionId: 'pred-104' });
+
+    addDropped(makeDropped('pred-104'));
+    expect(predictionStore.getSnapshot().dropped.filter((entry) => entry.predictionId === 'pred-104')).toHaveLength(1);
+  });
+
+  it('clears predictions, outcomes, and dropped while keeping model status', () => {
     addPrediction(makePrediction('pred-1'));
     addOutcome(makeOutcome('pred-1'));
+    addDropped(makeDropped('pred-2'));
     setModelStatus({ loaded: true, modelId: 'model-a', strategyId: null, trainingMode: null, instrument: null, featureNames: [], classMap: {}, validationOk: true, validationDetail: null });
 
     clearPredictions();
 
     expect(predictionStore.getSnapshot().predictions).toEqual([]);
     expect(predictionStore.getSnapshot().outcomes).toEqual([]);
+    expect(predictionStore.getSnapshot().dropped).toEqual([]);
     expect(predictionStore.getSnapshot().modelStatus).toMatchObject({ loaded: true, modelId: 'model-a' });
   });
 

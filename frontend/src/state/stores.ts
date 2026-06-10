@@ -1,12 +1,14 @@
 import { createStore, useStore } from './createStore';
-import type { BlotterEvent, LiveStatus, MarketBar, MarketLevel, MarketTouch, ModelBundle, ModelStatus, Observation, Outcome, Prediction, ReplaySource, ReplayStatus, RuntimeSummary, Timeframe, Warning } from '../domain/models';
+import type { BlotterEvent, DroppedPrediction, LiveStatus, MarketBar, MarketLevel, MarketTouch, ModelBundle, ModelStatus, Observation, Outcome, Prediction, ReplaySource, ReplayStatus, RuntimeSummary, Timeframe, Warning } from '../domain/models';
 
 const MAX_PREDICTIONS = 100;
 const MAX_OUTCOMES = 100;
+const MAX_DROPPED = 100;
 
 export type PredictionState = {
   predictions: Prediction[];
   outcomes: Outcome[];
+  dropped: DroppedPrediction[];
   modelStatus: ModelStatus | null;
   bundles: ModelBundle[];
 };
@@ -109,17 +111,19 @@ export const liveStore = createStore({
 export const predictionStore = createStore<PredictionState>({
   predictions: [],
   outcomes: [],
+  dropped: [],
   modelStatus: null,
   bundles: [],
 });
 
 // Newest-first, bounded prediction history; the matching prediction is annotated
-// with its outcome by prediction_id when one resolves so the UI can render the
-// resolved state without a second lookup.
+// with its outcome (or drop) by prediction_id when one arrives so the UI can
+// render the resolved/dropped state without a second lookup.
 export const addPrediction = (prediction: Prediction) => {
   predictionStore.setState((current) => {
     const existingOutcome = current.outcomes.find((outcome) => outcome.predictionId === prediction.id) ?? null;
-    const annotated = existingOutcome ? { ...prediction, outcome: existingOutcome } : prediction;
+    const existingDrop = current.dropped.find((drop) => drop.predictionId === prediction.id) ?? null;
+    const annotated = { ...prediction, outcome: existingOutcome, dropped: existingDrop };
     const without = current.predictions.filter((entry) => entry.id !== prediction.id);
     return { ...current, predictions: [annotated, ...without].slice(0, MAX_PREDICTIONS) };
   });
@@ -135,6 +139,18 @@ export const addOutcome = (outcome: Outcome) => {
   });
 };
 
+// Drops mirror outcomes (newest-first, capped, de-duped by prediction id) but stay
+// out of `prediction.outcome` so they can never produce a chart outcome marker.
+export const addDropped = (dropped: DroppedPrediction) => {
+  predictionStore.setState((current) => {
+    const withoutDrop = current.dropped.filter((entry) => entry.predictionId !== dropped.predictionId);
+    const predictions = current.predictions.map((prediction) =>
+      prediction.id === dropped.predictionId ? { ...prediction, dropped } : prediction,
+    );
+    return { ...current, dropped: [dropped, ...withoutDrop].slice(0, MAX_DROPPED), predictions };
+  });
+};
+
 export const setModelStatus = (modelStatus: ModelStatus) => {
   predictionStore.setState((current) => ({ ...current, modelStatus }));
 };
@@ -144,7 +160,7 @@ export const setModelBundles = (bundles: ModelBundle[]) => {
 };
 
 export const clearPredictions = () => {
-  predictionStore.setState((current) => ({ ...current, predictions: [], outcomes: [] }));
+  predictionStore.setState((current) => ({ ...current, predictions: [], outcomes: [], dropped: [] }));
 };
 
 export const useRuntime = <T = RuntimeSummary>(selector?: (state: RuntimeSummary) => T) => useStore(runtimeStore, selector ?? ((state) => state as T));
@@ -156,6 +172,7 @@ export const useReplay = <T = ReturnType<typeof replayStore.getSnapshot>>(select
 export const useLive = <T = ReturnType<typeof liveStore.getSnapshot>>(selector?: (state: ReturnType<typeof liveStore.getSnapshot>) => T) => useStore(liveStore, selector ?? ((state) => state as T));
 export const usePredictions = <T = Prediction[]>(selector?: (predictions: Prediction[]) => T) => useStore(predictionStore, (state) => (selector ? selector(state.predictions) : (state.predictions as T)));
 export const useOutcomes = <T = Outcome[]>(selector?: (outcomes: Outcome[]) => T) => useStore(predictionStore, (state) => (selector ? selector(state.outcomes) : (state.outcomes as T)));
+export const useDropped = <T = DroppedPrediction[]>(selector?: (dropped: DroppedPrediction[]) => T) => useStore(predictionStore, (state) => (selector ? selector(state.dropped) : (state.dropped as T)));
 export const useModelStatus = <T = ModelStatus | null>(selector?: (modelStatus: ModelStatus | null) => T) => useStore(predictionStore, (state) => (selector ? selector(state.modelStatus) : (state.modelStatus as T)));
 export const useBundles = <T = ModelBundle[]>(selector?: (bundles: ModelBundle[]) => T) => useStore(predictionStore, (state) => (selector ? selector(state.bundles) : (state.bundles as T)));
 

@@ -15,7 +15,7 @@ from trade_lab.domain.data_quality import DataQualityWarning
 from trade_lab.domain.feed import FeedConnectionState, FeedStatus
 from trade_lab.domain.levels import DisplayLevel, TouchEvent
 from trade_lab.domain.observations import Observation
-from trade_lab.domain.outcomes import Outcome
+from trade_lab.domain.outcomes import DroppedPrediction, Outcome
 from trade_lab.services.inference.inference_engine import Prediction
 from trade_lab.services.model_registry import ModelBundle
 from trade_lab.services.replay import ReplayStatus
@@ -34,6 +34,7 @@ MessageType = Literal[
     "feed.status",
     "prediction.created",
     "prediction.resolved",
+    "prediction.dropped",
     "model.status",
 ]
 
@@ -126,6 +127,15 @@ class OutcomeDTO(ApiModel):
     max_mae_pts: float
     bars_to_resolution: int
     resolved_ts_utc: datetime
+    entry_price: float
+
+
+class DroppedPredictionDTO(ApiModel):
+    prediction_id: str
+    touch_id: str
+    reason: str
+    decision_ts_utc: datetime
+    entry_price: float | None = None
 
 
 class ModelStatusDTO(ApiModel):
@@ -186,6 +196,7 @@ class SnapshotPayload(ApiModel):
     warnings: list[DataQualityWarningDTO] = Field(default_factory=list)
     predictions: list[PredictionDTO] = Field(default_factory=list)
     outcomes: list[OutcomeDTO] = Field(default_factory=list)
+    dropped: list[DroppedPredictionDTO] = Field(default_factory=list)
     model_status: ModelStatusDTO
     session: str | None = None
     trading_day: date | None = None
@@ -314,6 +325,17 @@ def outcome_to_dto(outcome: Outcome) -> OutcomeDTO:
         max_mae_pts=outcome.max_mae_pts,
         bars_to_resolution=outcome.bars_to_resolution,
         resolved_ts_utc=outcome.resolved_ts_utc,
+        entry_price=outcome.entry_price,
+    )
+
+
+def dropped_to_dto(dropped: DroppedPrediction) -> DroppedPredictionDTO:
+    return DroppedPredictionDTO(
+        prediction_id=dropped.prediction_id,
+        touch_id=dropped.touch_id,
+        reason=dropped.reason,
+        decision_ts_utc=dropped.decision_ts_utc,
+        entry_price=dropped.entry_price,
     )
 
 
@@ -400,6 +422,7 @@ def snapshot_payload_from_runtime(snapshot: RuntimeSnapshot) -> SnapshotPayload:
         warnings=[warning_to_dto(warning) for warning in snapshot.warnings],
         predictions=[prediction_to_dto(prediction) for prediction in snapshot.predictions],
         outcomes=[outcome_to_dto(outcome) for outcome in snapshot.outcomes],
+        dropped=[dropped_to_dto(dropped) for dropped in snapshot.dropped],
         model_status=model_status_to_dto(snapshot.model_status),
         session=snapshot.session,
         trading_day=snapshot.trading_day,
@@ -424,6 +447,10 @@ def prediction_payload(prediction: Prediction) -> dict[str, Any]:
 
 def outcome_payload(outcome: Outcome) -> dict[str, Any]:
     return {"outcome": outcome_to_dto(outcome).model_dump(mode="json")}
+
+
+def dropped_payload(dropped: DroppedPrediction) -> dict[str, Any]:
+    return {"dropped": dropped_to_dto(dropped).model_dump(mode="json")}
 
 
 def make_envelope(

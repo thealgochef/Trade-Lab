@@ -239,6 +239,7 @@ describe('chart view model normalization', () => {
     contractId: 'contract-1',
     nanCount: 0,
     outcome: null,
+    dropped: null,
     ...overrides,
   });
 
@@ -254,6 +255,7 @@ describe('chart view model normalization', () => {
     maxMaePts: 3.25,
     barsToResolution: 8,
     timeUtc: '2026-05-21T14:05:00Z',
+    entryPrice: 19000.25,
     ...overrides,
   });
 

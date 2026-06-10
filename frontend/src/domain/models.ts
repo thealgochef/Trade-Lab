@@ -130,6 +130,7 @@ export type Prediction = {
   contractId: string;
   nanCount: number;
   outcome: Outcome | null;
+  dropped: DroppedPrediction | null;
 };
 
 export type Outcome = {
@@ -144,6 +145,15 @@ export type Outcome = {
   maxMaePts: number;
   barsToResolution: number;
   timeUtc: string;
+  entryPrice: number;
+};
+
+export type DroppedPrediction = {
+  predictionId: string;
+  touchId: string;
+  reason: string;
+  decisionTsUtc: string;
+  entryPrice: number | null;
 };
 
 export type ModelStatus = {

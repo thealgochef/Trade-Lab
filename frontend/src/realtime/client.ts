@@ -1,9 +1,9 @@
 import { config } from '../config';
 import { MAX_BARS_PER_TIMEFRAME, barKey, isSupportedTimeframe } from '../chart/viewModels';
-import { addBlotterEvent, addOutcome, addPrediction, clearPredictions, connectionStore, intelligenceStore, liveStore, marketStore, predictionStore, replayStore, runtimeStore, setModelStatus } from '../state/stores';
-import { normalizeBar, normalizeLevel, normalizeModelStatus, normalizeObservation, normalizeOutcome, normalizePrediction, normalizeTouch, normalizeWarning } from '../domain/normalize';
+import { addBlotterEvent, addDropped, addOutcome, addPrediction, clearPredictions, connectionStore, intelligenceStore, liveStore, marketStore, predictionStore, replayStore, runtimeStore, setModelStatus } from '../state/stores';
+import { normalizeBar, normalizeDropped, normalizeLevel, normalizeModelStatus, normalizeObservation, normalizeOutcome, normalizePrediction, normalizeTouch, normalizeWarning } from '../domain/normalize';
 import type { MarketBar } from '../domain/models';
-import type { BarDTO, DataQualityWarningDTO, DisplayLevelDTO, Envelope, FeedStatusDTO, ModelStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, SnapshotPayloadDTO, TouchDTO } from './types';
+import type { BarDTO, DataQualityWarningDTO, DisplayLevelDTO, DroppedPredictionDTO, Envelope, FeedStatusDTO, ModelStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, SnapshotPayloadDTO, TouchDTO } from './types';
 
 type WebSocketFactory = (url: string) => WebSocket;
 
@@ -138,6 +138,12 @@ export class RealtimeClient {
         addOutcome(normalizeOutcome((envelope.payload as { outcome: OutcomeDTO }).outcome));
         addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'observation', severity: 'info', message: 'Prediction resolved', sequence: envelope.sequence });
         break;
+      case 'prediction.dropped': {
+        const dropped = normalizeDropped((envelope.payload as { dropped: DroppedPredictionDTO }).dropped);
+        addDropped(dropped);
+        addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'observation', severity: 'info', message: `Prediction dropped (${dropped.reason})`, sequence: envelope.sequence });
+        break;
+      }
       case 'model.status':
         setModelStatus(normalizeModelStatus(envelope.payload as ModelStatusDTO));
         addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'system', severity: 'info', message: 'Model status updated', sequence: envelope.sequence });
@@ -156,19 +162,26 @@ export class RealtimeClient {
       warnings: payload.warnings.map(normalizeWarning).slice(0, 100),
       touches: [],
     });
-    // Seed predictions/outcomes newest-first and annotate each prediction with any
-    // already-resolved outcome so the snapshot matches the running delta state.
+    // Seed predictions/outcomes/drops newest-first and annotate each prediction with
+    // any already-resolved outcome (or drop) so the snapshot matches the running
+    // delta state. Drops never enter `prediction.outcome`, so no chart marker.
     const outcomes = (payload.outcomes ?? []).map(normalizeOutcome).slice(0, 100);
+    const dropped = (payload.dropped ?? []).map(normalizeDropped).slice(0, 100);
     const outcomeByPrediction = new Map(outcomes.map((outcome) => [outcome.predictionId, outcome]));
+    const droppedByPrediction = new Map(dropped.map((drop) => [drop.predictionId, drop]));
     const predictions = (payload.predictions ?? []).map((dto) => {
       const prediction = normalizePrediction(dto);
-      const outcome = outcomeByPrediction.get(prediction.id);
-      return outcome ? { ...prediction, outcome } : prediction;
+      return {
+        ...prediction,
+        outcome: outcomeByPrediction.get(prediction.id) ?? null,
+        dropped: droppedByPrediction.get(prediction.id) ?? null,
+      };
     }).slice(0, 100);
     predictionStore.setState((current) => ({
       ...current,
       predictions,
       outcomes,
+      dropped,
       modelStatus: payload.model_status ? normalizeModelStatus(payload.model_status) : current.modelStatus,
     }));
     runtimeStore.setState((current) => ({ ...current, session: payload.session ?? null, tradingDay: payload.trading_day ?? null }));

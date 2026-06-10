@@ -432,6 +432,7 @@ def test_resolved_outcome_envelope_validates_when_a_forward_bar_closes(tmp_path:
         max_mae_pts=2.0,
         bars_to_resolution=3,
         resolved_ts_utc=day0 + timedelta(minutes=10),
+        entry_price=17_002.75,
     )
     raw = broadcaster.envelope_bytes("prediction.resolved", outcome_payload(sample))
     envelope = json.loads(raw)
@@ -439,6 +440,57 @@ def test_resolved_outcome_envelope_validates_when_a_forward_bar_closes(tmp_path:
     assert envelope["version"] == MESSAGE_VERSION
     assert envelope["type"] == "prediction.resolved"
     assert envelope["payload"]["outcome"] == outcome_to_dto(sample).model_dump(mode="json")
+    # D1b: the served shape carries the honest fill the excursions were anchored on.
+    assert set(envelope["payload"]["outcome"]) == {
+        "outcome_id",
+        "prediction_id",
+        "touch_id",
+        "resolution_type",
+        "actual_class",
+        "predicted_class",
+        "correct",
+        "max_mfe_pts",
+        "max_mae_pts",
+        "bars_to_resolution",
+        "resolved_ts_utc",
+        "entry_price",
+    }
+    assert envelope["payload"]["outcome"]["entry_price"] == 17_002.75
+    _assert_no_secret_text(envelope)
+    _assert_no_temp_path(envelope, tmp_path)
+
+
+def test_dropped_prediction_envelope_validates(tmp_path: Path) -> None:
+    _client, _runtime, broadcaster = _runtime_app_with_active_model(tmp_path)
+
+    # Synthesize a drop envelope the same way the resolved test does, validating the
+    # D1b prediction.dropped frame shape without depending on flatten-window timing.
+    from trade_lab.api.dto import dropped_payload, dropped_to_dto
+    from trade_lab.domain.outcomes import DroppedPrediction
+
+    day0 = datetime(2026, 1, 5, 21, 41, tzinfo=UTC)
+    sample = DroppedPrediction(
+        prediction_id="prediction-1",
+        touch_id="touch-1",
+        reason="flatten",
+        decision_ts_utc=day0,
+        entry_price=None,
+    )
+    raw = broadcaster.envelope_bytes("prediction.dropped", dropped_payload(sample))
+    envelope = json.loads(raw)
+
+    assert envelope["version"] == MESSAGE_VERSION
+    assert envelope["type"] == "prediction.dropped"
+    assert envelope["payload"]["dropped"] == dropped_to_dto(sample).model_dump(mode="json")
+    assert set(envelope["payload"]["dropped"]) == {
+        "prediction_id",
+        "touch_id",
+        "reason",
+        "decision_ts_utc",
+        "entry_price",
+    }
+    assert envelope["payload"]["dropped"]["reason"] == "flatten"
+    assert envelope["payload"]["dropped"]["entry_price"] is None
     _assert_no_secret_text(envelope)
     _assert_no_temp_path(envelope, tmp_path)
 

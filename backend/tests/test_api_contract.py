@@ -545,6 +545,7 @@ def test_websocket_snapshot_contract_is_versioned_deterministic_and_safe() -> No
         "warnings",
         "predictions",
         "outcomes",
+        "dropped",
         "model_status",
         "session",
         "trading_day",
@@ -556,6 +557,7 @@ def test_websocket_snapshot_contract_is_versioned_deterministic_and_safe() -> No
     assert snapshot["payload"]["warnings"] == []
     assert snapshot["payload"]["predictions"] == []
     assert snapshot["payload"]["outcomes"] == []
+    assert snapshot["payload"]["dropped"] == []
     assert snapshot["payload"]["model_status"] == {
         "loaded": False,
         "model_id": None,
@@ -649,6 +651,7 @@ def test_empty_snapshot_payload_has_required_shape() -> None:
         "warnings",
         "predictions",
         "outcomes",
+        "dropped",
         "model_status",
         "session",
         "trading_day",
