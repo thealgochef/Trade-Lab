@@ -1,11 +1,10 @@
-from dataclasses import FrozenInstanceError
+﻿from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import MappingProxyType
 
 import pytest
 
-from trade_lab.domain.candles import CandleCloseReason, CandleEngine
 from trade_lab.domain.events import (
     DailyStatisticEvent,
     MarketStatus,
@@ -194,122 +193,3 @@ def test_cached_session_classifier_preserves_minute_boundary_semantics() -> None
 
     assert asia == (datetime(2026, 1, 5, tzinfo=UTC).date(), SessionName.ASIA)
     assert london == (datetime(2026, 1, 5, tzinfo=UTC).date(), SessionName.LONDON)
-
-
-def test_candle_engine_counts_only_trade_events_and_completes_exactly_n() -> None:
-    engine = CandleEngine((3,))
-    quote = MarketStatusEvent(datetime(2026, 1, 5, 0, 0, tzinfo=UTC), 1, MarketStatus.OPEN)
-    assert engine.process_event(quote).completed == ()
-
-    assert engine.process_trade(trade(datetime(2026, 1, 5, 0, 0, tzinfo=UTC), 100)).completed == ()
-    current = engine.process_trade(trade(datetime(2026, 1, 5, 0, 1, tzinfo=UTC), 101, 2)).current[0]
-    assert current.bar_index == 0
-    assert current.bar_id == "3t:2026-01-05:0"
-    assert current.open_ticks == 100
-    assert current.high_ticks == 101
-    assert current.low_ticks == 100
-    assert current.close_ticks == 101
-    assert current.volume == 3
-    assert current.trade_count == 2
-    assert current.is_partial
-
-    update = engine.process_trade(trade(datetime(2026, 1, 5, 0, 2, tzinfo=UTC), 99, 2))
-    assert update.current == ()
-    assert len(update.completed) == 1
-    candle = update.completed[0]
-    assert candle.bar_index == current.bar_index
-    assert candle.bar_id == current.bar_id
-    assert candle.trade_count == 3
-    assert candle.open_ticks == 100
-    assert candle.high_ticks == 101
-    assert candle.low_ticks == 99
-    assert candle.close_ticks == 99
-    assert candle.volume == 5
-    assert candle.is_complete
-    assert not candle.is_partial
-    assert candle.close_reason == CandleCloseReason.COMPLETE
-
-
-def test_candle_engine_assigns_stable_incrementing_bar_identity_for_same_second_bars() -> None:
-    engine = CandleEngine((1, 2))
-    ts = datetime(2026, 1, 5, 0, 0, 0, 500_000, tzinfo=UTC)
-
-    first = engine.process_trade(trade(ts, 100)).completed
-    second = engine.process_trade(trade(ts, 101)).completed
-    closed_two_tick = second[1]
-    next_current = engine.process_trade(trade(ts, 102)).current[0]
-
-    assert [(bar.timeframe_ticks, bar.bar_index, bar.bar_id) for bar in first] == [
-        (1, 0, "1t:2026-01-05:0")
-    ]
-    assert (second[0].timeframe_ticks, second[0].bar_index, second[0].bar_id) == (
-        1,
-        1,
-        "1t:2026-01-05:1",
-    )
-    assert (closed_two_tick.bar_index, closed_two_tick.bar_id) == (0, "2t:2026-01-05:0")
-    assert (next_current.bar_index, next_current.bar_id) == (1, "2t:2026-01-05:1")
-
-
-def test_candle_engine_tracks_147_987_and_2000_tick_bars_concurrently() -> None:
-    engine = CandleEngine()
-    completed_timeframes: list[int] = []
-    start = datetime(2026, 1, 5, 0, 0, tzinfo=UTC)
-
-    for i in range(2000):
-        update = engine.process_trade(trade(start + timedelta(seconds=i), 68_000 + (i % 10), 1))
-        completed_timeframes.extend(candle.timeframe_ticks for candle in update.completed)
-
-    assert completed_timeframes.count(147) == 13
-    assert completed_timeframes.count(987) == 2
-    assert completed_timeframes.count(2000) == 1
-    assert sorted(candle.timeframe_ticks for candle in engine.snapshot_update(()).current) == [
-        147,
-        987,
-    ]
-
-
-def test_candle_engine_finalizes_partial_at_day_boundary_and_starts_fresh_sequence() -> None:
-    engine = CandleEngine((3,))
-    engine.process_trade(trade(datetime(2026, 1, 5, 0, 0, tzinfo=UTC), 100))
-    update = engine.process_trade(trade(datetime(2026, 1, 6, 0, 0, tzinfo=UTC), 110))
-
-    assert len(update.completed) == 1
-    partial = update.completed[0]
-    assert partial.is_partial
-    assert partial.close_reason == CandleCloseReason.END_OF_DAY
-    assert partial.close_ts_utc == datetime(2026, 1, 5, 0, 0, tzinfo=UTC)
-    assert update.current[0].open_ticks == 110
-    assert update.current[0].bar_index == 0
-    assert update.current[0].bar_id == "3t:2026-01-06:0"
-    assert update.current[0].trade_count == 1
-    assert update.current[0].trading_day.isoformat() == "2026-01-06"
-
-
-def test_candle_engine_does_not_reset_at_asia_london_or_ny_boundaries() -> None:
-    engine = CandleEngine((4,))
-    for ts, price in [
-        (datetime(2026, 1, 5, 7, 59, tzinfo=UTC), 100),
-        (datetime(2026, 1, 5, 8, 0, tzinfo=UTC), 101),
-        (datetime(2026, 1, 5, 13, 59, tzinfo=UTC), 102),
-        (datetime(2026, 1, 5, 14, 0, tzinfo=UTC), 103),
-    ]:
-        update = engine.process_trade(trade(ts, price))
-
-    assert len(update.completed) == 1
-    assert update.completed[0].open_ticks == 100
-    assert update.completed[0].close_ticks == 103
-    assert update.completed[0].trade_count == 4
-
-
-def test_explicit_finalize_closes_all_incomplete_bars_as_end_of_day_partials() -> None:
-    engine = CandleEngine((3, 5))
-    engine.process_trade(trade(datetime(2026, 1, 5, 0, 0, tzinfo=UTC), 100))
-    engine.process_trade(trade(datetime(2026, 1, 5, 0, 1, tzinfo=UTC), 101))
-
-    finalized = engine.finalize_trading_day()
-
-    assert {candle.timeframe_ticks for candle in finalized} == {3, 5}
-    assert all(candle.is_partial for candle in finalized)
-    assert all(candle.close_reason == CandleCloseReason.END_OF_DAY for candle in finalized)
-    assert engine.snapshot_update(()).current == ()

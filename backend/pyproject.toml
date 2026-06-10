@@ -11,7 +11,6 @@ requires-python = ">=3.13"
 dependencies = [
   "catboost>=1.2",
   "fastapi>=0.115",
-  "httpx2>=2.3",
   "orjson>=3.10",
   "pyarrow>=18.0",
   "pydantic>=2.10",
@@ -22,6 +21,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  # starlette 1.x's TestClient backend (cold CI resolves starlette>=1.x, whose
+  # testclient imports `httpx2 as httpx`); sole consumers are the TestClient tests,
+  # so it is a test dependency, not a runtime one. CI installs .[dev].
+  "httpx2>=2.3",
   "pytest>=8.3",
   "pytest-asyncio>=0.24",
   "ruff>=0.8",

@@ -1,9 +1,11 @@
 import inspect
 from datetime import UTC, datetime
+from pathlib import Path
 
 from strategy_core.runtime.state import StrategyRuntime
 from strategy_core.types import Trade as CoreTrade
 
+import trade_lab
 from trade_lab.domain.events import TradeEvent
 from trade_lab.services import runtime as runtime_module
 from trade_lab.services.runtime import ApplicationRuntime
@@ -76,3 +78,75 @@ def test_runtime_path_uses_strategy_core_service_not_legacy_strategy_engines() -
     assert "CandleEngine" not in service_source
     assert "SessionLevelEngine" not in service_source
     assert "SessionClassifier" not in service_source
+
+
+def test_deleted_shadow_engines_stay_deleted_across_backend_src() -> None:
+    """D2 guard: the dormant local strategy engines are DELETED, not just unwired.
+
+    ``domain/candles.py``'s CandleEngine and ``domain/levels.py``'s
+    SessionLevelEngine were drift-capable shadow implementations of Strategy-Core
+    semantics with no production consumer; D2 removed them. This guard fails if any
+    deleted engine name/module is reintroduced ANYWHERE under backend/src, and pins
+    the kept modules to their DTO/display surface.
+
+    Documented carve-outs (deliberate, named in PROGRESS):
+      * ``services/seed.py`` — the vectorized warm-up bar BUILDER stays (display-only
+        context; its Chicago-clock divergence from Strategy-Core's ET sessions is a
+        named debt). It may use ``SessionClassifier``/``make_bar_id`` but never the
+        deleted engines.
+      * ``services/inference/outcome_tracker.py`` — the tracker's local RTH-cutoff
+        wall-clock math (contract-parameterized) dies WITH the tracker at D1b.
+      * ``services/strategy_core_service.py`` — display-flag re-derivation
+        (``is_eligible``/``is_developing`` off Strategy-Core ``available_from``) on
+        the DTO seam.
+    """
+
+    src_root = Path(trade_lab.__file__).parent
+    banned = (
+        "CandleEngine",
+        "SessionLevelEngine",
+        "_MutableCandle",
+        "_SessionRange",
+        "CandleUpdate",
+        "LevelUpdate",
+    )
+    offenders = []
+    classifier_files = set()
+    for path in sorted(src_root.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        offenders.extend(f"{path.name}: {name}" for name in banned if name in text)
+        if "SessionClassifier" in text:
+            classifier_files.add(path.name)
+    assert offenders == [], f"deleted engine names reintroduced in src: {offenders}"
+    # Local wall-clock session math is allowed ONLY in its home module and the
+    # seed warm-up carve-out.
+    assert classifier_files <= {"sessions.py", "seed.py"}, (
+        f"SessionClassifier escaped its carve-outs: {sorted(classifier_files)}"
+    )
+
+    # The kept modules expose DTO/display types only — no bar-building or level
+    # engine survives on them.
+    from trade_lab.domain import candles as candles_module
+    from trade_lab.domain import levels as levels_module
+
+    for name in ("CandleEngine", "_MutableCandle", "CandleUpdate"):
+        assert not hasattr(candles_module, name)
+    for name in (
+        "SessionLevelEngine",
+        "_SessionRange",
+        "_DaySummary",
+        "LevelUpdate",
+        "SESSION_LEVELS",
+        "LEVEL_ORIGIN",
+    ):
+        assert not hasattr(levels_module, name)
+    candles_public = {n for n in dir(candles_module) if not n.startswith("_")}
+    assert candles_public <= {
+        "Candle", "CandleCloseReason", "make_bar_id",  # the surface
+        "StrEnum", "dataclass", "date", "datetime",  # stdlib imports
+    }
+    levels_public = {n for n in dir(levels_module) if not n.startswith("_")}
+    assert levels_public <= {
+        "DisplayLevel", "LevelDirection", "LevelKind", "TouchEvent", "SessionName",
+        "StrEnum", "dataclass", "date", "datetime",
+    }

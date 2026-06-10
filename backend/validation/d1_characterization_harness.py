@@ -89,7 +89,7 @@ def _read_trade_events(day: str) -> list[TradeEvent]:
             instrument_id=1,
             requested_symbol="NQ.c.0",
             raw_symbol=str(fm),
-            price_ticks=int(round(px[i] / TICK_SIZE)),
+            price_ticks=round(px[i] / TICK_SIZE),
             size=int(sz[i]),
             side=_SIDE.get(side[i], TradeSide.UNKNOWN),
             source_schema="mbp-10",
@@ -152,17 +152,19 @@ def main() -> None:
     # Harness end: flush the dark resolver past the last day's window so still-open
     # setups finalize exactly as the streaming cutoff rule dictates.
     _, _, last_end = _window(DAYS[-1])
-    resolver = runtime._honest_resolver  # noqa: SLF001 - gate-B harness owns the dark seat
+    resolver = runtime._honest_resolver  # gate-B harness owns the dark seat
     flushed = resolver.flush(last_end.to_pydatetime()) if resolver is not None else ()
     if flushed:
-        runtime._append_dark(flushed)  # noqa: SLF001
+        runtime._append_dark(flushed)
     old_still_open = (
         runtime._outcome_tracker.open_count if runtime._outcome_tracker is not None else 0
-    )  # noqa: SLF001
+    )
     dark = {item.key: item for item in runtime.dark_outcomes}
 
     lines.append("## Per-day\n")
-    lines.append("| day | trades | predictions | old outcomes (by type) | dark events | dark (by kind) |")
+    lines.append(
+        "| day | trades | predictions | old outcomes (by type) | dark events | dark (by kind) |"
+    )
     lines.append("|---|---|---|---|---|---|")
     for day, n_trades, day_preds, day_old, dark_delta, day_dark in per_day_rows:
         lines.append(f"| {day} | {n_trades} | {day_preds} | {dict(day_old) or '-'} "
@@ -176,8 +178,8 @@ def main() -> None:
     new_kinds = Counter(_dark_kind(i) for i in dark.values())
     lines.append("\n## Totals\n")
     lines.append(f"- predictions registered (both paths, one-for-one): **{total_preds}**")
-    lines.append(f"- OLD path resolutions: **{sum(old_types.values())}** by type {dict(old_types)}; "
-                 f"still open at harness end: {old_still_open}")
+    lines.append(f"- OLD path resolutions: **{sum(old_types.values())}** by type "
+                 f"{dict(old_types)}; still open at harness end: {old_still_open}")
     lines.append(f"- NEW path events: **{len(dark)}** by kind {dict(new_kinds)}; "
                  f"still open after flush: {resolver.open_count if resolver else 0}")
 

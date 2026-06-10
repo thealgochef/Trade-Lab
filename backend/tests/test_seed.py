@@ -5,12 +5,10 @@ from datetime import UTC, datetime
 import pandas as pd
 
 from trade_lab.adapters.databento_historical import DatabentoHistoricalSource
-from trade_lab.domain.candles import CandleEngine
 from trade_lab.domain.data_quality import DataQualityCode
-from trade_lab.domain.events import TradeEvent
 from trade_lab.services.live import LiveConfig, LiveMarketDataService, LiveState
 from trade_lab.services.runtime import ApplicationRuntime
-from trade_lab.services.seed import HistoricalSeedService, build_tick_bars_from_frame
+from trade_lab.services.seed import HistoricalSeedService
 
 # now() pinned to 2026-01-07 14:00 CT (NY session) -> current trading day 2026-01-07,
 # so seed bars must come only from completed sessions strictly before it.
@@ -92,26 +90,6 @@ def test_build_seed_bars_keeps_only_recent_completed_sessions() -> None:
     assert all(bar.trading_day.isoformat() < "2026-01-07" for bar in bars)
 
 
-def test_seed_bars_do_not_collide_with_live_engine_today_bar_ids() -> None:
-    seed_ids = {bar.bar_id for bar in _seed_service().build_seed_bars()}
-
-    live_engine = CandleEngine((2,))
-    update = live_engine.process_trade(
-        TradeEvent(
-            event_ts_utc=datetime(2026, 1, 7, 18, 0, tzinfo=UTC),
-            receive_ts_utc=None,
-            instrument_id=1,
-            requested_symbol="NQ.c.0",
-            raw_symbol="NQH6",
-            price_ticks=68_000,
-            size=1,
-        )
-    )
-    live_today_ids = {bar.bar_id for bar in (*update.completed, *update.current)}
-
-    assert seed_ids.isdisjoint(live_today_ids)
-
-
 def test_seed_is_skipped_when_disabled_or_source_unavailable() -> None:
     assert _seed_service(enabled=False).enabled is False
     assert _seed_service(enabled=False).build_seed_bars() == ()
@@ -152,46 +130,6 @@ def test_runtime_reset_clears_seed_bars() -> None:
     runtime.reset(requested_symbol="NQ.c.0")
 
     assert runtime.snapshot().recent_closed_bars == ()
-
-
-def test_vectorized_builder_matches_candle_engine() -> None:
-    # Multi-session trades incl. an 18:30 CT roll into the next trading day and a
-    # 16:30 CT closed-window trade both paths must drop. CST (UTC-6) in January.
-    rows = [
-        ("2026-01-12T00:30:00Z", 68_000, 1),  # 2026-01-11 18:30 CT -> trading day 01-12
-        ("2026-01-12T15:00:00Z", 68_001, 2),  # 09:00 CT NY
-        ("2026-01-12T15:00:01Z", 68_002, 1),
-        ("2026-01-12T15:00:02Z", 68_003, 3),
-        ("2026-01-12T22:30:00Z", 69_000, 9),  # 16:30 CT closed window -> dropped by both
-        ("2026-01-13T15:00:00Z", 68_010, 1),
-        ("2026-01-13T15:00:01Z", 68_011, 2),
-        ("2026-01-13T15:00:02Z", 68_012, 1),
-    ]
-    timeframes = (2, 3)
-
-    engine = CandleEngine(timeframes)
-    engine_bars: list = []
-    for iso, ticks, size in rows:
-        trade = TradeEvent(
-            event_ts_utc=datetime.fromisoformat(iso.replace("Z", "+00:00")),
-            receive_ts_utc=None,
-            instrument_id=1,
-            requested_symbol="NQ.c.0",
-            raw_symbol="NQH6",
-            price_ticks=ticks,
-            size=size,
-        )
-        engine_bars.extend(engine.process_trade(trade).completed)
-    engine_bars.extend(engine.finalize_trading_day())
-
-    frame = _frame_from_rows([(iso, ticks * 0.25, size) for iso, ticks, size in rows])
-    vector_bars = build_tick_bars_from_frame(frame, timeframes)
-
-    def key(bar):
-        return (bar.timeframe_ticks, bar.trading_day, bar.bar_index)
-
-    assert sorted(engine_bars, key=key) == sorted(vector_bars, key=key)
-    assert engine_bars  # sanity: the fixture actually produced bars
 
 
 def test_live_start_seeds_chart_and_broadcasts_history() -> None:

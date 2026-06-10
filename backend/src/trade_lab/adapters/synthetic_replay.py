@@ -55,7 +55,7 @@ def _nq_demo_events(requested_symbol: str) -> Iterator[MarketEvent]:
 
     # First 180 trades occur during Asia and intentionally create a stable high at
     # 68_020 ticks. London later revisits that exact level, producing an eligible
-    # touch and observation through SessionLevelEngine/ObservationEngine.
+    # touch (via the Strategy-Core runtime) and observation (ObservationEngine).
     for i in range(180):
         price = 68_000 + (i % 21)
         yield TradeEvent(
