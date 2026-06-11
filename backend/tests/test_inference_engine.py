@@ -245,6 +245,20 @@ def _active_registry(tmp_path: Path, model_id: str = "good-model") -> ModelRegis
     return registry
 
 
+def test_activation_carries_typed_section_and_real_validation_result(tmp_path: Path) -> None:
+    """E3: the ActiveModel carries the plugin-typed section + the REAL metadata
+    cross-check result (ledger c — no longer hardcoded True downstream)."""
+    from strategy_core.strategies.touch_reversal.section import TouchReversalSection
+
+    registry = _active_registry(tmp_path)
+    active = registry.active()
+    assert active is not None
+    assert isinstance(active.section, TouchReversalSection)
+    assert active.section.feature_windows.interaction_window_minutes == 5
+    assert active.validation_ok is True
+    assert active.validation_detail == "contract matches metadata feature set"
+
+
 def test_prediction_is_deterministic_and_well_formed(tmp_path: Path) -> None:
     registry = _active_registry(tmp_path)
     engine = InferenceEngine(registry)

@@ -80,13 +80,19 @@ class LevelContext:
     def from_contract(
         cls,
         contract: StrategyContract,
+        section,
         *,
         reference_price: Decimal,
         direction: LevelDirection,
     ) -> LevelContext:
-        """Build a context from a touch level and the active contract's bands."""
+        """Build a context from a touch level and the active bundle's bands.
 
-        windows = contract.feature_windows
+        E3: ``feature_windows`` is section-bound — the bands read the typed
+        ``section`` (duck-typed touch-section access; recorded coupling), while
+        ``tick_size`` stays an envelope read.
+        """
+
+        windows = section.feature_windows
         return cls(
             reference_price=reference_price,
             direction=direction,
@@ -337,6 +343,7 @@ def build_feature_vector(
     buffer: MarketContextBuffer,
     level_ctx: LevelContext,
     contract: StrategyContract,
+    section,
     *,
     registry: FeatureFunctionRegistry = DEFAULT_FEATURE_REGISTRY,
     touch_ts_utc: datetime | None = None,
@@ -345,16 +352,18 @@ def build_feature_vector(
     """Compute the contract's ordered feature vector and a name->value dict.
 
     Values follow ``feature_set.names`` order exactly (the model's positional
-    contract). Provide either an explicit ``window`` or a ``touch_ts_utc`` from
-    which the interaction/approach windows are derived using the contract's
-    ``feature_windows`` minutes. Missing approach data surfaces as ``np.nan``;
-    only the absorption / interaction-time features may legitimately return 0.0.
+    contract — an ENVELOPE read). Provide either an explicit ``window`` or a
+    ``touch_ts_utc`` from which the interaction/approach windows are derived
+    using the active bundle's section ``feature_windows`` minutes (E3:
+    section-bound; duck-typed touch-section access, recorded coupling). Missing
+    approach data surfaces as ``np.nan``; only the absorption /
+    interaction-time features may legitimately return 0.0.
     """
 
     if window is None:
         if touch_ts_utc is None:
             raise ValueError("build_feature_vector requires either window or touch_ts_utc")
-        windows = contract.feature_windows
+        windows = section.feature_windows
         window = FeatureWindow.from_touch(
             touch_ts_utc,
             interaction_window=timedelta(minutes=windows.interaction_window_minutes),

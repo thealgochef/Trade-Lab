@@ -163,3 +163,67 @@ def test_serving_strategy_id_guard_rejects_foreign_routing(tmp_path: Path) -> No
     registry = ModelRegistry(tmp_path, serving_strategy_id="some_other_plugin")
     with pytest.raises(ModelValidationError, match="does not match the"):
         registry.activate("bundle-x")
+
+
+# ── E3: the section hook (both entries) + the activation ledger fixes ───────
+
+
+def test_invalid_section_rejected_at_discovery_and_activation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A section subtree the plugin's SectionModel rejects (unknown key) is skipped
+    # with a warning at discovery and raises fail-closed at activation.
+    payload = _load_real_payload()
+    payload["section"]["bogus_key"] = 1  # type: ignore[index]
+    _write_bundle_dir(tmp_path, "bundle-x", payload)
+
+    with caplog.at_level(logging.WARNING):
+        assert discover_model_bundles(tmp_path) == []
+    assert any("invalid strategy section" in r.getMessage() for r in caplog.records)
+
+    with pytest.raises(ModelValidationError, match="invalid strategy section"):
+        ModelRegistry(tmp_path).activate("bundle-x")
+
+
+def test_partition_cross_check_mismatch_rejected_at_activation(tmp_path: Path) -> None:
+    # The envelope<->section feature-partition cross-check (the TL validation
+    # site): a section whose partition does not cover feature_set.names fails
+    # activation closed. (The section itself is SectionModel-valid — only the
+    # cross-check trips.)
+    payload = _load_real_payload()
+    payload["section"]["approach_features"] = ["app_large_trade_vol_pct"]  # type: ignore[index]
+    _write_bundle_dir(tmp_path, "bundle-x", payload)
+
+    with pytest.raises(ModelValidationError, match="exactly the union"):
+        ModelRegistry(tmp_path).activate("bundle-x")
+
+
+def test_metadata_mismatch_rejected_at_activation(tmp_path: Path) -> None:
+    # E3 ledger (a): the metadata cross-check is FAIL-CLOSED at activation — a
+    # bundle whose metadata selected_features disagree with the contract can no
+    # longer activate (discovery's flag is no longer ignorable).
+    payload = _load_real_payload()
+    bundle = _write_bundle_dir(tmp_path, "bundle-x", payload)
+    (bundle / "metadata.json").write_text(
+        json.dumps({"selected_features": ["int_time_beyond_level"]}), encoding="utf-8"
+    )
+
+    with pytest.raises(ModelValidationError, match="selected_features"):
+        ModelRegistry(tmp_path).activate("bundle-x")
+
+
+def test_missing_checksum_sidecar_warns_at_activation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # E3 ledger (b): an absent sidecar surfaces a warning instead of a silent
+    # skip. The stub binary then fails the CatBoost load — asserting AFTER the
+    # checksum step proves the warning fired on the real activation path.
+    payload = _load_real_payload()
+    _write_bundle_dir(tmp_path, "bundle-x", payload)  # no model.cbm.sha256 written
+
+    with (
+        caplog.at_level(logging.WARNING),
+        pytest.raises(ModelValidationError, match="loadable CatBoost"),
+    ):
+        ModelRegistry(tmp_path).activate("bundle-x")
+    assert any("no model.cbm.sha256 sidecar" in r.getMessage() for r in caplog.records)

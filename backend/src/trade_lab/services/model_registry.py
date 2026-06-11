@@ -30,6 +30,11 @@ import strategy_core.strategies.touch_reversal  # noqa: F401
 from strategy_core import PLATFORM_VERSION, ContractError, StrategyContract, load_strategy_contract
 from strategy_core.strategies.registry import get_strategy
 
+# E3 KNOWN COUPLING (recorded): the feature-partition cross-check helper lives on
+# the touch section. Generic TL code duck-typing touch-section attributes is
+# acceptable single-strategy behavior; the F-era cleanup moves this into the plugin.
+from strategy_core.strategies.touch_reversal.section import validate_feature_partition
+
 if TYPE_CHECKING:
     from catboost import CatBoostClassifier
 
@@ -137,7 +142,15 @@ def _describe_bundle(directory: Path, model_id: str) -> ModelBundle | None:
         return None
 
     try:
-        contract = load_strategy_contract(strategy_file, expected_platform_version=PLATFORM_VERSION)
+        # E3: the section hook types the bundle's section subtree against the
+        # registered plugin's SectionModel at DISCOVERY too — a bundle whose
+        # section the plugin rejects is skipped with a warning, same pattern as
+        # every other discovery-time contract failure.
+        contract = load_strategy_contract(
+            strategy_file,
+            expected_platform_version=PLATFORM_VERSION,
+            validate_section_via_registry=True,
+        )
     except ContractError as exc:
         logger.warning("ignored model bundle with invalid strategy contract: %s", exc)
         return None
@@ -234,11 +247,21 @@ class ModelNotFoundError(ModelRegistryError):
 
 @dataclass(frozen=True, slots=True)
 class ActiveModel:
-    """The currently loaded model + the contract it was validated against."""
+    """The currently loaded model + the contract it was validated against.
+
+    E3: also carries the TYPED, plugin-validated ``section`` instance (the
+    loader's ``section_model`` carrier, resolved at activation) and the REAL
+    metadata cross-check result (``validation_ok``/``validation_detail``) —
+    activation fails closed on a mismatch, so an active model's result is the
+    actual computed one, never a hardcoded True.
+    """
 
     model_id: str
     model: CatBoostClassifier
     contract: StrategyContract
+    section: Any
+    validation_ok: bool
+    validation_detail: str
 
 
 class ModelRegistry:
@@ -306,8 +329,30 @@ class ModelRegistry:
                 f"contract strategy_id {contract.strategy_id!r} does not match the "
                 f"running service's plugin {self._serving_strategy_id!r}"
             )
+        # E3: the typed section (populated by the loader's registry hook) + the
+        # envelope<->section feature-partition cross-check — the second of the
+        # two validation sites (QL emission is the first).
+        section = contract.section_model
+        try:
+            validate_feature_partition(contract.feature_set.names, section)
+        except ContractError as exc:
+            raise ModelValidationError(str(exc)) from exc
+        # E3 ledger (a): the metadata cross-check is FAIL-CLOSED at activation —
+        # discovery's flag is no longer ignorable here.
+        validation_ok, validation_detail = _validate_against_metadata(
+            directory / METADATA_FILE, contract
+        )
+        if not validation_ok:
+            raise ModelValidationError(validation_detail)
         model = self._load_and_validate_model(directory, contract)
-        active = ActiveModel(model_id=model_id, model=model, contract=contract)
+        active = ActiveModel(
+            model_id=model_id,
+            model=model,
+            contract=contract,
+            section=section,
+            validation_ok=validation_ok,
+            validation_detail=validation_detail,
+        )
         with self._lock:
             self._active = active
         return active
@@ -341,8 +386,13 @@ class ModelRegistry:
     @staticmethod
     def _load_contract(directory: Path) -> StrategyContract:
         try:
+            # E3: activation loads with the section hook on, so the typed section
+            # rides the contract (.section_model) and a SectionModel-rejected
+            # subtree fails closed here, before any model bytes are read.
             return load_strategy_contract(
-                directory / STRATEGY_FILE, expected_platform_version=PLATFORM_VERSION
+                directory / STRATEGY_FILE,
+                expected_platform_version=PLATFORM_VERSION,
+                validate_section_via_registry=True,
             )
         except ContractError as exc:
             raise ModelValidationError(f"invalid strategy contract: {exc}") from exc
@@ -360,6 +410,12 @@ class ModelRegistry:
     def _verify_checksum(directory: Path, model_file: Path) -> None:
         checksum_file = directory / CHECKSUM_FILE
         if not checksum_file.is_file():
+            # E3 ledger (b): an absent sidecar no longer skips SILENTLY — the gap
+            # is surfaced (path-free) so an unverified binary is a visible fact.
+            logger.warning(
+                "model bundle has no %s sidecar; binary integrity not verified",
+                CHECKSUM_FILE,
+            )
             return
         try:
             declared = checksum_file.read_text(encoding="utf-8").split()[0].strip().lower()

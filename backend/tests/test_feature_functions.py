@@ -14,6 +14,9 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+
+# Registration import: the v3 section hook resolves the plugin's SectionModel.
+import strategy_core.strategies.touch_reversal  # noqa: F401
 from strategy_core import load_strategy_contract
 
 from trade_lab.domain.events import TradeSide
@@ -41,6 +44,11 @@ LEVEL_TICKS = 68_000
 TOUCH = datetime(2026, 2, 20, 15, 0, tzinfo=UTC)
 
 FIXTURE_CONTRACT = Path(__file__).parent / "fixtures" / "strategy.json"
+
+
+def _load_fixture_contract():
+    """The v3 fixture loaded with the section hook (feature_windows is section-bound)."""
+    return load_strategy_contract(FIXTURE_CONTRACT, validate_section_via_registry=True)
 
 
 def _ts(seconds: float) -> datetime:
@@ -253,14 +261,17 @@ def _combined_buffer() -> MarketContextBuffer:
 
 
 def test_build_feature_vector_orders_by_contract_names() -> None:
-    contract = load_strategy_contract(FIXTURE_CONTRACT)
+    contract = _load_fixture_contract()
     buffer = _combined_buffer()
     ctx = LevelContext.from_contract(
-        contract, reference_price=LEVEL_PRICE, direction=LevelDirection.LONG
+        contract,
+        contract.section_model,
+        reference_price=LEVEL_PRICE,
+        direction=LevelDirection.LONG,
     )
 
     ordered, by_name = build_feature_vector(
-        buffer, ctx, contract, touch_ts_utc=TOUCH
+        buffer, ctx, contract, contract.section_model, touch_ts_utc=TOUCH
     )
 
     assert list(by_name) == list(contract.feature_set.names)
@@ -279,14 +290,17 @@ def test_build_feature_vector_orders_by_contract_names() -> None:
 
 
 def test_build_feature_vector_uses_nan_for_missing_approach() -> None:
-    contract = load_strategy_contract(FIXTURE_CONTRACT)
+    contract = _load_fixture_contract()
     buffer = _empty_buffer()  # no events at all
     ctx = LevelContext.from_contract(
-        contract, reference_price=LEVEL_PRICE, direction=LevelDirection.LONG
+        contract,
+        contract.section_model,
+        reference_price=LEVEL_PRICE,
+        direction=LevelDirection.LONG,
     )
 
     _ordered, by_name = build_feature_vector(
-        buffer, ctx, contract, touch_ts_utc=TOUCH
+        buffer, ctx, contract, contract.section_model, touch_ts_utc=TOUCH
     )
 
     # Interaction features fall to their 0.0 rule; approach features to NaN.
@@ -305,22 +319,23 @@ def test_build_feature_vector_uses_nan_for_missing_approach() -> None:
 
 
 def test_build_feature_vector_is_deterministic() -> None:
-    contract = load_strategy_contract(FIXTURE_CONTRACT)
+    contract = _load_fixture_contract()
+    section = contract.section_model
     buffer = _combined_buffer()
     ctx = LevelContext.from_contract(
-        contract, reference_price=LEVEL_PRICE, direction=LevelDirection.LONG
+        contract, section, reference_price=LEVEL_PRICE, direction=LevelDirection.LONG
     )
 
-    first, _ = build_feature_vector(buffer, ctx, contract, touch_ts_utc=TOUCH)
-    second, _ = build_feature_vector(buffer, ctx, contract, touch_ts_utc=TOUCH)
+    first, _ = build_feature_vector(buffer, ctx, contract, section, touch_ts_utc=TOUCH)
+    second, _ = build_feature_vector(buffer, ctx, contract, section, touch_ts_utc=TOUCH)
     assert first == second
 
 
 def test_build_feature_vector_requires_window_or_touch() -> None:
-    contract = load_strategy_contract(FIXTURE_CONTRACT)
+    contract = _load_fixture_contract()
     ctx = _long_ctx()
     with pytest.raises(ValueError, match="window or touch_ts_utc"):
-        build_feature_vector(_empty_buffer(), ctx, contract)
+        build_feature_vector(_empty_buffer(), ctx, contract, contract.section_model)
 
 
 def test_registry_exposes_six_contract_features_in_order() -> None:
@@ -341,9 +356,9 @@ def test_registry_rejects_unknown_feature() -> None:
 
 def test_feature_values_are_native_floats_not_numpy() -> None:
     # build_feature_vector should yield plain floats so DTO serialization is clean.
-    contract = load_strategy_contract(FIXTURE_CONTRACT)
+    contract = _load_fixture_contract()
     ordered, _ = build_feature_vector(
-        _empty_buffer(), _long_ctx(), contract, touch_ts_utc=TOUCH
+        _empty_buffer(), _long_ctx(), contract, contract.section_model, touch_ts_utc=TOUCH
     )
     assert all(isinstance(value, float) and not isinstance(value, np.floating)
                for value in ordered)

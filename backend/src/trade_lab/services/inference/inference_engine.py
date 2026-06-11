@@ -74,11 +74,13 @@ def _level_side(level_kind: str) -> str:
     raise ValueError(f"cannot derive a level side from level_kind {level_kind!r}")
 
 
-def _direction_from_contract(contract: StrategyContract, level_kind: str) -> LevelDirection:
+def _direction_from_section(section, level_kind: str) -> LevelDirection:
+    """E3: ``touch_rule`` is section-bound — the direction map reads the ACTIVE
+    bundle's typed section (duck-typed touch-section access; recorded coupling)."""
     side = _level_side(level_kind)
-    mapped = contract.touch_rule.direction_from_side.get(side)
+    mapped = section.touch_rule.direction_from_side.get(side)
     if mapped is None:
-        raise ValueError(f"contract has no direction mapping for level side {side!r}")
+        raise ValueError(f"contract section has no direction mapping for level side {side!r}")
     return LevelDirection(mapped.lower())
 
 
@@ -156,24 +158,29 @@ class InferenceEngine:
         buffer: MarketContextBuffer,
     ) -> Prediction:
         contract = active.contract
+        # E3: the plugin-consumed groups (touch_rule, feature_windows) live on the
+        # ACTIVE bundle's typed section; the envelope keeps tick_size/feature_set/
+        # inference, consumed exactly where they were consumed before.
+        section = active.section
         reference_price = Decimal(observation.level_price_ticks) * Decimal(str(contract.tick_size))
         # audit #NN-1: consume the authoritative direction carried from the Strategy-Core
         # touch (observation.direction) rather than re-deriving it from level_kind
         # (= zone.names[0]), which inverts for mixed-side merged zones. The domain and
         # inference LevelDirection share the long/short value convention, so a by-value
-        # rebuild lines the types up. Fall back to the contract-derived direction only for
+        # rebuild lines the types up. Fall back to the section-derived direction only for
         # legacy observations that carry no direction.
         if observation.direction is not None:
             direction = LevelDirection(observation.direction.value)
         else:
-            direction = _direction_from_contract(contract, observation.level_kind.value)
+            direction = _direction_from_section(section, observation.level_kind.value)
         level_ctx = LevelContext.from_contract(
-            contract, reference_price=reference_price, direction=direction
+            contract, section, reference_price=reference_price, direction=direction
         )
         ordered, by_name = build_feature_vector(
             buffer,
             level_ctx,
             contract,
+            section,
             registry=self._feature_registry,
             touch_ts_utc=observation.start_ts_utc,
         )

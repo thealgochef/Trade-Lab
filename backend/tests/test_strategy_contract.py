@@ -49,7 +49,9 @@ def _write_bundle(
 
 
 def test_load_real_strategy_contract_parses_all_sections() -> None:
-    contract = load_strategy_contract(_FIXTURE_STRATEGY)
+    # v3: the section hook types the strategy-owned subtree (touch_rule /
+    # feature_windows now live there); envelope reads are unchanged.
+    contract = load_strategy_contract(_FIXTURE_STRATEGY, validate_section_via_registry=True)
 
     assert isinstance(contract, StrategyContract)
     assert contract.contract_version == CONTRACT_VERSION
@@ -71,18 +73,20 @@ def test_load_real_strategy_contract_parses_all_sections() -> None:
         "aggressive_blowthrough",
     )
     assert len(contract.class_map) == 3
-    assert contract.touch_rule.bar_type == "147t"
-    assert contract.feature_windows.interaction_window_minutes == 5
-    assert contract.feature_windows.approach_window_minutes == 30
+    section = contract.section_model
+    assert section.touch_rule.bar_type == "147t"
+    assert section.feature_windows.interaction_window_minutes == 5
+    assert section.feature_windows.approach_window_minutes == 30
     assert contract.label_policy.resolution == "mae_first"
+    assert contract.label_policy.barrier_mode == "fixed_points"
     assert contract.inference.confidence_gate == 0.7
     assert contract.data_requirements.depth_usage == "top_of_book_only"
 
 
 def test_load_rejects_unsupported_contract_version(tmp_path: Path) -> None:
-    # E1: v1 is now the UNSUPPORTED version (the shape break migrated v1 -> v2).
+    # E3: v2 is now the UNSUPPORTED version (the shape break #2 migrated v2 -> v3).
     payload = _load_real_payload()
-    payload["contract_version"] = "trade_lab_contract_v1"
+    payload["contract_version"] = "trade_lab_contract_v2"
     target = tmp_path / "strategy.json"
     _write_strategy(target, payload)
 
@@ -100,15 +104,16 @@ def test_load_rejects_missing_required_section(tmp_path: Path) -> None:
         load_strategy_contract(target)
 
 
-def test_load_rejects_feature_set_partition_mismatch(tmp_path: Path) -> None:
+def test_load_rejects_section_failing_the_plugin_model(tmp_path: Path) -> None:
+    # v3: the partition moved into the section; a section subtree the plugin's
+    # SectionModel rejects (unknown key) dies at the hook.
     payload = _load_real_payload()
-    # Drop one name from the interaction split so names != interaction + approach.
-    payload["feature_set"]["interaction_features"] = ["int_time_beyond_level"]  # type: ignore[index]
+    payload["section"]["bogus_key"] = 1  # type: ignore[index]
     target = tmp_path / "strategy.json"
     _write_strategy(target, payload)
 
-    with pytest.raises(ContractError, match="invalid strategy contract"):
-        load_strategy_contract(target)
+    with pytest.raises(ContractError, match="invalid strategy section"):
+        load_strategy_contract(target, validate_section_via_registry=True)
 
 
 def test_load_rejects_non_contiguous_class_map(tmp_path: Path) -> None:

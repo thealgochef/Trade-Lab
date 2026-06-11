@@ -391,8 +391,10 @@ class ApplicationRuntime:
             instrument=contract.instrument,
             feature_names=tuple(contract.feature_set.names),
             class_map=MappingProxyType(dict(contract.class_map.mapping)),
-            validation_ok=True,
-            validation_detail="active model validated against its contract",
+            # E3 ledger (c): the REAL activation-time metadata cross-check result
+            # carried on the active bundle — no longer hardcoded True.
+            validation_ok=active.validation_ok,
+            validation_detail=active.validation_detail,
         )
 
     def session_state(self) -> tuple[str | None, date | None]:
