@@ -5,7 +5,9 @@ name: backend-ci
 # or an undeclared test dependency. Runs on pushes to main and on PRs.
 on:
   push:
-    branches: [main]
+    # platform-refactor included so the cold-install pin check runs on this
+    # branch's pushes (the E-window pin bump lands here before merge day).
+    branches: [main, platform-refactor]
   pull_request:
     branches: [main]
 
