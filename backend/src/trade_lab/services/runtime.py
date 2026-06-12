@@ -28,6 +28,10 @@ from trade_lab.domain.events import (
 from trade_lab.domain.feed import FeedConnectionState, FeedStatus
 from trade_lab.domain.levels import DisplayLevel, TouchEvent
 from trade_lab.domain.market_context import DEFAULT_RETENTION_MINUTES, MarketContextBuffer
+
+#: W1 P3b: slack added on top of approach + interaction when deriving the
+#: contract-driven market-context retention at activation.
+MARKET_CONTEXT_RETENTION_SLACK_MINUTES = 10
 from trade_lab.domain.observations import Observation, ObservationEngine, ObservationStatus
 from trade_lab.domain.outcomes import DroppedPrediction, Outcome
 from trade_lab.services.inference.inference_engine import InferenceEngine, Prediction
@@ -178,6 +182,9 @@ class ApplicationRuntime:
         self._honest_resolver: StreamingHonestResolver | None = self._build_honest_resolver(
             inference_engine
         )
+        # W1 P3b: a constructor-supplied engine gets the same contract-driven
+        # retention a hot-swap would apply.
+        self._apply_market_context_retention(inference_engine)
         self._warnings: list[DataQualityWarning] = []
         self._recent_closed_bars: list[Candle] = []
         # Historical warm-up bars kept separate from the rolling live buffer so live
@@ -260,6 +267,31 @@ class ApplicationRuntime:
         self._dropped.clear()
         self._open_predictions.clear()
         self._honest_resolver = self._build_honest_resolver(engine)
+        self._apply_market_context_retention(engine)
+
+    def _apply_market_context_retention(self, engine: InferenceEngine | None) -> None:
+        """W1 P3b: buffer retention follows the ACTIVE contract's feature windows.
+
+        Effective retention = approach + interaction + slack minutes (inference
+        fires ~interaction after the touch while approach features reach back to
+        touch - approach, so both windows stack; the slack absorbs scheduling
+        jitter). Note this is deliberately >= the W1 spec's
+        ``max(approach, interaction) + slack``, which under-retains whenever the
+        interaction window exceeds the slack. No active section -> the configured
+        baseline. The activation gate refuses contracts whose requirement exceeds
+        the configured ceiling before this ever applies.
+        """
+
+        minutes = self._market_context_retention_minutes
+        active = engine.active() if engine is not None else None
+        if active is not None:
+            windows = active.section.feature_windows
+            minutes = (
+                windows.approach_window_minutes
+                + windows.interaction_window_minutes
+                + MARKET_CONTEXT_RETENTION_SLACK_MINUTES
+            )
+        self.market_context.set_retention(timedelta(minutes=minutes))
 
     def _build_honest_resolver(
         self, engine: InferenceEngine | None

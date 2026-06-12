@@ -13,14 +13,19 @@ from datetime import UTC, datetime, timedelta
 
 from trade_lab.domain.events import TradeSide
 
-# Inference fires when an observation COMPLETES, i.e. ~interaction_window (5m) after
-# the touch, yet approach features still need data back to touch - approach_window
-# (30m). So at completion time the buffer must still hold the start of the approach
-# window: retention >= approach_window + interaction_window + margin (30 + 5 + 10).
+# Inference fires when an observation COMPLETES, i.e. ~interaction_window after
+# the touch, yet approach features still need data back to touch - approach_window.
+# So at completion time the buffer must still hold the start of the approach
+# window: retention >= approach_window + interaction_window + margin. W1 P3b: the
+# EFFECTIVE retention is contract-driven at activation (see ApplicationRuntime);
+# this default is the no-model baseline.
 DEFAULT_RETENTION_MINUTES = 45
-# Hard ceiling on element count so a quote storm cannot grow the buffer unbounded
-# regardless of retention time. Bounds memory near the documented 100k-events floor.
-DEFAULT_MAX_ELEMENTS = 200_000
+# W1 P3b: SAFETY CEILING only — never the operative bound under a sane retention.
+# Time-based eviction governs; this cap exists so a malformed stream cannot grow
+# memory without limit. Measured: a 120-minute approach window over deduped L1 +
+# trades is ~3.4M elements, so 6M covers the largest admissible contract window
+# with headroom (the old 200k cap evicted the feature windows during NY RTH).
+DEFAULT_MAX_ELEMENTS = 6_000_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +124,18 @@ class MarketContextBuffer:
             return None
         quote = self._quotes[-1]
         return (quote.bid_price_ticks + quote.ask_price_ticks) / 2
+
+    def set_retention(self, retention: timedelta) -> None:
+        """Re-bound the time window (W1 P3b: contract-driven at model activation).
+
+        Shrinking re-evicts immediately so the buffer never serves a window wider
+        than the active contract is entitled to.
+        """
+
+        if retention.total_seconds() <= 0:
+            raise ValueError("retention must be positive")
+        self.retention = retention
+        self._evict()
 
     def reset(self) -> None:
         """Drop all retained context. Called when the runtime resets for a new replay."""
