@@ -455,6 +455,8 @@ def create_app(
                     source_label=definition.label,
                     speed=payload.speed,
                     max_events=payload.max_events,
+                    trading_day=definition.trading_day,
+                    symbol_dir=definition.symbol_dir,
                 ),
             )
         except RuntimeError as exc:

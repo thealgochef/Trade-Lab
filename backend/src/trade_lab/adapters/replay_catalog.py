@@ -12,6 +12,7 @@ import re
 import stat
 from collections import deque
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -372,6 +373,17 @@ def _definition_for_file(
     symbol = _safe_part(_symbol_from_path(relative_path, instrument_root))
     source_id = f"historical:{symbol.lower()}:{date_label}:{schema}"
     label = f"Historical {symbol} {date_label} {schema}"
+    # W1 P3a: date-DIRECTORY sources replay the CANONICAL trading day (two-file
+    # composition via the SC source; single-file with a logged warning when the
+    # prior date is absent). Day-mode engages only for the per-date layout
+    # <symbol_dir>/<YYYY-MM-DD>/<file>; flat date-NAMED files keep the explicit
+    # single-file scan.
+    try:
+        trading_day = date.fromisoformat(date_label)
+    except ValueError:
+        trading_day = None
+    if trading_day is not None and path.parent.name != date_label:
+        trading_day = None
     definition = ReplaySourceDefinition(
         source_id=source_id,
         label=label,
@@ -381,6 +393,8 @@ def _definition_for_file(
         session_label=date_label,
         availability="metadata_only",
         paths=(path,),
+        trading_day=trading_day,
+        symbol_dir=path.parent.parent if trading_day is not None else None,
     )
     # Use the opaque source id as the adapter source label so warnings/status never
     # include full local paths. Historical-only depth fields are ignored by adapter.

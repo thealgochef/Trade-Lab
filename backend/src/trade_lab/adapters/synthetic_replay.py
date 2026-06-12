@@ -8,7 +8,7 @@ as future live feeds, which keeps chart/replay semantics identical.
 
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from trade_lab.domain.events import MarketEvent, MarketStatus, MarketStatusEvent, TradeEvent
@@ -24,6 +24,11 @@ class ReplaySourceDefinition:
     session_label: str | None = None
     availability: str | None = None
     paths: tuple[Path, ...] = ()
+    #: W1 P3a: date-discovered sources replay the CANONICAL trading day
+    #: [prev 18:00 ET, day 18:00 ET) composed from two per-date files under
+    #: ``symbol_dir``; None keeps the explicit single-file scan.
+    trading_day: date | None = None
+    symbol_dir: Path | None = None
 
 
 class SyntheticNqDemoSource:

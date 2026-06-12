@@ -5,7 +5,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import cast
@@ -41,12 +41,19 @@ class _StrategyCoreHistoricalSourceAdapter:
         self._config = config
 
     def events(self):
+        # W1 P3a: day-mode kwargs are passed only when set so non-parquet sources
+        # (e.g. the synthetic demo) keep the narrow HistoricalMarketDataSource shape.
+        day_kwargs = {}
+        if self._config.trading_day is not None:
+            day_kwargs["trading_day"] = self._config.trading_day
+            day_kwargs["symbol_dir"] = self._config.symbol_dir
         yield from self._source.scan(
             self._config.paths,
             requested_symbol=self._config.requested_symbol,
             schema=self._config.schema,
             start_ts_utc=self._config.start_ts_utc,
             end_ts_utc=self._config.end_ts_utc,
+            **day_kwargs,
         )
 
 
@@ -73,6 +80,9 @@ class ReplayConfig:
     max_events: int | None = None
     start_ts_utc: datetime | None = None
     end_ts_utc: datetime | None = None
+    #: W1 P3a: canonical trading-day replay window (two-file composition).
+    trading_day: date | None = None
+    symbol_dir: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
