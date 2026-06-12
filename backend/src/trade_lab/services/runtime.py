@@ -28,10 +28,6 @@ from trade_lab.domain.events import (
 from trade_lab.domain.feed import FeedConnectionState, FeedStatus
 from trade_lab.domain.levels import DisplayLevel, TouchEvent
 from trade_lab.domain.market_context import DEFAULT_RETENTION_MINUTES, MarketContextBuffer
-
-#: W1 P3b: slack added on top of approach + interaction when deriving the
-#: contract-driven market-context retention at activation.
-MARKET_CONTEXT_RETENTION_SLACK_MINUTES = 10
 from trade_lab.domain.observations import Observation, ObservationEngine, ObservationStatus
 from trade_lab.domain.outcomes import DroppedPrediction, Outcome
 from trade_lab.services.inference.inference_engine import InferenceEngine, Prediction
@@ -43,6 +39,10 @@ from trade_lab.services.inference.resolution_adapter import (
 from trade_lab.services.strategy_core_service import StrategyCoreService
 
 logger = logging.getLogger(__name__)
+
+#: W1 P3b: slack added on top of approach + interaction when deriving the
+#: contract-driven market-context retention at activation.
+MARKET_CONTEXT_RETENTION_SLACK_MINUTES = 10
 
 
 @dataclass(frozen=True, slots=True)
