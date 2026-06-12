@@ -66,3 +66,7 @@ temp/
 *.swo
 .DS_Store
 Thumbs.db
+
+# Window recon/diff scratch artifacts at the repo root (review deliverables, never committed)
+/VIZ_RECON.md
+/*_DIFF.txt
