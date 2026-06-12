@@ -77,6 +77,12 @@ class WebSocketBroadcaster:
 
     def messages_for_update(self, update: RuntimeUpdate) -> tuple[bytes, ...]:
         messages: list[bytes] = []
+        # W2 P2c: the typed reset frame goes FIRST so clients clear stale panes
+        # before this update's fresh deltas arrive.
+        if update.model_reset_reason is not None:
+            messages.append(
+                self.envelope_bytes("model.reset", {"reason": update.model_reset_reason})
+            )
         if update.feed_status is not None:
             messages.append(
                 self.envelope_bytes("feed.status", feed_status_to_dto(update.feed_status))

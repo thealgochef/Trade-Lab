@@ -30,12 +30,14 @@ from trade_lab.domain.levels import DisplayLevel, TouchEvent
 from trade_lab.domain.market_context import DEFAULT_RETENTION_MINUTES, MarketContextBuffer
 from trade_lab.domain.observations import Observation, ObservationEngine, ObservationStatus
 from trade_lab.domain.outcomes import DroppedPrediction, Outcome
+from trade_lab.services.inference.features import FeatureComputationError
 from trade_lab.services.inference.inference_engine import InferenceEngine, Prediction
 from trade_lab.services.inference.resolution_adapter import (
     drop_to_dropped,
     parse_bar_type,
     resolution_to_outcome,
 )
+from trade_lab.services.journal import PredictionJournal
 from trade_lab.services.strategy_core_service import StrategyCoreService
 
 logger = logging.getLogger(__name__)
@@ -57,6 +59,10 @@ class RuntimeUpdate:
     predictions: tuple[Prediction, ...] = ()
     outcomes: tuple[Outcome, ...] = ()
     dropped: tuple[DroppedPrediction, ...] = ()
+    #: W2 P2c: when set, the broadcaster emits a typed ``model.reset`` frame with
+    #: this reason ("activation" | "replay_reset" | "live_reset") — replacing the
+    #: frontend's 'runtime reset' feed-message substring trigger.
+    model_reset_reason: str | None = None
 
     def has_deltas(self) -> bool:
         return any(
@@ -71,8 +77,18 @@ class RuntimeUpdate:
                 self.predictions,
                 self.outcomes,
                 self.dropped,
+                self.model_reset_reason is not None,
             )
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedRebind:
+    """W2 P2b: a fully-constructed engine rebind awaiting its atomic commit."""
+
+    engine: InferenceEngine | None
+    resolver: StreamingHonestResolver | None
+    market_context_retention: timedelta
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +146,7 @@ class ApplicationRuntime:
         prediction_limit: int = 500,
         outcome_limit: int = 500,
         inference_engine: InferenceEngine | None = None,
+        journal: PredictionJournal | None = None,
     ) -> None:
         if warning_limit <= 0:
             raise ValueError("warning_limit must be positive")
@@ -179,12 +196,21 @@ class ApplicationRuntime:
         self._observation_duration_seconds = observation_duration_seconds
         # D1b: the SC streaming honest resolver IS the serving outcome path (the D1a
         # dark seat promoted; the legacy level-anchored OutcomeTracker is retired).
-        self._honest_resolver: StreamingHonestResolver | None = self._build_honest_resolver(
-            inference_engine
-        )
         # W1 P3b: a constructor-supplied engine gets the same contract-driven
         # retention a hot-swap would apply.
-        self._apply_market_context_retention(inference_engine)
+        ctor_active = inference_engine.active() if inference_engine is not None else None
+        self._honest_resolver: StreamingHonestResolver | None = self._build_honest_resolver(
+            None if ctor_active is None else ctor_active.contract
+        )
+        self.market_context.set_retention(self._market_context_retention_for(ctor_active))
+        # W2 P2e (D-P-07): append-only prediction/outcome/drop journaling so
+        # serving evidence survives restarts. Write-only this window.
+        self._journal = journal
+        # W2 P2d: named-feature inference failure diagnostics, surfaced on the
+        # status endpoint. Deliberately NOT cleared by reset() — they are
+        # process-lifetime serving health, not per-session market state.
+        self._inference_error_count = 0
+        self._last_inference_error: dict[str, str | None] | None = None
         self._warnings: list[DataQualityWarning] = []
         self._recent_closed_bars: list[Candle] = []
         # Historical warm-up bars kept separate from the rolling live buffer so live
@@ -205,6 +231,7 @@ class ApplicationRuntime:
         requested_symbol: str | None = None,
         preserve_warnings: bool = False,
         feed_message: str = "Runtime reset for replay.",
+        reset_reason: str | None = None,
     ) -> RuntimeUpdate:
         """Reset all derived runtime state before a new replay session.
 
@@ -243,7 +270,7 @@ class ApplicationRuntime:
             requested_symbol=self.requested_symbol,
             last_message=feed_message,
         )
-        return RuntimeUpdate(feed_status=self._feed_status)
+        return RuntimeUpdate(feed_status=self._feed_status, model_reset_reason=reset_reason)
 
     @property
     def feed_status(self) -> FeedStatus:
@@ -259,17 +286,86 @@ class ApplicationRuntime:
         Called on model hot-swap: an activation switches the engine's active model,
         so prior predictions belong to a different contract and must be dropped to
         avoid mixing bundles in one session. Market-data state is untouched.
+
+        W2 P2b: composed from :meth:`prepare_inference_rebind` (everything that can
+        raise) + :meth:`commit_inference_rebind` (the assignment, cannot raise) so
+        the activation endpoint can validate fully BEFORE the registry swap and
+        commit both together with no awaits between them.
         """
 
-        self._inference_engine = engine
+        active = engine.active() if engine is not None else None
+        self.commit_inference_rebind(self.prepare_inference_rebind(engine, active))
+
+    def prepare_inference_rebind(
+        self, engine: InferenceEngine | None, active: "Any"
+    ) -> "_PreparedRebind":
+        """Build everything an engine rebind needs, WITHOUT mutating the runtime.
+
+        ``active`` is the CANDIDATE ActiveModel (may differ from the registry's
+        current one during an atomic activation). Resolver construction fails loud
+        here — before any swap — so a bad activation leaves the serving state
+        untouched (F12).
+        """
+
+        resolver = (
+            None if active is None else self._build_honest_resolver(active.contract)
+        )
+        return _PreparedRebind(
+            engine=engine,
+            resolver=resolver,
+            market_context_retention=self._market_context_retention_for(active),
+        )
+
+    def commit_inference_rebind(self, prepared: "_PreparedRebind") -> None:
+        """Apply a prepared rebind: pure assignment, no I/O, nothing can raise.
+
+        Called together with the registry swap (no awaits between) so concurrent
+        readers on the event loop always see a consistent (registry, resolver,
+        retention) triple.
+        """
+
+        self._inference_engine = prepared.engine
         self._predictions.clear()
         self._outcomes.clear()
         self._dropped.clear()
         self._open_predictions.clear()
-        self._honest_resolver = self._build_honest_resolver(engine)
-        self._apply_market_context_retention(engine)
+        self._honest_resolver = prepared.resolver
+        self.market_context.set_retention(prepared.market_context_retention)
 
-    def _apply_market_context_retention(self, engine: InferenceEngine | None) -> None:
+    def flush_resolver(self, now_ts_utc=None) -> RuntimeUpdate:
+        """W2 P2a (F10): finalize open setups whose cutoff is at/before ``now``.
+
+        Wired at replay stream end (last event instant), live stop (wall clock),
+        and hot-swap (the OLD resolver, before the new one is built). Flushed
+        drops flow through the existing drop -> DroppedPrediction adapter onto
+        the same WS/status surfaces as in-stream drops, and are journaled.
+        """
+
+        resolver = self._honest_resolver
+        if resolver is None:
+            return RuntimeUpdate()
+        if now_ts_utc is None:
+            now_ts_utc = self._feed_status.last_event_ts_utc
+        if now_ts_utc is None:
+            return RuntimeUpdate()
+        try:
+            emitted = resolver.flush(now_ts_utc)
+        except Exception:
+            logger.warning("honest-resolver flush failed", exc_info=True)
+            return RuntimeUpdate()
+        dropped: list[DroppedPrediction] = []
+        for drop in emitted:
+            prediction = self._open_predictions.pop(drop.key, None)
+            if prediction is None:
+                logger.warning("honest-resolver flush emission has no open prediction")
+                continue
+            served = drop_to_dropped(drop, prediction)
+            self._append_dropped(served)
+            dropped.append(served)
+        self._journal_records((), (), tuple(dropped))
+        return RuntimeUpdate(dropped=tuple(dropped))
+
+    def _market_context_retention_for(self, active: "Any") -> timedelta:
         """W1 P3b: buffer retention follows the ACTIVE contract's feature windows.
 
         Effective retention = approach + interaction + slack minutes (inference
@@ -283,34 +379,29 @@ class ApplicationRuntime:
         """
 
         minutes = self._market_context_retention_minutes
-        active = engine.active() if engine is not None else None
-        if active is not None:
-            windows = active.section.feature_windows
+        section = getattr(active, "section", None) if active is not None else None
+        if section is not None:
+            windows = section.feature_windows
             minutes = (
                 windows.approach_window_minutes
                 + windows.interaction_window_minutes
                 + MARKET_CONTEXT_RETENTION_SLACK_MINUTES
             )
-        self.market_context.set_retention(timedelta(minutes=minutes))
+        return timedelta(minutes=minutes)
 
-    def _build_honest_resolver(
-        self, engine: InferenceEngine | None
-    ) -> StreamingHonestResolver | None:
+    def _build_honest_resolver(self, contract) -> StreamingHonestResolver | None:
         """Construct the contract-specific SC streaming honest resolver.
 
-        The serving outcome path (D1b): built from the active model's contract so a
+        The serving outcome path (D1b): built from the activating contract so a
         hot-swap re-derives forward bar type + thresholds. Entry prints come from
         the Strategy-Core runtime's trade ring via a late-binding closure so the
         seam survives ``reset()`` swapping the service. Construction FAILS LOUD
         when the contract's forward bar type is not among the runtime's configured
         tick timeframes — the recon's silent-never-resolve hole — so a bad
         activation is rejected instead of silently tracking nothing. Returns
-        ``None`` when no engine/model is active.
+        ``None`` when no contract is supplied.
         """
 
-        if engine is None:
-            return None
-        contract = engine.active_contract
         if contract is None:
             return None
         policy = contract.label_policy
@@ -466,9 +557,21 @@ class ApplicationRuntime:
                 continue
             try:
                 prediction = engine.predict_for_observation(observation, self.market_context)
+            except FeatureComputationError as exc:
+                # Inference must never break the market-data hot path; W2 P2d: the
+                # failing FEATURE is named, counted, and surfaced on status.
+                self._record_inference_error(exc.feature_name, observation)
+                logger.warning(
+                    "inference failed computing feature %r for a completed observation",
+                    exc.feature_name,
+                    exc_info=True,
+                )
+                continue
             except Exception:
-                # Inference must never break the market-data hot path.
-                logger.warning("inference failed for a completed observation", exc_info=False)
+                self._record_inference_error(None, observation)
+                logger.warning(
+                    "inference failed for a completed observation", exc_info=True
+                )
                 continue
             if prediction is not None:
                 produced.append(prediction)
@@ -536,6 +639,48 @@ class ApplicationRuntime:
             if len(self._outcomes) > self._outcome_limit:
                 del self._outcomes[: len(self._outcomes) - self._outcome_limit]
         return tuple(resolved), tuple(dropped)
+
+    def _record_inference_error(self, feature_name: str | None, observation) -> None:
+        self._inference_error_count += 1
+        ts = getattr(observation, "scheduled_end_ts_utc", None)
+        self._last_inference_error = {
+            "feature_name": feature_name,
+            "ts_utc": None if ts is None else ts.isoformat(),
+        }
+
+    def inference_health(self) -> dict[str, Any]:
+        """W2 P2d: inference failure diagnostics for the status endpoint."""
+
+        return {
+            "error_count": self._inference_error_count,
+            "last_error": self._last_inference_error,
+        }
+
+    def _journal_records(
+        self,
+        predictions: tuple[Prediction, ...],
+        outcomes: tuple[Outcome, ...],
+        dropped: tuple[DroppedPrediction, ...],
+    ) -> None:
+        """W2 P2e (D-P-07): append the served records to the prediction journal.
+
+        Tagged with the runtime mode (replay|live via feed status) and the active
+        bundle id. Journal failures are logged and never break the hot path.
+        """
+
+        journal = self._journal
+        if journal is None or not (predictions or outcomes or dropped):
+            return
+        mode = self._feed_status.mode
+        engine = self._inference_engine
+        active = engine.active() if engine is not None else None
+        bundle_id = None if active is None else active.model_id
+        for prediction in predictions:
+            journal.record_prediction(prediction, mode=mode)
+        for outcome in outcomes:
+            journal.record_outcome(outcome, mode=mode, bundle_id=bundle_id)
+        for drop in dropped:
+            journal.record_drop(drop, mode=mode, bundle_id=bundle_id)
 
     def record_warning(self, warning: DataQualityWarning) -> RuntimeUpdate:
         warning = _safe_warning(warning)
@@ -709,6 +854,9 @@ class ApplicationRuntime:
         for touch in core_update.touches:
             changed_observations.append(self.observations.start_from_touch(touch))
         self._feed_status = self._feed_status_for_mode(core_update.feed_status, trade=trade)
+        self._journal_records(
+            predictions, outcomes, (*registration_drops, *terminal_drops)
+        )
         return RuntimeUpdate(
             feed_status=self._feed_status,
             current_bars=core_update.current_bars,

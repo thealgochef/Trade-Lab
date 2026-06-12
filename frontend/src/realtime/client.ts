@@ -148,6 +148,20 @@ export class RealtimeClient {
         setModelStatus(normalizeModelStatus(envelope.payload as ModelStatusDTO));
         addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'system', severity: 'info', message: 'Model status updated', sequence: envelope.sequence });
         break;
+      case 'model.reset': {
+        // W2 P2c: typed reset frame replaces the 'runtime reset' feed-message
+        // substring trigger. Activation swaps the model only, so prediction and
+        // outcome panes clear; a runtime reset (replay/live) also clears the
+        // chart and intelligence panes the old substring trigger cleared.
+        const reason = (envelope.payload as { reason?: string }).reason ?? 'unknown';
+        if (reason !== 'activation') {
+          marketStore.setState({ currentBars: [], recentClosedBars: [] });
+          intelligenceStore.setState({ levels: [], touches: [], observations: [] });
+        }
+        clearPredictions();
+        addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'system', severity: 'info', message: `Model reset (${reason})`, sequence: envelope.sequence });
+        break;
+      }
       default:
         addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'warning', severity: 'warning', message: `Unhandled WS message type: ${envelope.type}`, sequence: envelope.sequence });
         break;
@@ -189,11 +203,6 @@ export class RealtimeClient {
   }
 
   private applyFeedStatus(status: FeedStatusDTO) {
-    if ((status.last_message ?? '').toLowerCase().includes('runtime reset')) {
-      marketStore.setState({ currentBars: [], recentClosedBars: [] });
-      intelligenceStore.setState({ levels: [], touches: [], observations: [] });
-      clearPredictions();
-    }
     const replayState = replayStateFromFeedMessage(status.last_message, status.state, runtimeStore.getSnapshot().replayState);
     runtimeStore.setState((current) => ({ ...current, runtimeMode: status.mode, requestedSymbol: status.requested_symbol ?? current.requestedSymbol, feedReady: ['connected', 'replaying'].includes(status.state), feedState: status.state, replayState: status.mode === 'replay' ? replayState : current.replayState }));
     if (status.mode === 'replay') {

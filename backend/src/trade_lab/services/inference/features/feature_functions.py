@@ -35,6 +35,18 @@ if TYPE_CHECKING:
     from trade_lab.domain.market_context import MarketContextBuffer
 
 
+class FeatureComputationError(RuntimeError):
+    """W2 P2d: a named feature function raised during vector construction.
+
+    Carries the failing feature's name so the runtime's inference error path can
+    log and surface WHICH feature broke, not just that one did.
+    """
+
+    def __init__(self, feature_name: str, original: Exception) -> None:
+        super().__init__(f"feature {feature_name!r} failed: {original}")
+        self.feature_name = feature_name
+
+
 class LevelDirection(StrEnum):
     """Trade direction implied by which side of the level was touched."""
 
@@ -318,7 +330,12 @@ def build_feature_vector(
     ordered: list[float] = []
     by_name: dict[str, float] = {}
     for name in contract.feature_set.names:
-        value = registry.compute(name, buffer, window, level_ctx)
+        try:
+            value = registry.compute(name, buffer, window, level_ctx)
+        except Exception as exc:
+            # W2 P2d: name the failing feature so the runtime's status surface can
+            # report WHICH feature broke, not just that one did.
+            raise FeatureComputationError(name, exc) from exc
         ordered.append(value)
         by_name[name] = value
     return ordered, by_name

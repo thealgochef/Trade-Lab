@@ -36,6 +36,7 @@ MessageType = Literal[
     "prediction.resolved",
     "prediction.dropped",
     "model.status",
+    "model.reset",
 ]
 
 

@@ -200,6 +200,7 @@ class HistoricalReplayService:
             self.runtime.reset(
                 requested_symbol=config.requested_symbol,
                 feed_message="runtime reset for historical replay",
+                reset_reason="replay_reset",
             )
         )
         await self._emit(
@@ -290,6 +291,12 @@ class HistoricalReplayService:
         await core.start(CoreReplayConfig(speed=config.speed, max_events=config.max_events))
         await self._flush_pending()
         status = core.status()
+        # W2 P2a (F10): the bar stream has ended — finalize open setups whose
+        # cutoff is at/before the last replayed instant; the flushed drops ride
+        # the same drop -> DroppedPrediction surface as in-stream drops.
+        resolver_update = self.runtime.flush_resolver(status.last_event_ts_utc)
+        self._accumulate(resolver_update)
+        await self._flush_pending()
         self._events_processed = status.events_processed
         self._warnings_recorded = status.warnings_recorded
         self._last_event_ts_utc = status.last_event_ts_utc
@@ -438,9 +445,12 @@ def _coalesce_replay_updates(updates: list[RuntimeUpdate]) -> RuntimeUpdate:
     # 'dropped' (prediction.dropped) is event-style for the same reason.
     outcomes = list(merged.outcomes)
     dropped = list(merged.dropped)
+    model_reset_reason = merged.model_reset_reason
     for update in updates:
         if update.feed_status is not None:
             feed_status = update.feed_status
+        if update.model_reset_reason is not None:
+            model_reset_reason = update.model_reset_reason
         if update.warnings:
             warnings.extend(update.warnings)
         if update.current_bars:
@@ -470,6 +480,7 @@ def _coalesce_replay_updates(updates: list[RuntimeUpdate]) -> RuntimeUpdate:
         predictions=tuple(predictions),
         outcomes=tuple(outcomes),
         dropped=tuple(dropped),
+        model_reset_reason=model_reset_reason,
     )
 
 

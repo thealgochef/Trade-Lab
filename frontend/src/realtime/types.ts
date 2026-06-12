@@ -11,7 +11,8 @@ export type MessageType =
   | 'prediction.created'
   | 'prediction.resolved'
   | 'prediction.dropped'
-  | 'model.status';
+  | 'model.status'
+  | 'model.reset';
 
 export type BarDTO = {
   timeframe_ticks: number;

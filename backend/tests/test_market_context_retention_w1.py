@@ -47,20 +47,18 @@ class _StubEngine:
         self._approach = approach
         self._interaction = interaction
 
-    @property
-    def active_contract(self):  # resolver build path: no contract -> no resolver
-        return None
-
     def active(self):
         if self._approach is None:
             return None
         return SimpleNamespace(
+            # resolver build path: no contract -> no resolver (W2 P2b rebind seam)
+            contract=None,
             section=SimpleNamespace(
                 feature_windows=SimpleNamespace(
                     approach_window_minutes=self._approach,
                     interaction_window_minutes=self._interaction,
                 )
-            )
+            ),
         )
 
 

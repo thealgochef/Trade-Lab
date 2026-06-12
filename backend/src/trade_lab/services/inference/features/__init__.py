@@ -9,6 +9,7 @@ empty-case rule preserved exactly (absorption -> 0.0; approach -> NaN).
 
 from trade_lab.services.inference.features.feature_functions import (
     DEFAULT_FEATURE_REGISTRY,
+    FeatureComputationError,
     FeatureFn,
     FeatureFunctionRegistry,
     FeatureWindow,
@@ -19,6 +20,7 @@ from trade_lab.services.inference.features.feature_functions import (
 
 __all__ = [
     "DEFAULT_FEATURE_REGISTRY",
+    "FeatureComputationError",
     "FeatureFn",
     "FeatureFunctionRegistry",
     "FeatureWindow",

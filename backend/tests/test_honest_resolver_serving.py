@@ -15,7 +15,7 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 from strategy_core import load_strategy_contract
@@ -42,8 +42,17 @@ class _FakeEngine:
         self.has_active_model = True
         self._counter = 0
 
-    def active(self):  # model_status() probe; not under test here.
-        return None
+    def active(self):
+        # W2 P2b: the runtime's rebind reads the ActiveModel-shaped probe
+        # (contract for the resolver; section for retention — None keeps the
+        # configured baseline, which is not under test here).
+        return SimpleNamespace(
+            contract=self.active_contract,
+            section=None,
+            model_id="m-1",
+            validation_ok=True,
+            validation_detail="fake",
+        )
 
     def predict_for_observation(self, observation, market_context) -> Prediction:
         self._counter += 1

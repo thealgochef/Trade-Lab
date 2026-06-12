@@ -411,6 +411,22 @@ class ModelRegistry:
         :class:`ModelValidationError` (fail closed) if the loaded model disagrees
         with its contract. The prior active model is only replaced after the new
         one fully validates, so a failed activation leaves the registry unchanged.
+
+        W2 P2b: composed from :meth:`prepare_activation` (everything that can
+        fail) + :meth:`commit_activation` (the lock-swap) so the app can commit
+        the registry swap and the runtime's engine rebind together, with no
+        awaits between them.
+        """
+
+        active = self.prepare_activation(model_id)
+        self.commit_activation(active)
+        return active
+
+    def prepare_activation(self, model_id: str) -> ActiveModel:
+        """Validate + load ``model_id`` fully WITHOUT touching the active slot.
+
+        Any failure here leaves the previously active model serving, untouched
+        (F12): the registry swap happens only in :meth:`commit_activation`.
         """
 
         if not is_safe_model_id(model_id):
@@ -456,7 +472,7 @@ class ModelRegistry:
         if not validation_ok:
             raise ModelValidationError(validation_detail)
         model = self._load_and_validate_model(directory, contract)
-        active = ActiveModel(
+        return ActiveModel(
             model_id=model_id,
             model=model,
             contract=contract,
@@ -464,9 +480,12 @@ class ModelRegistry:
             validation_ok=validation_ok,
             validation_detail=validation_detail,
         )
+
+    def commit_activation(self, active: ActiveModel) -> None:
+        """Swap a fully-validated :class:`ActiveModel` in under the lock."""
+
         with self._lock:
             self._active = active
-        return active
 
     def deactivate(self) -> None:
         """Unload the active model. Market data continues to be served."""

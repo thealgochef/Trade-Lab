@@ -306,13 +306,13 @@ describe('RealtimeClient', () => {
     expect(predictionStore.getSnapshot().predictions.at(-1)).toMatchObject({ id: 'pred-5' });
   });
 
-  it('clears predictions and outcomes when a runtime reset feed status arrives', () => {
+  it('clears predictions and outcomes when a typed model.reset frame arrives', () => {
     client.start();
     sockets[0].message(envelope('prediction.created', { prediction: prediction() }));
     sockets[0].message(envelope('prediction.resolved', { outcome: outcome() }));
     expect(predictionStore.getSnapshot().predictions).toHaveLength(1);
 
-    sockets[0].message(envelope('feed.status', { ...feedStatus('disconnected'), mode: 'idle', last_message: 'runtime reset for live market data' }));
+    sockets[0].message(envelope('model.reset', { reason: 'activation' }));
 
     expect(predictionStore.getSnapshot().predictions).toHaveLength(0);
     expect(predictionStore.getSnapshot().outcomes).toHaveLength(0);
@@ -378,7 +378,7 @@ describe('RealtimeClient', () => {
     expect(marketStore.getSnapshot().recentClosedBars).toHaveLength(1);
   });
 
-  it('clears stale chart and intelligence data when live runtime reset status arrives', () => {
+  it('clears stale chart and intelligence data when a live model.reset frame arrives', () => {
     marketStore.setState({ currentBars: [normalizeBar(bar(147, false))], recentClosedBars: [normalizeBar(bar(147, true))] });
     intelligenceStore.setState({
       levels: [{ kind: 'pdh', priceTicks: 76000, tradingDay: '2026-05-21', originSession: 'ny', developing: false, eligible: true }],
@@ -388,14 +388,14 @@ describe('RealtimeClient', () => {
     });
     client.start();
 
-    sockets[0].message(envelope('feed.status', { ...feedStatus('disconnected'), mode: 'idle', last_message: 'runtime reset for live market data' }));
+    sockets[0].message(envelope('model.reset', { reason: 'live_reset' }));
 
     expect(marketStore.getSnapshot()).toMatchObject({ currentBars: [], recentClosedBars: [] });
     expect(intelligenceStore.getSnapshot()).toMatchObject({ levels: [], touches: [], observations: [] });
     expect(intelligenceStore.getSnapshot().warnings).toHaveLength(1);
   });
 
-  it('clears stale chart and intelligence data when replay runtime reset status arrives', () => {
+  it('clears stale chart and intelligence data when a replay model.reset frame arrives', () => {
     marketStore.setState({ currentBars: [normalizeBar(bar(147, false))], recentClosedBars: [normalizeBar(bar(147, true))] });
     intelligenceStore.setState({
       levels: [{ kind: 'pdh', priceTicks: 76000, tradingDay: '2026-05-21', originSession: 'ny', developing: false, eligible: true }],
@@ -405,7 +405,7 @@ describe('RealtimeClient', () => {
     });
     client.start();
 
-    sockets[0].message(envelope('feed.status', { ...feedStatus('disconnected'), mode: 'idle', last_message: 'runtime reset for historical replay' }));
+    sockets[0].message(envelope('model.reset', { reason: 'replay_reset' }));
 
     expect(marketStore.getSnapshot()).toMatchObject({ currentBars: [], recentClosedBars: [] });
     expect(intelligenceStore.getSnapshot()).toMatchObject({ levels: [], touches: [], observations: [] });
