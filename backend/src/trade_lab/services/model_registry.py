@@ -33,12 +33,108 @@ from strategy_core.strategies.registry import get_strategy
 # E3 KNOWN COUPLING (recorded): the feature-partition cross-check helper lives on
 # the touch section. Generic TL code duck-typing touch-section attributes is
 # acceptable single-strategy behavior; the F-era cleanup moves this into the plugin.
-from strategy_core.strategies.touch_reversal.section import validate_feature_partition
+from strategy_core.strategies.touch_reversal.section import (
+    default_touch_reversal_section,
+    validate_feature_partition,
+)
+
+from trade_lab.services.inference.resolution_adapter import parse_bar_type
 
 if TYPE_CHECKING:
     from catboost import CatBoostClassifier
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class ServingCapabilities:
+    """What THIS runtime can actually serve (W1 P3d activation refusal gate).
+
+    Snapshot of the wired configuration the gate compares every contract against.
+    """
+
+    computable_features: tuple[str, ...]
+    market_context_retention_minutes: int
+    instrument_root: str
+    observation_duration_seconds: int
+    decision_timeframe_ticks: int
+    supported_live_schemas: frozenset[str]
+    supported_replay_schemas: frozenset[str]
+
+
+def serving_compatibility_error(
+    contract: StrategyContract, section: Any, capabilities: ServingCapabilities
+) -> str | None:
+    """First serving-compatibility violation for a contract, or ``None``.
+
+    W1 P3d: ONE fail-closed gate at activation. Every check guards a previously
+    silent skew: unknown feature names (swallowed KeyError at predict), feature
+    windows wider than retention (truncated windows), instrument mismatch,
+    decision-clock split (offset vs observation window was warn-only), a
+    write-only barrier_mode enum, a bundle session scheme the wired plugin never
+    applies, a forward bar grid the runtime does not build, and data schemas the
+    feed layer cannot supply.
+    """
+
+    unsupported = [
+        name for name in contract.feature_set.names
+        if name not in capabilities.computable_features
+    ]
+    if unsupported:
+        return f"contract names features the runtime cannot compute: {unsupported}"
+    windows = section.feature_windows
+    required_minutes = windows.approach_window_minutes + windows.interaction_window_minutes
+    if required_minutes > capabilities.market_context_retention_minutes:
+        return (
+            f"contract feature windows need {required_minutes} min of market context; "
+            f"configured retention ceiling is "
+            f"{capabilities.market_context_retention_minutes} min"
+        )
+    if contract.instrument != capabilities.instrument_root:
+        return (
+            f"contract instrument {contract.instrument!r} does not match the configured "
+            f"instrument root {capabilities.instrument_root!r}"
+        )
+    policy = contract.label_policy
+    if policy.decision_offset_minutes * 60 != capabilities.observation_duration_seconds:
+        return (
+            f"contract decision_offset_minutes ({policy.decision_offset_minutes} min) does "
+            f"not equal the configured observation window "
+            f"({capabilities.observation_duration_seconds} s)"
+        )
+    if policy.barrier_mode != "fixed_points":
+        return (
+            f"unsupported barrier_mode {policy.barrier_mode!r}: serving implements "
+            "fixed_points semantics only"
+        )
+    if section.session_scheme != default_touch_reversal_section().session_scheme:
+        return (
+            "contract section.session_scheme differs from the wired runtime scheme; "
+            "the serving plugin would silently detect under a different calendar"
+        )
+    try:
+        bar_type_ticks = parse_bar_type(section.touch_rule.bar_type)
+    except ValueError as exc:
+        return str(exc)
+    if bar_type_ticks != capabilities.decision_timeframe_ticks:
+        return (
+            f"contract touch_rule.bar_type {section.touch_rule.bar_type!r} does not match "
+            f"the runtime decision timeframe {capabilities.decision_timeframe_ticks}t"
+        )
+    requirements = contract.data_requirements
+    missing_live = [
+        schema for schema in requirements.live_schemas
+        if schema not in capabilities.supported_live_schemas
+    ]
+    if missing_live:
+        return f"contract live schemas not supported by the feed layer: {missing_live}"
+    missing_replay = [
+        schema for schema in requirements.replay_schemas
+        if schema not in capabilities.supported_replay_schemas
+    ]
+    if missing_replay:
+        return f"contract replay schemas not supported by the replay layer: {missing_replay}"
+    return None
 
 MODEL_FILE = "model.cbm"
 METADATA_FILE = "metadata.json"
@@ -276,13 +372,20 @@ class ModelRegistry:
     """
 
     def __init__(
-        self, models_path: Path | None, *, serving_strategy_id: str | None = None
+        self,
+        models_path: Path | None,
+        *,
+        serving_strategy_id: str | None = None,
+        serving_capabilities: ServingCapabilities | None = None,
     ) -> None:
         # E2 check (iv): the running service's wired plugin id. When supplied,
         # activation refuses a contract routed to ANY other strategy — the
         # hardcoded touch_reversal wiring stays, now guarded instead of implicit.
+        # W1 P3d: when serving_capabilities is supplied (the app always supplies
+        # it), activation additionally runs the fail-closed compatibility gate.
         self._models_path = models_path
         self._serving_strategy_id = serving_strategy_id
+        self._serving_capabilities = serving_capabilities
         self._lock = threading.RLock()
         self._active: ActiveModel | None = None
 
@@ -337,6 +440,14 @@ class ModelRegistry:
             validate_feature_partition(contract.feature_set.names, section)
         except ContractError as exc:
             raise ModelValidationError(str(exc)) from exc
+        # W1 P3d: the serving-compatibility refusal gate — one check function,
+        # fail-closed, before any model bytes are read.
+        if self._serving_capabilities is not None:
+            compatibility_error = serving_compatibility_error(
+                contract, section, self._serving_capabilities
+            )
+            if compatibility_error is not None:
+                raise ModelValidationError(compatibility_error)
         # E3 ledger (a): the metadata cross-check is FAIL-CLOSED at activation —
         # discovery's flag is no longer ignorable here.
         validation_ok, validation_detail = _validate_against_metadata(

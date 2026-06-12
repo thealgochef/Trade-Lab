@@ -75,22 +75,22 @@
       "trading_day_boundary": "18:00",
       "sessions": {
         "asia": {
-          "start": "18:00",
-          "end": "01:00",
+          "start": "19:00",
+          "end": "02:45",
           "crosses_midnight": true
         },
         "london": {
-          "start": "01:00",
+          "start": "03:00",
           "end": "08:00"
         },
-        "ny_rth": {
-          "start": "09:30",
-          "end": "16:15"
+        "ny": {
+          "start": "09:00",
+          "end": "17:00"
         }
       }
     },
     "level_scheme": {
-      "pdh_pdl_source": "prior_day_ny_rth",
+      "pdh_pdl_source": "prior_day_full",
       "session_levels": [
         "asia_high",
         "asia_low",

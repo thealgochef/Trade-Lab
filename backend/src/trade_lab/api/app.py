@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from trade_lab import __version__
 from trade_lab.adapters.databento import DatabentoMarketDataFeed, is_databento_sdk_available
 from trade_lab.adapters.databento_historical import DatabentoHistoricalSource
-from trade_lab.adapters.replay_catalog import build_replay_catalog
+from trade_lab.adapters.replay_catalog import SUPPORTED_SCHEMAS, build_replay_catalog
 from trade_lab.api.dto import (
     ReplaySourceDTO,
     model_bundle_to_dto,
@@ -22,12 +22,14 @@ from trade_lab.api.dto import (
 )
 from trade_lab.config import Settings, load_settings
 from trade_lab.services.broadcaster import WebSocketBroadcaster
+from trade_lab.services.inference.features import DEFAULT_FEATURE_REGISTRY
 from trade_lab.services.inference.inference_engine import InferenceEngine
 from trade_lab.services.live import LiveConfig, LiveMarketDataService, LiveState
 from trade_lab.services.model_registry import (
     ModelNotFoundError,
     ModelRegistry,
     ModelValidationError,
+    ServingCapabilities,
     is_safe_model_id,
 )
 from trade_lab.services.replay import HistoricalReplayService, ReplayConfig, ReplayState
@@ -233,6 +235,19 @@ def create_app(
         # E2 check (iv): activation refuses contracts routed to any strategy other
         # than the one the runtime's wired plugin actually serves.
         serving_strategy_id=runtime.strategy_core_service.plugin_strategy_id,
+        # W1 P3d: the fail-closed serving-compatibility gate compares every
+        # activated contract against THIS runtime's actual capabilities.
+        serving_capabilities=ServingCapabilities(
+            computable_features=DEFAULT_FEATURE_REGISTRY.names,
+            market_context_retention_minutes=settings.market_context_retention_minutes,
+            instrument_root=settings.instrument_root,
+            observation_duration_seconds=settings.observation_duration_seconds,
+            decision_timeframe_ticks=min(settings.tick_timeframes),
+            supported_live_schemas=frozenset(
+                {settings.databento_trade_schema, settings.databento_quote_schema}
+            ),
+            supported_replay_schemas=frozenset(SUPPORTED_SCHEMAS),
+        ),
     )
     inference_engine = InferenceEngine(model_registry)
     runtime.set_inference_engine(inference_engine)
