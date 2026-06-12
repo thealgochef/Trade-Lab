@@ -68,3 +68,7 @@ class TouchEvent:
     # audit #NN-1: authoritative direction carried from Strategy-Core's Touch.direction.
     # Defaults to None so existing constructions keep working; the adapter always sets it.
     direction: LevelDirection | None = None
+    # W1 P3c: the EXACT zone representative price in points (no tick snap) — the
+    # feature reference research trains on. None only for legacy constructions;
+    # the adapter always sets it.
+    level_price: float | None = None

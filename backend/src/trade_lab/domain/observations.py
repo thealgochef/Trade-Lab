@@ -35,6 +35,9 @@ class Observation:
     # predate direction carry); inference consumes this instead of re-deriving from
     # level_kind so mixed-side merged zones are not inverted.
     direction: LevelDirection | None = None
+    # W1 P3c: exact zone representative price (points, no tick snap) carried from
+    # the touch; inference prefers this over the snapped ticks.
+    level_price: float | None = None
 
 
 class ObservationEngine:
@@ -56,6 +59,7 @@ class ObservationEngine:
             level_kind=touch.level_kind,
             level_price_ticks=touch.level_price_ticks,
             direction=touch.direction,  # audit #NN-1: carry authoritative direction
+            level_price=touch.level_price,  # W1 P3c: exact reference, no tick snap
         )
         self._observations[obs.observation_id] = obs
         return obs

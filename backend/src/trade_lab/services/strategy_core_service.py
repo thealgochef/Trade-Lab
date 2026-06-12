@@ -268,6 +268,9 @@ class StrategyCoreService:
             # leaving downstream to re-derive it from level_kind (which inverts for
             # mixed-side merged zones).
             direction=_CORE_DIRECTION_TO_TRADE_LAB[touch.direction],
+            # W1 P3c: carry the EXACT zone representative price (points, no tick
+            # snap) — the research feature reference; ticks stay for display/wire.
+            level_price=touch.representative_price,
         )
 
 

@@ -89,24 +89,23 @@ def _empty_buffer() -> MarketContextBuffer:
 
 
 def _interaction_buffer() -> MarketContextBuffer:
-    """Quotes for the time-tempo features + trades for absorption, post-touch."""
+    """Post-touch TRADE stream (W1 P3c: dwell observable is the trade print).
+
+    One stream drives both the time-tempo features (gap after each print is
+    attributed to its price) and absorption (proximity band +/-0.5pts ->
+    [16999.5, 17000.5]):
+
+      t=0s   17000.00 x5  at-level    gap 10s -> within;             at_level +5
+      t=10s  16996.00 x4  4pts below  gap 30s -> beyond (LONG);      through  +4
+      t=40s  17000.00 x3  at-level    gap 60s -> within;             at_level +3
+      t=100s 17004.00 x2  4pts above  last print: no following gap;  favorable
+    """
 
     buffer = _empty_buffer()
-    # Quotes: mid (points) and the gap that follows each.
-    #   t=0s   mid 17000.0  (at level)        gap 10s -> within
-    #   t=10s  mid 16996.0  (4pts below)      gap 30s -> beyond
-    #   t=40s  mid 17000.0  (at level)        gap 60s -> within
-    #   t=100s mid 17004.0  (4pts above)      (last quote: no following gap)
-    buffer.append_quote(_ts(0), 67_996, 68_004)  # mid 68000t = 17000.0
-    buffer.append_quote(_ts(10), 67_980, 67_988)  # mid 67984t = 16996.0
-    buffer.append_quote(_ts(40), 67_996, 68_004)  # mid 68000t = 17000.0
-    buffer.append_quote(_ts(100), 68_012, 68_020)  # mid 68016t = 17004.0
-
-    # Absorption trades (proximity band +/-0.5pts -> [16999.5, 17000.5]).
-    buffer.append_trade(_ts(5), 68_000, 5, TradeSide.BUY)  # 17000.0 at-level
-    buffer.append_trade(_ts(6), 68_001, 3, TradeSide.BUY)  # 17000.25 at-level
-    buffer.append_trade(_ts(7), 67_990, 4, TradeSide.SELL)  # 16997.5 through (LONG adverse)
-    buffer.append_trade(_ts(8), 68_010, 2, TradeSide.BUY)  # 17002.5 favorable, ignored
+    buffer.append_trade(_ts(0), 68_000, 5, TradeSide.BUY)
+    buffer.append_trade(_ts(10), 67_984, 4, TradeSide.SELL)
+    buffer.append_trade(_ts(40), 68_000, 3, TradeSide.BUY)
+    buffer.append_trade(_ts(100), 68_016, 2, TradeSide.BUY)
     return buffer
 
 
@@ -131,22 +130,22 @@ def _approach_buffer() -> MarketContextBuffer:
 def test_int_time_beyond_level_long_sums_adverse_dwell() -> None:
     buffer = _interaction_buffer()
     value = int_time_beyond_level(buffer, _window(), _long_ctx())
-    # Only the 30s gap after the 16996.0 mid is below the level for a LONG.
+    # Only the 30s gap after the 16996.0 print is below the level for a LONG.
     assert value == pytest.approx(30.0)
 
 
 def test_int_time_beyond_level_short_inverts_side() -> None:
     buffer = _interaction_buffer()
     value = int_time_beyond_level(buffer, _window(), _short_ctx())
-    # For a SHORT only mids above the level are adverse: the 17004.0 mid is last,
-    # so it contributes no following gap -> no adverse dwell here.
+    # For a SHORT only prints above the level are adverse: the 17004.0 print is
+    # last, so it contributes no following gap -> no adverse dwell here.
     assert value == pytest.approx(0.0)
 
 
 def test_int_time_within_2pts_sums_near_level_dwell() -> None:
     buffer = _interaction_buffer()
     value = int_time_within_2pts(buffer, _window(), _long_ctx())
-    # 10s (after 17000.0) + 60s (after the second 17000.0) = 70s within 2pts.
+    # 10s (after the first 17000.00) + 60s (after the second) = 70s within 2pts.
     assert value == pytest.approx(70.0)
 
 
@@ -157,7 +156,7 @@ def test_int_absorption_ratio_long() -> None:
     assert value == pytest.approx(8.0 / 12.0)
 
 
-def test_interaction_time_features_zero_when_no_quotes() -> None:
+def test_interaction_time_features_zero_when_no_trades() -> None:
     buffer = _empty_buffer()
     window = _window()
     ctx = _long_ctx()
@@ -179,9 +178,9 @@ def test_int_absorption_ratio_zero_when_only_favorable_volume() -> None:
 
 def test_dwell_skips_gaps_longer_than_ten_minutes() -> None:
     buffer = _empty_buffer()
-    # Two at-level quotes 700s apart (> 600s ceiling): the gap is discarded.
-    buffer.append_quote(_ts(0), 67_996, 68_004)
-    buffer.append_quote(_ts(700), 67_996, 68_004)
+    # Two at-level trades 700s apart (> 600s ceiling): the gap is discarded.
+    buffer.append_trade(_ts(0), 68_000, 1, TradeSide.BUY)
+    buffer.append_trade(_ts(700), 68_000, 1, TradeSide.BUY)
     # Extend the interaction window so both quotes fall inside it.
     window = FeatureWindow.from_touch(
         TOUCH,
@@ -233,6 +232,41 @@ def test_approach_window_is_end_exclusive_of_touch() -> None:
     # A trade exactly at the touch timestamp belongs to interaction, not approach.
     buffer.append_trade(TOUCH, 68_000, 9, TradeSide.BUY)
     assert math.isnan(app_avg_trade_size(buffer, _window(), _long_ctx()))
+
+
+# ── W1 P3c pins: section band + exact off-grid reference ──────────
+
+
+def test_within_band_width_comes_from_level_context() -> None:
+    """The within-band half width is a section parameter, not a local hardcode."""
+    buffer = _empty_buffer()
+    # 17001.5 print (1.5pts above level) with a 20s following gap.
+    buffer.append_trade(_ts(0), 68_006, 1, TradeSide.BUY)
+    buffer.append_trade(_ts(20), 68_006, 1, TradeSide.BUY)
+    wide = _long_ctx()  # default band 2.0 -> 1.5pts is within
+    narrow = LevelContext(
+        reference_price=LEVEL_PRICE,
+        direction=LevelDirection.LONG,
+        tick_size=TICK_SIZE,
+        within_band_pts=1.0,
+    )
+    assert int_time_within_2pts(buffer, _window(), wide) == pytest.approx(20.0)
+    assert int_time_within_2pts(buffer, _window(), narrow) == pytest.approx(0.0)
+
+
+def test_reference_price_accepts_off_grid_zone_mean() -> None:
+    """The reference is the EXACT zone representative price — no tick snap."""
+    off_grid = Decimal("17000.1667")  # a 3-level zone mean, off the 0.25 grid
+    ctx = LevelContext(
+        reference_price=off_grid,
+        direction=LevelDirection.LONG,
+        tick_size=TICK_SIZE,
+        proximity_points=0.5,
+    )
+    buffer = _empty_buffer()
+    buffer.append_trade(_ts(1), 68_001, 2, TradeSide.BUY)  # 17000.25: in band
+    buffer.append_trade(_ts(2), 67_998, 1, TradeSide.SELL)  # 16999.50: through
+    assert int_absorption_ratio(buffer, _window(), ctx) == pytest.approx(2.0 / 3.0)
 
 
 # ── Vector assembly / ordering ─────────────────────────────────────

@@ -162,7 +162,14 @@ class InferenceEngine:
         # ACTIVE bundle's typed section; the envelope keeps tick_size/feature_set/
         # inference, consumed exactly where they were consumed before.
         section = active.section
-        reference_price = Decimal(observation.level_price_ticks) * Decimal(str(contract.tick_size))
+        # W1 P3c: the feature reference is the EXACT zone representative price (no
+        # tick snap), matching research; snapped ticks remain only a legacy fallback.
+        if observation.level_price is not None:
+            reference_price = Decimal(str(observation.level_price))
+        else:
+            reference_price = Decimal(observation.level_price_ticks) * Decimal(
+                str(contract.tick_size)
+            )
         # audit #NN-1: consume the authoritative direction carried from the Strategy-Core
         # touch (observation.direction) rather than re-deriving it from level_kind
         # (= zone.names[0]), which inverts for mixed-side merged zones. The domain and
