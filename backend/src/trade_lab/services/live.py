@@ -4,6 +4,14 @@ Live and replay deliberately share ``ApplicationRuntime.process_market_event`` s
 bars, levels, touches, observations, and WebSocket deltas cannot diverge. This
 controller never auto-starts; an operator API call is required because live market
 data uses paid credentials and should not surprise-connect during app startup.
+
+W2 (D-P-06): on start the runtime resets, the prior trading day's PDH/PDL seed
+loads through the same ``load_prior_day_summary`` path research and cold replay
+use, and the feed replays the CURRENT trading day from 18:00 ET before going real
+time (the adapter's intraday replay-start, or its Historical fallback). A feed
+disconnect re-runs that exact start path, so a reconnect can never resume on a
+wiped, context-free runtime. The Chicago display seed is retired — display warm-up
+now comes from real engine bars produced by the warm-start replay.
 """
 
 import asyncio
@@ -18,16 +26,18 @@ from typing import cast
 from strategy_core.runtime import LiveRuntime as CoreLiveRuntime
 from strategy_core.runtime import LiveState as CoreLiveState
 
-from trade_lab.domain.data_quality import (
-    DataQualityCode,
-    DataQualitySeverity,
-    DataQualityWarning,
-)
+from trade_lab.adapters.databento_historical import DatabentoHistoricalSource
+from trade_lab.domain.data_quality import DataQualityWarning
 from trade_lab.domain.events import MarketEvent
 from trade_lab.domain.feed import FeedConnectionState, FeedStatus
+from trade_lab.domain.prices import price_to_ticks
+from trade_lab.domain.trading_day import (
+    prior_trading_day,
+    trading_day_bounds_utc,
+    trading_day_for,
+)
 from trade_lab.ports.market_data import MarketDataFeed
 from trade_lab.services.runtime import ApplicationRuntime, RuntimeUpdate, _safe_text
-from trade_lab.services.seed import HistoricalSeedService
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +84,10 @@ class LiveStatus:
     last_error: str | None = None
     started_at_utc: datetime | None = None
     stopped_at_utc: datetime | None = None
+    #: W2 P1b: "warming" while the engine is digesting the trading day's replayed
+    #: events (event ts < the start wall clock); "live" once real-time events flow.
+    warm_start_state: str | None = None
+    warm_start_events: int = 0
 
 
 FeedFactory = Callable[[LiveConfig], MarketDataFeed]
@@ -89,13 +103,17 @@ class LiveMarketDataService:
         feed_factory: FeedFactory,
         *,
         on_update: Callable[[RuntimeUpdate], Awaitable[None]] | None = None,
-        seed_service: HistoricalSeedService | None = None,
+        historical_source: DatabentoHistoricalSource | None = None,
+        reconnect_delay_seconds: float = 1.0,
+        now_provider: Callable[[], datetime] | None = None,
     ) -> None:
         self.runtime = runtime
         self.config = config
         self._feed_factory = feed_factory
         self._on_update = on_update
-        self._seed_service = seed_service
+        self._historical_source = historical_source
+        self._reconnect_delay_seconds = max(reconnect_delay_seconds, 0.01)
+        self._now = now_provider or (lambda: datetime.now(UTC))
         self._state = LiveState.IDLE
         self._events_processed = 0
         self._last_error: str | None = None
@@ -104,13 +122,17 @@ class LiveMarketDataService:
         self._stopped_at_utc: datetime | None = None
         self._task: asyncio.Task[None] | None = None
         self.strategy_core_live: CoreLiveRuntime | None = None
-        self._seed_task: asyncio.Task[None] | None = None
-        # audit #NN-5: monotonic token identifying the current live/runtime generation.
-        # Each start() bumps it; an in-flight warm-up seed task carries the generation it
-        # was started for and no-ops if a disconnect+restart has since reset the runtime.
-        self._generation = 0
         self._feed: MarketDataFeed | None = None
         self._lock = asyncio.Lock()
+        # W2 P1b warm-start marking: events older than the start wall clock are the
+        # replayed trading day ("warming"); the first at/after it flips to "live".
+        self._warm_anchor_utc: datetime | None = None
+        self._warm_start_state: str | None = None
+        self._warm_start_events = 0
+        # W2 P1d: a feed disconnect schedules this task to re-run the full start
+        # path (reset + prior-day seed + trading-day replay), killing the old
+        # wipe-without-recovery behavior.
+        self._reconnect_task: asyncio.Task[None] | None = None
 
     @property
     def has_update_callback(self) -> bool:
@@ -154,6 +176,8 @@ class LiveMarketDataService:
             last_error=last_error,
             started_at_utc=started_at_utc,
             stopped_at_utc=stopped_at_utc,
+            warm_start_state=self._warm_start_state,
+            warm_start_events=self._warm_start_events,
         )
 
     async def start(self) -> None:
@@ -173,21 +197,20 @@ class LiveMarketDataService:
             self._started_at_utc = datetime.now(UTC)
             self._stopped_at_utc = None
             self.strategy_core_live = None
-            # audit #NN-5: a restart resets the runtime below, so any warm-up seed task
-            # left running from a prior (auto-disconnected) connection is now stale. Bump
-            # the generation token and cancel the orphan so it cannot inject stale bars
-            # into the freshly reset runtime; the generation guard in _seed_and_broadcast
-            # is the backstop if the cancel loses the race with an in-flight fetch.
-            self._generation += 1
-            if self._seed_task is not None and not self._seed_task.done():
-                self._seed_task.cancel()
             if self.config.reset_runtime_on_start:
                 await self._emit(
                     self.runtime.reset(
                         requested_symbol=self.config.requested_symbol,
                         feed_message="runtime reset for live market data",
+                        reset_reason="live_reset",
                     )
                 )
+            # W2 P1c: the prior trading day's PDH/PDL through the SAME seed path
+            # research and cold replay use — before any event reaches the engine.
+            await self._load_prior_day_summary()
+            self._warm_anchor_utc = self._now()
+            self._warm_start_state = "warming"
+            self._warm_start_events = 0
             await self._emit_status(FeedConnectionState.CONNECTING, "live feed connecting")
             feed: MarketDataFeed | None = None
             try:
@@ -229,23 +252,15 @@ class LiveMarketDataService:
                 ) from exc
             self._state = LiveState.RUNNING
             await self._emit_status(FeedConnectionState.CONNECTED, "live feed running")
-            # Warm-up runs off the event loop and broadcasts when ready, so the live
-            # connection is never blocked by the historical fetch. It is scheduled after
-            # the runtime reset above so its bars are not cleared by the reset.
-            if self._seed_service is not None and self._seed_service.enabled:
-                # audit #NN-5: bind this seed task to the current generation so it can
-                # detect (and skip) seeding if a later restart resets the runtime.
-                self._seed_task = asyncio.create_task(
-                    self._seed_and_broadcast(self._generation)
-                )
             self._task = asyncio.create_task(self._wait_strategy_core_live())
 
     async def stop(self) -> None:
         async with self._lock:
-            if self._seed_task is not None and not self._seed_task.done():
-                self._seed_task.cancel()
+            if self._reconnect_task is not None and not self._reconnect_task.done():
+                self._reconnect_task.cancel()
                 with suppress(asyncio.CancelledError):
-                    await self._seed_task
+                    await self._reconnect_task
+            self._reconnect_task = None
             core = self.strategy_core_live
             if core is not None:
                 await core.stop()
@@ -257,14 +272,58 @@ class LiveMarketDataService:
             self._feed = None
             self._state = LiveState.STOPPED
             self._stopped_at_utc = datetime.now(UTC)
+            # W2 P2a (F10): finalize open setups whose cutoff has already passed;
+            # the flushed drops ride the normal drop -> DroppedPrediction surface.
+            await self._emit(self.runtime.flush_resolver(datetime.now(UTC)))
             await self._emit_status(FeedConnectionState.DISCONNECTED, "live feed stopped")
+
+    async def _load_prior_day_summary(self) -> None:
+        """W2 P1c: seed PDH/PDL from the prior trading day's ohlcv-1h summary."""
+
+        source = self._historical_source
+        if source is None or not source.available:
+            logger.warning(
+                "prior-day summary skipped: Databento Historical access is not "
+                "configured (PDH/PDL emit only after the first in-stream day roll)"
+            )
+            return
+        try:
+            day = prior_trading_day(trading_day_for(self._now()))
+            start, end = trading_day_bounds_utc(day)
+            frame = await asyncio.to_thread(lambda: source.ohlcv_frame(start=start, end=end))
+            if frame is None or len(frame) == 0:
+                logger.warning("prior-day summary fetch returned no bars for %s", day)
+                return
+            high_ticks = price_to_ticks(str(float(frame["high"].max())))
+            low_ticks = price_to_ticks(str(float(frame["low"].min())))
+            self.runtime.levels.load_prior_day_summary(day, high_ticks, low_ticks)
+            logger.info("prior-day summary loaded for %s", day)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "prior-day summary fetch failed (exception_type=%s); PDH/PDL emit "
+                "only after the first in-stream day roll",
+                type(exc).__name__,
+            )
 
     def _process_live_item(self, item: object) -> RuntimeUpdate:
         if isinstance(item, FeedStatus):
             return self.runtime.set_feed_status(item)
         if isinstance(item, DataQualityWarning):
             return self.runtime.record_warning(item)
+        self._mark_warm_start(item)
         return self.runtime.process_market_event(cast(MarketEvent, item))
+
+    def _mark_warm_start(self, item: object) -> None:
+        anchor = self._warm_anchor_utc
+        ts = getattr(item, "event_ts_utc", None)
+        if anchor is None or ts is None:
+            return
+        if ts < anchor:
+            self._warm_start_events += 1
+        elif self._warm_start_state != "live":
+            self._warm_start_state = "live"
 
     async def _wait_strategy_core_live(self) -> None:
         core = self.strategy_core_live
@@ -279,12 +338,11 @@ class LiveMarketDataService:
         self._stopped_at_utc = status.stopped_at_utc
         if status.state == CoreLiveState.DISCONNECTED and self._state == LiveState.RUNNING:
             self._state = LiveState.DISCONNECTED
-            # audit #NN-5: deliberately do NOT cancel self._seed_task here. A bare
-            # disconnect does not reset the runtime, so an in-flight warm-up is still
-            # valid for the current generation (the empty-feed-then-seed path relies on
-            # this). The orphaning race is closed instead at restart (start() cancels +
-            # bumps the generation) and by the generation guard in _seed_and_broadcast.
             await self._emit_status(FeedConnectionState.DISCONNECTED, "live feed disconnected")
+            # W2 P1d (D-P-06): reconnect = the same warm-start path. start() resets
+            # the runtime, reloads the prior-day seed, and replays the trading day
+            # from 18:00 ET before resuming real time.
+            self._schedule_reconnect()
         elif status.state == CoreLiveState.FAILED:
             self._state = LiveState.FAILED
             # audit #N6: the migration dropped the old failure logger.error call, so a
@@ -299,46 +357,24 @@ class LiveMarketDataService:
             )
             await self._emit_status(FeedConnectionState.DISCONNECTED, "live feed failed")
 
-    async def _seed_and_broadcast(self, generation: int) -> None:
-        service = self._seed_service
-        if service is None:
+    def _schedule_reconnect(self) -> None:
+        if self._reconnect_task is not None and not self._reconnect_task.done():
             return
+        self._reconnect_task = asyncio.create_task(self._reconnect_after_disconnect())
+
+    async def _reconnect_after_disconnect(self) -> None:
+        await asyncio.sleep(self._reconnect_delay_seconds)
+        if self._state != LiveState.DISCONNECTED:
+            return
+        logger.info("live feed reconnecting from the trading-day start (D-P-06)")
         try:
-            bars = await asyncio.to_thread(service.build_seed_bars)
-        except asyncio.CancelledError:
-            raise
+            await self.start()
         except Exception as exc:
-            logger.warning(
-                "historical warm-up seeding task failed: exception_type=%s", type(exc).__name__
+            logger.error(
+                "live auto-reconnect failed: exception_type=%s message=%s",
+                type(exc).__name__,
+                _redact_configured_secrets(str(exc), self.config.secret_values),
             )
-            bars = ()
-        # audit #NN-5: history fetch above runs off-thread and can outlive its
-        # connection. If a disconnect+restart advanced the generation while we were
-        # fetching, this task belongs to a torn-down runtime; drop the result rather
-        # than seed (possibly stale) bars or warnings into the freshly reset runtime.
-        if generation != self._generation:
-            return
-        if bars:
-            logger.info("historical warm-up seeded %d bars", len(bars))
-            await self._emit(self.runtime.seed_closed_bars(bars))
-            return
-        # Surface (rather than silently swallow) so an empty chart is explained in the UI.
-        logger.warning("historical warm-up produced no seed bars")
-        await self._emit(
-            RuntimeUpdate(
-                warnings=(
-                    DataQualityWarning(
-                        code=DataQualityCode.PROVIDER_ERROR,
-                        message=(
-                            "live warm-up history unavailable; chart starts without prior "
-                            "sessions and will fill as live trades arrive"
-                        ),
-                        severity=DataQualitySeverity.WARNING,
-                        source="seed",
-                    ),
-                )
-            )
-        )
 
     async def _emit_status(self, state: FeedConnectionState, message: str) -> None:
         await self._emit(

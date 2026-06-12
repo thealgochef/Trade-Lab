@@ -103,6 +103,8 @@ def _settings(tmp_path: Path, *, with_token: bool = False) -> Settings:
         "front_month_symbol": "NQ.c.0",
         "models_path": tmp_path,
         "databento_api_key": "super-secret-key",
+        # W2 P2e: keep test journals inside the test tmp dir, never the repo.
+        "journal_path": tmp_path / "journal",
     }
     if with_token:
         kwargs["operator_token"] = _OPERATOR_TOKEN
@@ -193,8 +195,12 @@ def test_activate_broadcasts_model_status_over_websocket(tmp_path: Path) -> None
         activate = client.post("/api/v1/models/activate", json={"model_id": "good-model"})
         assert activate.status_code == 200
 
+        # W2 P2c: a typed model.reset frame precedes the model.status delta.
+        model_reset = json.loads(websocket.receive_bytes())
         model_status = json.loads(websocket.receive_bytes())
 
+    assert model_reset["type"] == "model.reset"
+    assert model_reset["payload"] == {"reason": "activation"}
     assert model_status["version"] == MESSAGE_VERSION
     assert model_status["type"] == "model.status"
     assert model_status["sequence"] > snapshot["sequence"]

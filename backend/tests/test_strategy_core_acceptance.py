@@ -90,10 +90,10 @@ def test_deleted_shadow_engines_stay_deleted_across_backend_src() -> None:
     the kept modules to their DTO/display surface.
 
     Documented carve-outs (deliberate, named in PROGRESS):
-      * ``services/seed.py`` — the vectorized warm-up bar BUILDER stays (display-only
-        context; its Chicago-clock divergence from Strategy-Core's ET sessions is a
-        named debt). It may use ``SessionClassifier``/``make_bar_id`` but never the
-        deleted engines.
+      * ``services/seed.py`` — DELETED in W2 P1e (the Chicago display seed retired;
+        warm-up bars now come from the engine via the live trading-day replay). Its
+        name stays in the subset allowlist below only so the guard reads stably;
+        no surviving file outside ``sessions.py`` touches SessionClassifier.
       * ``services/strategy_core_service.py`` — display-flag re-derivation
         (``is_eligible``/``is_developing`` off Strategy-Core ``available_from``) on
         the DTO seam.

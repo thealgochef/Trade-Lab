@@ -3,6 +3,7 @@
 import hmac
 import ipaddress
 import re
+from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -32,9 +33,9 @@ from trade_lab.services.model_registry import (
     ServingCapabilities,
     is_safe_model_id,
 )
+from trade_lab.services.journal import PredictionJournal
 from trade_lab.services.replay import HistoricalReplayService, ReplayConfig, ReplayState
-from trade_lab.services.runtime import ApplicationRuntime
-from trade_lab.services.seed import HistoricalSeedService
+from trade_lab.services.runtime import ApplicationRuntime, RuntimeUpdate
 
 
 class ReplayStartRequest(BaseModel):
@@ -168,6 +169,9 @@ def _live_status_payload(live: LiveMarketDataService) -> dict[str, object]:
         "stopped_at_utc": None
         if status.stopped_at_utc is None
         else status.stopped_at_utc.isoformat(),
+        # W2 P1b: "warming (N events)" vs "live" for the status surface.
+        "warm_start_state": status.warm_start_state,
+        "warm_start_events": status.warm_start_events,
     }
 
 
@@ -210,7 +214,17 @@ def create_app(
     broadcaster: WebSocketBroadcaster | None = None,
 ) -> FastAPI:
     settings = settings or load_settings()
-    app = FastAPI(title="Trade-Lab Backend", version=__version__)
+
+    # W2 P2a: the lifespan shutdown hook stops an active live feed on process
+    # exit, so the live-stop resolver flush actually runs (F10).
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        yield
+        live_service = getattr(app.state, "live", None)
+        if live_service is not None and _live_is_active(live_service):
+            await live_service.stop()
+
+    app = FastAPI(title="Trade-Lab Backend", version=__version__, lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(settings.allowed_origin_values),
@@ -225,6 +239,8 @@ def create_app(
         observation_duration_seconds=settings.observation_duration_seconds,
         seed_bar_limit_per_timeframe=settings.seed_max_bars_per_timeframe,
         market_context_retention_minutes=settings.market_context_retention_minutes,
+        # W2 P2e (D-P-07): append-only prediction/outcome/drop journaling.
+        journal=PredictionJournal(settings.journal_path),
     )
     # ModelRegistry discovers bundles from the configured models path; the runtime
     # invokes inference on completed observations only once an operator activates a
@@ -273,6 +289,20 @@ def create_app(
             secret_values=_configured_secret_values(settings),
         )
 
+        # W2 P1: one Historical source serves the warm-start FALLBACK (inside the
+        # feed) and the prior-day PDH/PDL seed (inside the live service). D-P-03:
+        # the Historical API exists solely for the live warm-start slice.
+        historical_source = DatabentoHistoricalSource(
+            api_key=(
+                None
+                if settings.databento_api_key is None
+                else settings.databento_api_key.get_secret_value()
+            ),
+            dataset=settings.databento_dataset,
+            requested_symbol=settings.databento_requested_symbol,
+            stype_in=settings.databento_stype_in,
+        )
+
         def live_feed_factory(config: LiveConfig):
             if settings.databento_api_key is None:
                 raise RuntimeError("Databento API key is not configured")
@@ -284,26 +314,17 @@ def create_app(
                 trade_schema=config.trade_schema,
                 quote_schema=config.quote_schema,
                 context_schemas=config.context_schemas,
+                # W2 P1b (D-P-06): replay the current trading day from 18:00 ET
+                # through the same adapter path before flowing into real time.
+                intraday_replay=True,
+                historical_source=historical_source,
             )
 
-        seed_service = HistoricalSeedService(
-            DatabentoHistoricalSource(
-                api_key=(
-                    None
-                    if settings.databento_api_key is None
-                    else settings.databento_api_key.get_secret_value()
-                ),
-                dataset=settings.databento_dataset,
-                requested_symbol=settings.databento_requested_symbol,
-                stype_in=settings.databento_stype_in,
-            ),
-            tick_timeframes=settings.tick_timeframes,
-            lookback_days=settings.seed_lookback_days,
-            max_bars_per_timeframe=settings.seed_max_bars_per_timeframe,
-            enabled=settings.seed_enabled,
-        )
         live = LiveMarketDataService(
-            runtime, live_config, live_feed_factory, seed_service=seed_service
+            runtime,
+            live_config,
+            live_feed_factory,
+            historical_source=historical_source,
         )
     if not live.has_update_callback:
         live.set_update_callback(broadcaster.broadcast_update)
@@ -339,6 +360,8 @@ def create_app(
             "trading_day": None if trading_day is None else trading_day.isoformat(),
             "replay": replay_status,
             "live": _live_status_payload(app.state.live),
+            # W2 P2d: named-feature inference failure visibility.
+            "inference": app.state.runtime.inference_health(),
         }
 
     @app.get("/api/v1/live/status")
@@ -391,31 +414,53 @@ def create_app(
         if not is_safe_model_id(model_id):
             raise HTTPException(status_code=400, detail="invalid model id")
         registry: ModelRegistry = app.state.model_registry
+        runtime: ApplicationRuntime = app.state.runtime
+        # W2 P2b (F12): validation + ActiveModel construction + resolver build all
+        # complete BEFORE the registry swap. Any failure here leaves the previous
+        # model serving, untouched.
         try:
-            registry.activate(model_id)
+            candidate = registry.prepare_activation(model_id)
         except ModelNotFoundError as exc:
             raise HTTPException(status_code=404, detail="unknown model id") from exc
         except ModelValidationError as exc:
             # The message is already path-free/secret-free by ModelRegistry design.
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        # The active contract changed: rebind the engine so prior predictions,
-        # outcomes, and the contract-specific tracker are cleared atomically.
-        app.state.runtime.set_inference_engine(app.state.inference_engine)
-        status = app.state.runtime.model_status()
-        await app.state.broadcaster.broadcast_model_status(status)
-        return model_status_to_dto(status).model_dump(mode="json")
+        try:
+            prepared = runtime.prepare_inference_rebind(app.state.inference_engine, candidate)
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        # W2 P2a: flush the OLD resolver before the swap discards it; the flushed
+        # drops belong to the outgoing bundle and broadcast after the commit.
+        flush_update = runtime.flush_resolver()
+        # The swap + engine rebind happen together with NO awaits between them, so
+        # the event loop can never observe a torn (registry, resolver) pair.
+        registry.commit_activation(candidate)
+        runtime.commit_inference_rebind(prepared)
+        if flush_update.has_deltas():
+            await app.state.broadcaster.broadcast_update(flush_update)
+        # W2 P2c: typed reset frame — clients clear prediction/outcome panes. The
+        # broadcaster appends the changed model.status delta to the same update.
+        await app.state.broadcaster.broadcast_update(
+            RuntimeUpdate(model_reset_reason="activation")
+        )
+        return model_status_to_dto(runtime.model_status()).model_dump(mode="json")
 
     @app.post("/api/v1/models/deactivate")
     async def deactivate_model(request: Request) -> dict[str, object]:
         _authorize_live_control(request, settings)
         registry: ModelRegistry = app.state.model_registry
+        runtime: ApplicationRuntime = app.state.runtime
+        prepared = runtime.prepare_inference_rebind(app.state.inference_engine, None)
+        flush_update = runtime.flush_resolver()
+        # Swap + rebind together, no awaits between (mirrors activate).
         registry.deactivate()
-        # Rebind so prediction/outcome/tracker state is dropped; market data keeps
-        # flowing with no model active.
-        app.state.runtime.set_inference_engine(app.state.inference_engine)
-        status = app.state.runtime.model_status()
-        await app.state.broadcaster.broadcast_model_status(status)
-        return model_status_to_dto(status).model_dump(mode="json")
+        runtime.commit_inference_rebind(prepared)
+        if flush_update.has_deltas():
+            await app.state.broadcaster.broadcast_update(flush_update)
+        await app.state.broadcaster.broadcast_update(
+            RuntimeUpdate(model_reset_reason="activation")
+        )
+        return model_status_to_dto(runtime.model_status()).model_dump(mode="json")
 
     @app.get("/api/v1/replay/status")
     async def replay_status() -> dict[str, object]:

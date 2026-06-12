@@ -1318,3 +1318,30 @@ def test_sdk_missing_path_is_actionable(monkeypatch: pytest.MonkeyPatch) -> None
             requested_symbol="NQ.c.0",
             dataset="GLBX.MDP3",
         )
+
+
+def test_integer_ns_timestamp_decode_has_no_float_precision_loss() -> None:
+    # W2 P1a: 1_770_000_000_123_456_789 ns flips its microsecond on the float
+    # fromtimestamp route (123457) vs the floor-µs integer path (123456).
+    event = normalize_provider_message(
+        {"ts_event": 1_770_000_000_123_456_789, "price": 20_000.25, "size": 1},
+        requested_symbol="NQ.c.0",
+        schema="trades",
+    )
+    assert event.event_ts_utc == datetime(2026, 2, 2, 2, 40, 0, 123456, tzinfo=UTC)
+
+
+def test_databento_side_a_maps_to_sell_aggressor() -> None:
+    # W2: 'A' (ask aggressor) = SELL per the W1-ratified canonical mapping;
+    # it previously fell through to UNKNOWN on the live path.
+    base = {"ts_event": 1_770_000_000_000_000_000, "price": 20_000.25, "size": 1}
+    sides = {
+        "A": "sell",
+        "B": "buy",
+        "N": "unknown",
+    }
+    for code, expected in sides.items():
+        event = normalize_provider_message(
+            {**base, "side": code}, requested_symbol="NQ.c.0", schema="trades"
+        )
+        assert event.side.value == expected, code

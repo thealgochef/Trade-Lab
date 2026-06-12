@@ -63,12 +63,14 @@ class Settings(BaseSettings):
     # cover approach + interaction + margin (default 30 + 5 + 10 = 45 minutes).
     market_context_retention_minutes: int = Field(default=45, ge=45, le=240)
 
-    # Live warm-up: on live start, pre-fill the chart with the last N completed sessions
-    # of front-month tick bars fetched from the Databento Historical API (L0/L1 only, to
-    # match what live streaming provides). Bounded per timeframe to cap snapshot size.
-    seed_enabled: bool = True
-    seed_lookback_days: int = Field(default=3, ge=1, le=30)
+    # Per-timeframe cap on warm-up bars retained by the runtime snapshot buffer.
+    # (W2 P1e: the Chicago display-seed service retired; display warm-up now comes
+    # from real engine bars produced by the live warm-start replay.)
     seed_max_bars_per_timeframe: int = Field(default=2500, ge=1, le=20_000)
+
+    # W2 P2e (D-P-07): append-only prediction journal directory; one JSONL file
+    # per trading day (18:00 ET roll). Write-only this window; W3's soak reads it.
+    journal_path: Path = Field(default=_BACKEND_ENV_FILE.parent / "data" / "journal")
 
     _ALLOWED_DATASETS: ClassVar[set[str]] = {"GLBX.MDP3"}
     _ALLOWED_STYPE_IN: ClassVar[set[str]] = {"raw_symbol", "continuous", "instrument_id", "parent"}

@@ -2,9 +2,10 @@
 
 The local candle-engine shadow implementation was deleted in D2: authoritative
 live/replay bars are produced by Strategy-Core's streaming engine and mapped into
-these compatibility types at the adapter seam (``strategy_core_service``). The
-only TL-local bar CONSTRUCTION left in production is the seed warm-up builder
-(``services/seed.py`` — display-only, documented carve-out in the acceptance guard).
+these compatibility types at the adapter seam (``strategy_core_service``). W2 P1e
+retired the last TL-local bar construction (the ``services/seed.py`` Chicago
+display seed) — live warm-up bars now come from the engine via the trading-day
+replay, so NO local bar building remains in production.
 """
 
 from dataclasses import dataclass

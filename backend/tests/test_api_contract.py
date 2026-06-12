@@ -192,7 +192,10 @@ def test_status_includes_runtime_fields_and_supported_timeframes_without_secrets
             "last_error": None,
             "started_at_utc": None,
             "stopped_at_utc": None,
+            "warm_start_state": None,
+            "warm_start_events": 0,
         },
+        "inference": {"error_count": 0, "last_error": None},
     }
     _assert_no_secret_text(payload)
 

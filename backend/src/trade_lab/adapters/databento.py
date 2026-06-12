@@ -8,13 +8,14 @@ to Databento; ``start()`` is called only by the opt-in live controller.
 """
 
 import asyncio
+import heapq
 import importlib.util
 import logging
 import re
-from collections.abc import AsyncIterator, Callable
-from datetime import UTC, datetime
+from collections.abc import AsyncIterator, Callable, Iterable
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from trade_lab.domain.data_quality import (
     DataQualityCode,
@@ -33,6 +34,10 @@ from trade_lab.domain.events import (
 )
 from trade_lab.domain.feed import FeedConnectionState, FeedStatus
 from trade_lab.domain.prices import NQ_TICK_SIZE, price_to_ticks
+from trade_lab.domain.trading_day import most_recent_session_open_utc
+
+if TYPE_CHECKING:
+    from trade_lab.adapters.databento_historical import DatabentoHistoricalSource
 
 
 class DatabentoUnavailableError(RuntimeError):
@@ -102,13 +107,31 @@ class _DatabentoSdkFacade:
         client.add_callback(callback)
 
     def subscribe(
-        self, client: Any, *, dataset: str, schema: str, symbol: str, stype_in: str
+        self,
+        client: Any,
+        *,
+        dataset: str,
+        schema: str,
+        symbol: str,
+        stype_in: str,
+        start: datetime | None = None,
     ) -> None:
         if not hasattr(client, "subscribe"):
             raise DatabentoUnavailableError(
                 "Databento Live client does not expose subscribe. Upgrade the databento SDK."
             )
-        client.subscribe(dataset=dataset, schema=schema, symbols=[symbol], stype_in=stype_in)
+        # W2 P1b: ``start`` engages the gateway's intraday replay (warm start). It is
+        # only forwarded when set so fakes/older clients keep the narrow signature.
+        if start is None:
+            client.subscribe(dataset=dataset, schema=schema, symbols=[symbol], stype_in=stype_in)
+        else:
+            client.subscribe(
+                dataset=dataset,
+                schema=schema,
+                symbols=[symbol],
+                stype_in=stype_in,
+                start=start,
+            )
 
     def start(self, client: Any) -> None:
         if hasattr(client, "start"):
@@ -143,6 +166,9 @@ class DatabentoMarketDataFeed:
         queue_maxsize: int = 10_000,
         sdk_module: Any | None = None,
         sdk_facade: _DatabentoSdkFacade | None = None,
+        intraday_replay: bool = False,
+        historical_source: "DatabentoHistoricalSource | None" = None,
+        now_provider: Callable[[], datetime] | None = None,
     ) -> None:
         if not api_key:
             raise ValueError("Databento API key must be configured in backend environment")
@@ -171,16 +197,51 @@ class DatabentoMarketDataFeed:
         self._queue: asyncio.Queue[_QueuedProviderMessage] = asyncio.Queue(maxsize=queue_maxsize)
         self._overflow_count = 0
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._intraday_replay = intraday_replay
+        self._historical_source = historical_source
+        self._now = now_provider or (lambda: datetime.now(UTC))
+        # W2 P1b FALLBACK: per-schema historical record streams staged by start()
+        # when the gateway rejects the replay-start subscribe; drained by events()
+        # BEFORE the live subscription so the queue can never overflow on history.
+        self._warm_start_streams: tuple[tuple[str, Iterable[Any]], ...] | None = None
 
     async def start(self) -> None:
         if self._started:
             return
+        self._warm_start_streams = None
+        if self._intraday_replay:
+            replay_start = most_recent_session_open_utc(self._now())
+            try:
+                self._connect(replay_start=replay_start)
+                self._started = True
+                return
+            except Exception as exc:
+                # W2 P1b: the gateway/entitlement rejected the replay-start subscribe
+                # at runtime — fall back to the Historical API for the same window.
+                logger.warning(
+                    "Databento live replay-start subscribe was rejected "
+                    "(exception_type=%s); falling back to the Historical API warm start",
+                    type(exc).__name__,
+                )
+                self._teardown_client()
+                self._warm_start_streams = await self._fetch_warm_start_streams(replay_start)
+                if self._warm_start_streams is not None:
+                    # The live subscribe happens in events() AFTER the historical
+                    # records drain, so warm-start can never overflow the live queue.
+                    self._loop = asyncio.get_running_loop()
+                    self._started = True
+                    return
+        self._connect(replay_start=None)
+        self._started = True
+
+    def _connect(self, *, replay_start: datetime | None) -> None:
         client: Any = None
         try:
             client = self._sdk_facade.create_live_client(self._api_key)
             self._client = client
             self._loop = asyncio.get_running_loop()
             self._sdk_facade.add_callback(client, self._provider_callback)
+            replayable = {self.trade_schema.lower(), self.quote_schema.lower()}
             for schema in _unique_schemas(
                 (self.trade_schema, self.quote_schema, *self.context_schemas)
             ):
@@ -190,9 +251,9 @@ class DatabentoMarketDataFeed:
                     schema=schema,
                     symbol=self.requested_symbol,
                     stype_in=self.stype_in,
+                    start=replay_start if schema in replayable else None,
                 )
             self._sdk_facade.start(client)
-            self._started = True
         except Exception:
             if client is not None:
                 try:
@@ -206,6 +267,46 @@ class DatabentoMarketDataFeed:
             self._loop = None
             self._started = False
             raise
+
+    def _teardown_client(self) -> None:
+        if self._client is not None:
+            try:
+                self._sdk_facade.stop(self._client)
+            except Exception as stop_exc:  # pragma: no cover - defensive logging
+                logger.warning(
+                    "Databento client cleanup after rejected replay-start raised: "
+                    "exception_type=%s",
+                    type(stop_exc).__name__,
+                )
+        self._client = None
+        self._loop = None
+
+    async def _fetch_warm_start_streams(
+        self, replay_start: datetime
+    ) -> tuple[tuple[str, Iterable[Any]], ...] | None:
+        source = self._historical_source
+        if source is None or not source.available:
+            logger.warning(
+                "Databento warm-start fallback unavailable: Historical API access is "
+                "not configured; subscribing live without intraday history"
+            )
+            return None
+        try:
+            return await asyncio.to_thread(
+                source.dbn_record_streams,
+                start=replay_start,
+                end=self._now(),
+                schemas=(self.trade_schema, self.quote_schema),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Databento warm-start fallback fetch failed (exception_type=%s); "
+                "subscribing live without intraday history",
+                type(exc).__name__,
+            )
+            return None
 
     async def stop(self) -> None:
         self._started = False
@@ -229,6 +330,16 @@ class DatabentoMarketDataFeed:
             last_message="Databento live adapter consuming provider callback queue.",
             metadata={"schemas": list(_unique_schemas(self._schemas))},
         )
+        warm_streams = self._warm_start_streams
+        self._warm_start_streams = None
+        if warm_streams is not None:
+            async for item in self._drain_warm_start_streams(warm_streams):
+                yield item
+            if not self._started:
+                return
+            # Spec order: fetch -> feed -> subscribe live from now. A subscribe
+            # failure here propagates and surfaces as a live-feed failure.
+            self._connect(replay_start=None)
         while self._started or not self._queue.empty():
             await asyncio.sleep(0)
             warning = self._take_overflow_warning()
@@ -267,6 +378,41 @@ class DatabentoMarketDataFeed:
                     schema=schema,
                     detail=_redact(str(exc), (self._api_key,)),
                 )
+
+    async def _drain_warm_start_streams(
+        self, streams: tuple[tuple[str, Iterable[Any]], ...]
+    ) -> AsyncIterator[MarketEvent | DataQualityWarning]:
+        """Yield normalized historical records (merged by ``ts_event``) for warm start.
+
+        Records flow through the SAME ``normalize_provider_message`` path live
+        records take, so warm-start events cannot diverge from live ones. The loop
+        yields control periodically so a long intraday drain never starves the loop.
+        """
+
+        merged = heapq.merge(
+            *(_tag_records(schema, records) for schema, records in streams),
+            key=lambda item: _record_ts_event(item[1]),
+        )
+        count = 0
+        for schema, record in merged:
+            if not self._started:
+                return
+            normalized_schema = _normalize_provider_schema(schema, self.quote_schema) or schema
+            try:
+                yield normalize_provider_message(
+                    record, requested_symbol=self.requested_symbol, schema=normalized_schema
+                )
+            except Exception as exc:
+                yield _warning(
+                    _code_for_normalization_error(exc),
+                    "Databento warm-start record could not be normalized safely",
+                    schema=_safe_provider_schema(normalized_schema),
+                    detail=_redact(str(exc), (self._api_key,)),
+                )
+            count += 1
+            if count % 500 == 0:
+                await asyncio.sleep(0)
+        logger.info("Databento warm-start fallback replayed %d historical records", count)
 
     @property
     def _schemas(self) -> tuple[str, ...]:
@@ -417,6 +563,26 @@ def _top_of_book_source(message: Any) -> Any:
         return message
 
 
+def _tag_records(schema: str, records: Iterable[Any]) -> Iterable[tuple[str, Any]]:
+    # A real function (not a genexp) so each stream binds ITS schema eagerly.
+    for record in records:
+        yield (schema, record)
+
+
+_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _record_ts_event(record: Any) -> int:
+    value = getattr(record, "ts_event", None)
+    if value is None:
+        header = getattr(record, "hdr", None)
+        value = getattr(header, "ts_event", 0)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _timestamp(message: Any) -> datetime:
     value = _get(message, "event_ts_utc", "ts_event", "timestamp")
     if value is None:
@@ -424,7 +590,10 @@ def _timestamp(message: Any) -> datetime:
     if isinstance(value, datetime):
         return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
     if isinstance(value, int):
-        return datetime.fromtimestamp(value / 1_000_000_000, UTC)
+        # W2 P1a: ns since epoch decoded on the floor-µs INTEGER path. The float
+        # fromtimestamp(ns / 1e9) route loses sub-µs precision near the float53
+        # boundary and is deleted (same recipe as Strategy-Core's decoders).
+        return _EPOCH_UTC + timedelta(microseconds=value // 1_000)
     text = str(value).replace("Z", "+00:00")
     return datetime.fromisoformat(text).astimezone(UTC)
 
@@ -508,10 +677,14 @@ def _pretty_price_value(message: Any, *names: str) -> Any:
 
 
 def _side(message: Any) -> TradeSide:
+    # W2: Databento's single-letter aggressor codes are 'B' (bid aggressor = buy)
+    # and 'A' (ask aggressor = SELL) — the canonical mapping Strategy-Core's W1
+    # parquet shim ratified. 'A' previously fell through to UNKNOWN here, starving
+    # side-aware order-flow features of every sell print on the live path.
     value = (_optional_str(message, "side", "aggressor_side") or "unknown").lower()
     if value in {"buy", "b", "ask"}:
         return TradeSide.BUY
-    if value in {"sell", "s", "bid"}:
+    if value in {"sell", "s", "a", "bid"}:
         return TradeSide.SELL
     return TradeSide.UNKNOWN
 
