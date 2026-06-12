@@ -10,6 +10,8 @@ on:
     branches: [main, platform-refactor]
   pull_request:
     branches: [main]
+  # W2 P4b (A157): manual runs for greenlight witnessing without a push.
+  workflow_dispatch:
 
 concurrency:
   group: backend-ci-${{ github.ref }}
