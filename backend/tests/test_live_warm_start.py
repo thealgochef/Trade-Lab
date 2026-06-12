@@ -153,11 +153,13 @@ def _historical_records(
     )
 
 
-def test_rejected_replay_start_falls_back_to_historical_records_then_live() -> None:
-    asyncio.run(_run_fallback_warm_start())
+def test_rejected_replay_start_falls_back_to_historical_records_then_live(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    asyncio.run(_run_fallback_warm_start(caplog))
 
 
-async def _run_fallback_warm_start() -> None:
+async def _run_fallback_warm_start(caplog: pytest.LogCaptureFixture) -> None:
     sdk = _FakeSdk(reject_replay_start=True)
     fetch_calls: list[tuple[str, datetime, datetime]] = []
     feed = _feed(sdk, intraday_replay=True, historical_source=_historical_records(fetch_calls))
@@ -178,12 +180,13 @@ async def _run_fallback_warm_start() -> None:
             events.append(item)
 
     task = asyncio.create_task(consume())
-    for _ in range(300):
-        if len(sdk.clients) == 2:
-            break
-        await asyncio.sleep(0.01)
-    await feed.stop()
-    await task
+    with caplog.at_level("WARNING"):
+        for _ in range(300):
+            if len(sdk.clients) == 2:
+                break
+            await asyncio.sleep(0.01)
+        await feed.stop()
+        await task
 
     # ts_event-merged order: trade, quote, trade — through the SAME normalize path.
     assert isinstance(events[1], TradeEvent)
@@ -197,6 +200,18 @@ async def _run_fallback_warm_start() -> None:
     live_client = sdk.clients[1]
     assert all(sub.get("start") is None for sub in live_client.subscriptions)
     assert live_client.started is True
+    # W2-FIX F2: the seam between the fallback slice's (clamped) end and the
+    # live subscribe instant is logged. With the injected fetcher and a fixed
+    # clock the slice end equals now, so the gap is 0.0 s.
+    seam_logs = [
+        record.message
+        for record in caplog.records
+        if "warm-start fallback slice ends" in record.message
+    ]
+    assert seam_logs == [
+        "warm-start fallback slice ends 0.0 s before live subscribe "
+        "(historical availability lag)"
+    ]
 
 
 def _ohlcv_source(calls: list[tuple[datetime, datetime]]) -> DatabentoHistoricalSource:

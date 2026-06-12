@@ -308,6 +308,20 @@ class DatabentoMarketDataFeed:
             )
             return None
 
+    def _log_warm_start_seam_gap(self) -> None:
+        # W2-FIX F2: the Historical slice's end is clamped to the dataset's
+        # available end, which lags real time by minutes — the bars between that
+        # clamp and the live subscribe are never seen. Make the gap visible.
+        slice_end = getattr(self._historical_source, "last_stream_end", None)
+        if slice_end is None:
+            return
+        gap_seconds = (self._now() - slice_end).total_seconds()
+        logger.warning(
+            "warm-start fallback slice ends %.1f s before live subscribe "
+            "(historical availability lag)",
+            gap_seconds,
+        )
+
     async def stop(self) -> None:
         self._started = False
         loop = self._loop
@@ -337,6 +351,7 @@ class DatabentoMarketDataFeed:
                 yield item
             if not self._started:
                 return
+            self._log_warm_start_seam_gap()
             # Spec order: fetch -> feed -> subscribe live from now. A subscribe
             # failure here propagates and surfaces as a live-feed failure.
             self._connect(replay_start=None)
@@ -681,10 +696,12 @@ def _side(message: Any) -> TradeSide:
     # and 'A' (ask aggressor = SELL) — the canonical mapping Strategy-Core's W1
     # parquet shim ratified. 'A' previously fell through to UNKNOWN here, starving
     # side-aware order-flow features of every sell print on the live path.
+    # Databento emits single-letter codes only; the words "ask"/"bid" are not
+    # provider values and contradicted the letter canon, so they map to UNKNOWN.
     value = (_optional_str(message, "side", "aggressor_side") or "unknown").lower()
-    if value in {"buy", "b", "ask"}:
+    if value in {"buy", "b"}:
         return TradeSide.BUY
-    if value in {"sell", "s", "a", "bid"}:
+    if value in {"sell", "s", "a"}:
         return TradeSide.SELL
     return TradeSide.UNKNOWN
 

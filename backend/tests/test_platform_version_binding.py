@@ -212,18 +212,21 @@ def test_metadata_mismatch_rejected_at_activation(tmp_path: Path) -> None:
         ModelRegistry(tmp_path).activate("bundle-x")
 
 
-def test_missing_checksum_sidecar_warns_at_activation(
+def test_missing_checksum_sidecar_logs_debug_at_activation(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # E3 ledger (b): an absent sidecar surfaces a warning instead of a silent
-    # skip. The stub binary then fails the CatBoost load — asserting AFTER the
-    # checksum step proves the warning fired on the real activation path.
+    # W2-FIX F3 (D-P-01): an absent sidecar is recorded at DEBUG only — pre-W2
+    # bundles carry no sidecar and must stay activatable without alarm noise.
+    # The stub binary then fails the CatBoost load — asserting AFTER the
+    # checksum step proves the log fired on the real activation path.
     payload = _load_real_payload()
     _write_bundle_dir(tmp_path, "bundle-x", payload)  # no model.cbm.sha256 written
 
     with (
-        caplog.at_level(logging.WARNING),
+        caplog.at_level(logging.DEBUG),
         pytest.raises(ModelValidationError, match="loadable CatBoost"),
     ):
         ModelRegistry(tmp_path).activate("bundle-x")
-    assert any("no model.cbm.sha256 sidecar" in r.getMessage() for r in caplog.records)
+    sidecar_records = [r for r in caplog.records if "no model.cbm.sha256 sidecar" in r.getMessage()]
+    assert sidecar_records, "absent-sidecar log line did not fire"
+    assert all(r.levelno == logging.DEBUG for r in sidecar_records)

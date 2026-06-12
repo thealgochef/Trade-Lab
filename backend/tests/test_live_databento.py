@@ -1339,6 +1339,10 @@ def test_databento_side_a_maps_to_sell_aggressor() -> None:
         "A": "sell",
         "B": "buy",
         "N": "unknown",
+        # W2-FIX F1: Databento emits single-letter codes only — the word
+        # tolerances ("ask"→BUY contradicted 'A'=sell) are gone.
+        "ask": "unknown",
+        "bid": "unknown",
     }
     for code, expected in sides.items():
         event = normalize_provider_message(

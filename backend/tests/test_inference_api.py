@@ -9,6 +9,7 @@ it. No model/prediction payload may leak a filesystem path or secret.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -254,6 +255,52 @@ def test_activate_invalid_bundle_is_409_with_safe_message(tmp_path: Path) -> Non
     assert client.get("/api/v1/models/active").json()["loaded"] is False
     _assert_no_secret_text(response.json())
     _assert_no_temp_path(response.json(), tmp_path)
+
+
+def test_tampered_model_with_stale_sidecar_is_409_and_prior_stays_active(
+    tmp_path: Path,
+) -> None:
+    # W2-FIX F3: a model.cbm modified AFTER its sha256 sidecar was written must
+    # 409 at activation (the checksum gate fires before any model bytes are
+    # loaded) and leave the prior model serving. The detail names the bundle
+    # but never a path.
+    _write_bundle(tmp_path, "good-model", _train_model(_CONTRACT_FEATURES))
+    tampered_dir = _write_bundle(tmp_path, "tampered-model", _train_model(_CONTRACT_FEATURES))
+    model_path = tampered_dir / "model.cbm"
+    (tampered_dir / "model.cbm.sha256").write_text(
+        hashlib.sha256(model_path.read_bytes()).hexdigest(), encoding="utf-8"
+    )
+    tampered = bytearray(model_path.read_bytes())
+    tampered[-1] ^= 0xFF  # flip one byte: the sidecar is now stale
+    model_path.write_bytes(bytes(tampered))
+    client = TestClient(create_app(_settings(tmp_path)))
+
+    assert (
+        client.post("/api/v1/models/activate", json={"model_id": "good-model"}).status_code == 200
+    )
+
+    response = client.post("/api/v1/models/activate", json={"model_id": "tampered-model"})
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert "checksum" in detail
+    assert "tampered-model" in detail  # names the bundle (path-free)
+    _assert_no_secret_text(response.json())
+    _assert_no_temp_path(response.json(), tmp_path)
+
+    active = client.get("/api/v1/models/active").json()
+    assert active["loaded"] is True
+    assert active["model_id"] == "good-model"
+
+
+def test_bundle_without_sha256_sidecar_activates_normally(tmp_path: Path) -> None:
+    # W2-FIX F3 (D-P-01): pre-W2 bundles carry no sidecar and stay activatable.
+    client = _good_bundle_app(tmp_path)  # _write_bundle writes no sidecar
+
+    response = client.post("/api/v1/models/activate", json={"model_id": "good-model"})
+
+    assert response.status_code == 200
+    assert client.get("/api/v1/models/active").json()["model_id"] == "good-model"
 
 
 # --------------------------------------------------------------------------- #

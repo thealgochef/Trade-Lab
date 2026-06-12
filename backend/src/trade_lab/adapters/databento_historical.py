@@ -52,6 +52,10 @@ class DatabentoHistoricalSource:
         self._stype_in = stype_in
         self._record_fetcher = record_fetcher
         self._ohlcv_fetcher = ohlcv_fetcher
+        # The effective (availability-clamped) end of the last record-stream
+        # fetch — the live adapter logs the seam gap between it and the live
+        # subscribe instant (W2-FIX F2).
+        self.last_stream_end: datetime | None = None
 
     @property
     def available(self) -> bool:
@@ -67,11 +71,13 @@ class DatabentoHistoricalSource:
         """Per-schema DBN record streams over ``[start, end)`` for warm start."""
 
         if self._record_fetcher is not None:
+            self.last_stream_end = end
             return tuple((schema, self._record_fetcher(schema, start, end)) for schema in schemas)
         client = self._client()
         # Historical data lags real time by minutes; an unclamped end (≈ now)
         # triggers a 422 data_end_after_available_end error.
         end = self._clamp_end_to_available(client, end, schemas[0])
+        self.last_stream_end = end
         if end <= start:
             return tuple((schema, ()) for schema in schemas)
         return tuple(

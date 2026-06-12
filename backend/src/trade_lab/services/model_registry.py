@@ -540,10 +540,11 @@ class ModelRegistry:
     def _verify_checksum(directory: Path, model_file: Path) -> None:
         checksum_file = directory / CHECKSUM_FILE
         if not checksum_file.is_file():
-            # E3 ledger (b): an absent sidecar no longer skips SILENTLY — the gap
-            # is surfaced (path-free) so an unverified binary is a visible fact.
-            logger.warning(
-                "model bundle has no %s sidecar; binary integrity not verified",
+            # W2-FIX F3 (D-P-01): pre-W2 bundles carry no sidecar and stay
+            # activatable — the gap is recorded at debug only, not warning.
+            logger.debug(
+                "model bundle %s has no %s sidecar; binary integrity not verified",
+                directory.name,
                 CHECKSUM_FILE,
             )
             return
@@ -559,7 +560,11 @@ class ModelRegistry:
         except OSError as exc:
             raise ModelValidationError("model file is unreadable") from exc
         if digest.hexdigest().lower() != declared:
-            raise ModelValidationError("model file checksum does not match the sidecar .sha256")
+            # Name the bundle (directory.name == model_id) but never a path.
+            raise ModelValidationError(
+                f"model file checksum does not match the sidecar .sha256 "
+                f"for bundle {directory.name!r}"
+            )
 
     @staticmethod
     def _load_catboost(model_file: Path) -> CatBoostClassifier:
