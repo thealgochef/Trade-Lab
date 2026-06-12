@@ -181,7 +181,10 @@ def test_flush_resolver_serves_and_journals_flushed_drops(tmp_path: Path) -> Non
 def test_flush_resolver_without_timestamp_or_resolver_is_a_noop() -> None:
     runtime = _runtime()
     assert runtime.flush_resolver().has_deltas() is False  # no resolver
-    runtime._honest_resolver = SimpleNamespace(flush=lambda ts: (_ for _ in ()).throw(AssertionError))
+    def _explode(_ts):
+        raise AssertionError("flush must not run without a timestamp")
+
+    runtime._honest_resolver = SimpleNamespace(flush=_explode)
     assert runtime.flush_resolver().has_deltas() is False  # no timestamp known
 
 
@@ -281,7 +284,9 @@ def test_model_reset_frame_leads_the_update_messages() -> None:
 
 def test_runtime_reset_carries_the_reset_reason() -> None:
     runtime = _runtime()
-    update = runtime.reset(feed_message="runtime reset for live market data", reset_reason="live_reset")
+    update = runtime.reset(
+        feed_message="runtime reset for live market data", reset_reason="live_reset"
+    )
     assert update.model_reset_reason == "live_reset"
     assert runtime.reset().model_reset_reason is None
 

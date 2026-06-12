@@ -25,6 +25,7 @@ from trade_lab.config import Settings, load_settings
 from trade_lab.services.broadcaster import WebSocketBroadcaster
 from trade_lab.services.inference.features import DEFAULT_FEATURE_REGISTRY
 from trade_lab.services.inference.inference_engine import InferenceEngine
+from trade_lab.services.journal import PredictionJournal
 from trade_lab.services.live import LiveConfig, LiveMarketDataService, LiveState
 from trade_lab.services.model_registry import (
     ModelNotFoundError,
@@ -33,7 +34,6 @@ from trade_lab.services.model_registry import (
     ServingCapabilities,
     is_safe_model_id,
 )
-from trade_lab.services.journal import PredictionJournal
 from trade_lab.services.replay import HistoricalReplayService, ReplayConfig, ReplayState
 from trade_lab.services.runtime import ApplicationRuntime, RuntimeUpdate
 
