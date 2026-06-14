@@ -38,17 +38,38 @@ from w3b.window import resolve_window  # noqa: E402
 _DEFAULT_JOURNAL_BASE = Path(__file__).resolve().parents[2] / "data" / "w3b_journal"
 
 
-def _diff_one_day(date_str: str, journal_base_str: str, score: bool) -> DayDiff:
-    """Worker: replay one day -> journal, diff vs cache. Picklable, spawn-safe."""
+def _process_day(
+    date_str: str, journal_base: Path, window, *, score: bool, resume: bool
+) -> DayDiff:
+    """Replay one day -> journal, then diff vs the QL cache.
 
-    # Heavy imports inside the worker so spawned children don't pay them at import.
+    Resumable: if a COMPLETE journal already exists (a prior run finished this day)
+    re-diff it in place — fast, no replay — and accept it when green. A missing or
+    incomplete (non-green) journal triggers a fresh replay. Thin days (no journal
+    records) always replay, since 0==0 must be observed, not assumed.
+    """
+
     from w3b.headless_replay import replay_day_to_journal
 
-    window = resolve_window()
-    journal_dir = Path(journal_base_str) / date_str
-    replay_day_to_journal(date_str, journal_dir=journal_dir, window=window)
+    journal_dir = journal_base / date_str
+    jpath = journal_dir / f"{date_str}.jsonl"
     scorer = OfflineScorer.for_bundle(window) if score else None
-    return diff_day(date_str, journal_dir / f"{date_str}.jsonl", window=window, scorer=scorer)
+    if resume and jpath.exists():
+        diff = diff_day(date_str, jpath, window=window, scorer=scorer)
+        if diff.green:
+            return diff
+    replay_day_to_journal(date_str, journal_dir=journal_dir, window=window)
+    return diff_day(date_str, jpath, window=window, scorer=scorer)
+
+
+def _process_day_worker(
+    date_str: str, journal_base_str: str, score: bool, resume: bool
+) -> DayDiff:
+    """Pool worker (spawn-safe): resolves the memoized window per process."""
+
+    return _process_day(
+        date_str, Path(journal_base_str), resolve_window(), score=score, resume=resume
+    )
 
 
 def run_window(
@@ -57,6 +78,7 @@ def run_window(
     journal_base: Path = _DEFAULT_JOURNAL_BASE,
     workers: int = 1,
     score: bool = True,
+    resume: bool = True,
 ) -> list[DayDiff]:
     window = resolve_window()
     targets = days or list(window.window_dates)
@@ -64,24 +86,23 @@ def run_window(
     results: list[DayDiff] = []
 
     if workers <= 1:
-        scorer = OfflineScorer.for_bundle(window) if score else None
         for i, day in enumerate(targets, 1):
             t0 = time.perf_counter()
             try:
-                from w3b.headless_replay import replay_day_to_journal
-
-                journal_dir = journal_base / day
-                replay_day_to_journal(day, journal_dir=journal_dir, window=window)
-                diff = diff_day(day, journal_dir / f"{day}.jsonl", window=window, scorer=scorer)
+                diff = _process_day(day, journal_base, window, score=score, resume=resume)
             except Exception as exc:  # one bad day must not kill a multi-hour run
                 diff = _failed_diff(day, exc)
             results.append(diff)
             elapsed = time.perf_counter() - t0
             print(f"[{i}/{len(targets)} {elapsed:.0f}s] {diff.summary()}", flush=True)
     else:
-        with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=4) as ex:
+        # No max_tasks_per_child: a synchronized recycle spikes memory (all workers
+        # respawn at once) and killed the first full run at day 16. Resume-by-journal
+        # makes any death recoverable, so workers run for the pool's lifetime instead.
+        with ProcessPoolExecutor(max_workers=workers) as ex:
             futs = {
-                ex.submit(_diff_one_day, day, str(journal_base), score): day for day in targets
+                ex.submit(_process_day_worker, day, str(journal_base), score, resume): day
+                for day in targets
             }
             for done, fut in enumerate(as_completed(futs), 1):
                 day = futs[fut]
@@ -182,6 +203,11 @@ def _main() -> int:
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--journal-base", type=Path, default=_DEFAULT_JOURNAL_BASE)
     parser.add_argument("--no-score", action="store_true", help="skip P2 offline scoring")
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="re-replay every day even if a complete journal already exists",
+    )
     parser.add_argument("--report-out", type=Path, default=None)
     args = parser.parse_args()
 
@@ -196,7 +222,11 @@ def _main() -> int:
 
     t0 = time.perf_counter()
     results = run_window(
-        days, journal_base=args.journal_base, workers=args.workers, score=not args.no_score
+        days,
+        journal_base=args.journal_base,
+        workers=args.workers,
+        score=not args.no_score,
+        resume=not args.no_resume,
     )
     text, green = report(results, window)
     text += f"\nwall: {(time.perf_counter()-t0)/60:.1f} min  (pid {os.getpid()})"
