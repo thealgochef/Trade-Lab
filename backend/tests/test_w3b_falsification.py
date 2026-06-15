@@ -118,9 +118,14 @@ def _serving_day(survivors, drops=()) -> ServingDay:
     )
 
 
-def _diff(training, serving):
+def _diff(training, serving, serving_only_counter=None):
     return diff_touch_sets(
-        "2026-02-13", training, serving, cache_present=True, scorer=_StubScorer(_BASE_PROBA)
+        "2026-02-13",
+        training,
+        serving,
+        cache_present=True,
+        scorer=_StubScorer(_BASE_PROBA),
+        serving_only_counter=serving_only_counter,
     )
 
 
@@ -203,6 +208,48 @@ def test_added_touch_red():
     assert not diff.green
     assert diff.unmatched_serving == ["pdh|short"]
     assert not diff.unmatched_training
+
+
+# ── Finding-1: serving-only reconciliation via injected interaction-trade count ──
+def _extra_serving_only():
+    """A serving survivor with no matching training row (a serving-only key)."""
+    return replace(
+        _serving_touch(),
+        prediction_id="pid-2",
+        touch_id="touch-2",
+        level_kind="pdh",
+        direction="short",
+    )
+
+
+def test_serving_only_under_5_trades_reconciles_green():
+    # QL would have dropped this touch (<5 interaction trades) -> no cache row is
+    # EXPECTED. The injected counter returns 3; the day stays GREEN.
+    extra = _extra_serving_only()
+    diff = _diff(
+        [_training()],
+        _serving_day([_serving_touch(), extra]),
+        serving_only_counter=lambda s: 3,
+    )
+    assert diff.green, diff.summary()
+    assert diff.unmatched_serving == []
+    assert len(diff.reconciled_serving_only) == 1
+    assert diff.reconciled_serving_only[0].startswith("pdh|short")
+    assert "interaction_trades=3" in diff.reconciled_serving_only[0]
+
+
+def test_serving_only_5_or_more_trades_stays_red():
+    # >=5 interaction trades: QL would have KEPT it, so a missing cache row is a real
+    # divergence -> RED, in unmatched_serving, NOT reconciled.
+    extra = _extra_serving_only()
+    diff = _diff(
+        [_training()],
+        _serving_day([_serving_touch(), extra]),
+        serving_only_counter=lambda s: 7,
+    )
+    assert not diff.green
+    assert diff.unmatched_serving == ["pdh|short"]
+    assert diff.reconciled_serving_only == []
 
 
 def test_probability_perturbation_red():

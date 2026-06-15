@@ -30,10 +30,12 @@ a hard mismatch.
 
 from __future__ import annotations
 
+import bisect
 import json
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -59,6 +61,10 @@ _CONFIDENCE_GATE = 0.70
 #: Touch-instant join tolerance (ns). The serving instant rides a pandas
 #: Timestamp through the journal (ns-preserving); set 0 and report the residual.
 _INSTANT_TOL_NS = 0
+#: QL's interaction-trade drop threshold (engine_decision.py:764 — `< 5` prints in
+#: the interaction window => the row is dropped, leaving NO cache record). A
+#: serving-only survivor below this is the expected batch↔serving asymmetry, not a bug.
+_INTERACTION_MIN_TRADES = 5
 
 
 # ── Serving journal ──────────────────────────────────────────────────────────
@@ -245,8 +251,11 @@ class DayDiff:
     serving_drops: int = 0
     matched: int = 0
     # set reconciliation
-    unmatched_training: list[str] = field(default_factory=list)   # cache row, no serving
-    unmatched_serving: list[str] = field(default_factory=list)    # serving, no cache (reconcile)
+    unmatched_training: list[str] = field(default_factory=list)  # cache row, no serving (RED)
+    unmatched_serving: list[str] = field(default_factory=list)  # serving, no cache, >=5 (RED)
+    # serving-only survivor QL would have dropped for <5 interaction trades — the
+    # expected asymmetry (Finding-1). Recorded, does NOT make the day red.
+    reconciled_serving_only: list[str] = field(default_factory=list)
     duplicate_keys: list[str] = field(default_factory=list)
     orphan_predictions: int = 0
     # per-axis mismatches (each must be empty for green)
@@ -296,6 +305,7 @@ class DayDiff:
             f"matched={self.matched} drops={self.serving_drops} "
             f"unmatched_train={len(self.unmatched_training)} "
             f"unmatched_serv={len(self.unmatched_serving)} "
+            f"recon_serv_only={len(self.reconciled_serving_only)} "
             f"mismatches={nmis} max_inst_diff_ns={self.max_instant_diff_ns} "
             f"max_feat_diff={self.max_feature_abs_diff:g} "
             f"max_proba_diff={self.max_proba_abs_diff:g}"
@@ -312,18 +322,27 @@ def diff_day(
     *,
     window: W3Window | None = None,
     scorer: OfflineScorer | None = None,
+    serving_only_counter: Callable[[ServingTouch], int] | None = None,
 ) -> DayDiff:
-    """Load the day's training cache + serving journal, then diff all axes."""
+    """Load the day's training cache + serving journal, then diff all axes.
+
+    Supplies the REAL QL-backed serving-only interaction-trade counter by default
+    (Finding-1): a serving-only survivor is reconciled iff QL's own <5-trade rule
+    would have dropped it (see :class:`QLInteractionTradeCounter`).
+    """
 
     window = window or resolve_window()
     training = load_training_touches(window, date_str)
     serving = parse_journal(journal_path)
+    if serving_only_counter is None:
+        serving_only_counter = QLInteractionTradeCounter(window, date_str)
     return diff_touch_sets(
         date_str,
         training,
         serving,
         cache_present=window.has_cache(date_str),
         scorer=scorer,
+        serving_only_counter=serving_only_counter,
     )
 
 
@@ -334,11 +353,15 @@ def diff_touch_sets(
     *,
     cache_present: bool = False,
     scorer: OfflineScorer | None = None,
+    serving_only_counter: Callable[[ServingTouch], int] | None = None,
 ) -> DayDiff:
     """Join a training touch set <-> a serving day and assert all parity axes.
 
     Pure over its inputs (no I/O): the falsification suite drives this directly
-    with synthetic touch sets to prove each axis can go RED.
+    with synthetic touch sets to prove each axis can go RED. ``serving_only_counter``
+    is the injected interaction-trade count provider for serving-only survivors —
+    the real run passes the QL-backed counter; tests pass a stub returning a chosen
+    count; ``None`` (no provider) keeps every serving-only survivor RED.
     """
 
     diff = DayDiff(day=date_str)
@@ -365,8 +388,16 @@ def diff_touch_sets(
 
     for k in sorted(set(train_by_key) - set(serv_by_key)):
         diff.unmatched_training.append(k)
+    # Finding-1: a serving-only survivor (no cache row) is the EXPECTED asymmetry iff
+    # QL would have dropped it for <5 interaction trades; otherwise it is a real bug
+    # (serving kept a touch QL would have kept, yet the cache has no row).
     for k in sorted(set(serv_by_key) - set(train_by_key)):
-        diff.unmatched_serving.append(k)
+        s = serv_by_key[k]
+        count = serving_only_counter(s) if serving_only_counter is not None else None
+        if classify_serving_only(count):
+            diff.reconciled_serving_only.append(f"{k} (interaction_trades={count})")
+        else:
+            diff.unmatched_serving.append(k)
 
     for k in sorted(set(train_by_key) & set(serv_by_key)):
         t = train_by_key[k]
@@ -468,6 +499,75 @@ def _offline_eligible(probabilities: dict[str, float], session: str) -> bool:
         and session.split("_", 1)[0] == _ELIGIBLE_SESSION
         and probabilities.get(_ELIGIBLE_CLASS, 0.0) >= _CONFIDENCE_GATE
     )
+
+
+# ── Finding-1: serving-only reconciliation (<5-interaction-trade asymmetry) ───
+def classify_serving_only(count: int | None) -> bool:
+    """Is a serving-only survivor RECONCILED (the expected asymmetry) or a RED bug?
+
+    Pure: returns ``True`` (reconcile — QL would have dropped this touch, leaving no
+    cache row) iff the interaction-trade ``count`` is known and below QL's threshold
+    (engine_decision.py:764, ``< 5``). ``count is None`` (no provider) or
+    ``count >= 5`` -> ``False`` (RED: QL would have kept it, so a missing cache row is
+    a real divergence).
+    """
+
+    return count is not None and count < _INTERACTION_MIN_TRADES
+
+
+class QLInteractionTradeCounter:
+    """Count a serving-only touch's interaction trades the way QL's labeler does.
+
+    Reproduces QL's drop rule VERBATIM in definition, not by guess:
+    ``engine_decision.py:761-766`` computes
+    ``interaction_trades = _trades_in(touch.bar_ts_utc, touch.bar_ts_utc +
+    interaction_window)`` then drops the row on ``len(interaction_trades) < 5``;
+    ``_trades_in`` (``:694-695``) is
+    ``trades[bisect_left(trade_ts, start):bisect_left(trade_ts, end)]`` over the
+    front-month ``Trade`` prints harvested from the SAME canonical
+    ``DatabentoParquetSource.for_trading_day`` stream (``:654-668``) — i.e. a
+    half-open ``[touch_bar_close, touch_bar_close + interaction_window)`` count.
+
+    This counter reads that exact stream (same source, same default front-month
+    selection, same ``requested_symbol``) and counts identically (``bisect_left`` on
+    both bounds, ns-precise), with ``interaction_window`` taken from the resolved
+    D-036 config (``window.util_kwargs['interaction_window_minutes']``). The day's
+    trade timestamps are read once and memoized; only invoked when a serving-only
+    survivor actually exists (none on the 51 evaluated days).
+    """
+
+    def __init__(self, window: W3Window, date_str: str) -> None:
+        self._window = window
+        self._date_str = date_str
+        self._interaction_window = timedelta(
+            minutes=int(window.util_kwargs["interaction_window_minutes"])
+        )
+        self._trade_ns: list[int] | None = None
+
+    def _trade_ns_sorted(self) -> list[int]:
+        if self._trade_ns is None:
+            from strategy_core.data.databento_parquet import DatabentoParquetSource
+            from strategy_core.types import Trade as ScTrade
+
+            source = DatabentoParquetSource.for_trading_day(
+                self._window.symbol_dir,
+                date.fromisoformat(self._date_str),
+                requested_symbol=self._window.symbol,
+            )
+            ns = [
+                pd.Timestamp(ev.event_ts_utc).value
+                for ev in source.events()
+                if isinstance(ev, ScTrade)
+            ]
+            ns.sort()  # canonical SC order is already ts-sorted; explicit for bisect safety
+            self._trade_ns = ns
+        return self._trade_ns
+
+    def __call__(self, serv_touch: ServingTouch) -> int:
+        trade_ns = self._trade_ns_sorted()
+        start = int(serv_touch.touch_instant.value)
+        end = int((serv_touch.touch_instant + self._interaction_window).value)
+        return bisect.bisect_left(trade_ns, end) - bisect.bisect_left(trade_ns, start)
 
 
 # ── P2 offline scorer ────────────────────────────────────────────────────────

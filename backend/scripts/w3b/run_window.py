@@ -146,6 +146,8 @@ def report(results: list[DayDiff], window) -> tuple[str, bool]:
     axis_counts = {name: sum(len(getattr(d, attr)) for d in results) for name, attr in axes.items()}
     unmatched_train = [(d.day, d.unmatched_training) for d in results if d.unmatched_training]
     unmatched_serv = [(d.day, d.unmatched_serving) for d in results if d.unmatched_serving]
+    reconciled = [(d.day, d.reconciled_serving_only) for d in results if d.reconciled_serving_only]
+    total_reconciled = sum(len(d.reconciled_serving_only) for d in results)
     dup = [(d.day, d.duplicate_keys) for d in results if d.duplicate_keys]
     orphans = [(d.day, d.orphan_predictions) for d in results if d.orphan_predictions]
     # thin-day 0==0: a day without a cache must yield no surviving touch
@@ -169,6 +171,9 @@ def report(results: list[DayDiff], window) -> tuple[str, bool]:
     lines.append("=" * 78)
     lines.append(f"touches reconciled (matched): {total_matched}  (training rows: {total_train})")
     lines.append(f"serving drops: {total_drops}")
+    lines.append(
+        f"reconciled serving-only (<5 interaction trades, Finding-1): {total_reconciled}"
+    )
     lines.append(f"per-axis mismatches: {axis_counts}")
     lines.append(f"max instant diff (ns): {max_inst}  max feature |diff|: {max_feat:g}  "
                  f"max proba |diff|: {max_proba:g}")
@@ -176,7 +181,9 @@ def report(results: list[DayDiff], window) -> tuple[str, bool]:
     if unmatched_train:
         lines.append(f"UNMATCHED TRAINING (cache row, no serving survivor): {unmatched_train}")
     if unmatched_serv:
-        lines.append(f"UNMATCHED SERVING (survivor, no cache row): {unmatched_serv}")
+        lines.append(f"UNMATCHED SERVING (survivor, no cache row, >=5 trades): {unmatched_serv}")
+    if reconciled:
+        lines.append(f"RECONCILED serving-only (<5 trades — expected asymmetry): {reconciled}")
     if dup:
         lines.append(f"DUPLICATE KEYS: {dup}")
     if orphans:
