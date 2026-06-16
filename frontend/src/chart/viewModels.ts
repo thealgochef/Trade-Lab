@@ -81,16 +81,23 @@ export const normalizeBarsForTimeframe = (bars: MarketBar[], timeframe: Timefram
 // Markers carry wall-clock event timestamps, but bars live on a synthetic
 // monotonic chart-time axis (midnight + bar_index) so same-second tick bars stay
 // distinct. This resolver maps an event timestamp onto the chart time of the bar
-// that contains it, so annotations land on the right candle instead of piling up
-// past the last bar. Bars arrive already sorted ascending by chart time, which
+// that contains it. Bars arrive already sorted ascending by chart time, which
 // matches open-time order.
+//
+// Events OLDER than the first loaded bar resolve to null (the marker is dropped),
+// NOT to bars[0]. The chart only holds a recent window — the snapshot does not
+// carry bars back to prior sessions — so kept predictions/outcomes (up to ~100,
+// spanning many hours) routinely predate bars[0] by hours. Clamping them to bars[0]
+// stacked every one onto the leftmost candle (an unreadable, misleading pile that
+// implied they all happened at the window start). Dropping is honest: an event with
+// no loaded bar gets no marker; in-window events still land on their real bar.
 export const createChartTimeResolver = (bars: ChartBar[]): ((iso: string) => UTCTimestamp | null) => {
   const opens = bars.map((bar) => Date.parse(bar.openTimeUtc));
   return (iso: string) => {
     if (bars.length === 0) return null;
     const t = Date.parse(iso);
     if (!Number.isFinite(t)) return null;
-    if (t < opens[0]) return bars[0].time as UTCTimestamp;
+    if (t < opens[0]) return null;
     let index = 0;
     for (let i = 0; i < bars.length; i += 1) {
       if (opens[i] <= t) index = i;

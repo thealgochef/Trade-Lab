@@ -309,4 +309,37 @@ describe('chart view model normalization', () => {
     expect(normalizePredictionMarkers([prediction()], createChartTimeResolver([]))).toEqual([]);
     expect(normalizeOutcomeMarkers([prediction({ outcome: outcome() })], createChartTimeResolver([]))).toEqual([]);
   });
+
+  it('resolves an event older than the first loaded bar to null instead of clamping it to bars[0]', () => {
+    const bars = normalizeBarsForTimeframe([
+      bar({ barIndex: 0, barId: '147t:2026-05-21:0', openTimeUtc: '2026-05-21T18:00:00Z', closeTimeUtc: '2026-05-21T18:05:00Z' }),
+      bar({ barIndex: 1, barId: '147t:2026-05-21:1', openTimeUtc: '2026-05-21T18:10:00Z', closeTimeUtc: '2026-05-21T18:15:00Z' }),
+    ], 147);
+    const resolve = createChartTimeResolver(bars);
+
+    // Hours before bars[0].openTimeUtc → dropped (null), NOT pinned to bars[0].time.
+    expect(resolve('2026-05-21T08:10:00Z')).toBeNull();
+    expect(resolve('2026-05-21T08:10:00Z')).not.toBe(bars[0].time);
+    // An in-window event still lands on its real containing bar.
+    expect(resolve('2026-05-21T18:11:00Z')).toBe(bars[1].time);
+  });
+
+  it('drops markers that predate the loaded window so they never pile on bars[0]', () => {
+    // Mirrors the live bug: kept predictions/outcomes from earlier sessions whose
+    // event ts is hours before the chart's first loaded bar.
+    const bars = normalizeBarsForTimeframe([
+      bar({ barIndex: 0, barId: '147t:2026-05-21:0', openTimeUtc: '2026-05-21T18:00:00Z', closeTimeUtc: '2026-05-21T18:05:00Z' }),
+      bar({ barIndex: 1, barId: '147t:2026-05-21:1', openTimeUtc: '2026-05-21T18:10:00Z', closeTimeUtc: '2026-05-21T18:15:00Z' }),
+    ], 147);
+    const offWindow = prediction({ id: 'p-old', timeUtc: '2026-05-21T08:10:00Z', eligible: false, outcome: outcome({ id: 'o-old', predictionId: 'p-old' }) });
+    const inWindow = prediction({ id: 'p-now', timeUtc: '2026-05-21T18:11:00Z', eligible: false, outcome: outcome({ id: 'o-now', predictionId: 'p-now' }) });
+
+    const markers = combineMarkers([], [], [offWindow, inWindow], bars);
+
+    // Off-window prediction AND its outcome are dropped; only the in-window pair
+    // survives, anchored to its real bar — nothing collapses onto bars[0].
+    expect(markers.map((marker) => marker.id).sort()).toEqual(['outcome:o-now', 'prediction:p-now']);
+    expect(markers.every((marker) => marker.time === bars[1].time)).toBe(true);
+    expect(markers.some((marker) => marker.time === bars[0].time)).toBe(false);
+  });
 });
