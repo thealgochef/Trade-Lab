@@ -34,6 +34,7 @@ button { font: inherit; }
 .chart-panel { display:grid; grid-template-rows: auto 1fr; min-height: 0; }
 .chart-shell { position: relative; min-height: 420px; height: 100%; }
 .chart-canvas { position:absolute; inset:0; }
+.chart-marker-tooltip { position:absolute; top:0; left:0; z-index:3; pointer-events:none; max-width:260px; padding:5px 9px; border:1px solid rgba(28,48,65,.92); border-radius:8px; background:rgba(5,10,15,.94); backdrop-filter:blur(8px); color:#e6eef6; font-size:11px; line-height:1.35; letter-spacing:.04em; white-space:nowrap; box-shadow:0 4px 16px rgba(0,0,0,.45); }
 .chart-legend { position:absolute; top:12px; left:14px; z-index:2; display:flex; flex-wrap:wrap; gap:10px; align-items:center; max-width:calc(100% - 28px); padding:7px 9px; border:1px solid rgba(28,48,65,.78); border-radius:10px; background:rgba(5,10,15,.72); backdrop-filter: blur(8px); color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
 .chart-legend span { display:inline-flex; align-items:center; gap:6px; white-space:nowrap; }
 .legend-line { width:18px; height:0; border-top:2px solid var(--green); display:inline-block; }

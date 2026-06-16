@@ -14,6 +14,8 @@ const mocks = vi.hoisted(() => ({
   createSeriesMarkers: vi.fn(),
   setMarkers: vi.fn(),
   removeMarkers: vi.fn(),
+  subscribeCrosshairMove: vi.fn(),
+  unsubscribeCrosshairMove: vi.fn(),
 }));
 
 vi.mock('lightweight-charts', () => ({
@@ -35,7 +37,7 @@ describe('TradingChart', () => {
     mocks.createChart.mockReset();
     mocks.createSeriesMarkers.mockReset();
     mocks.addSeries.mockReturnValue({ setData: mocks.setData, update: mocks.update, createPriceLine: mocks.createPriceLine, removePriceLine: mocks.removePriceLine });
-    mocks.createChart.mockReturnValue({ addSeries: mocks.addSeries, remove: mocks.remove });
+    mocks.createChart.mockReturnValue({ addSeries: mocks.addSeries, remove: mocks.remove, subscribeCrosshairMove: mocks.subscribeCrosshairMove, unsubscribeCrosshairMove: mocks.unsubscribeCrosshairMove });
     mocks.createSeriesMarkers.mockReturnValue({ setMarkers: mocks.setMarkers, remove: mocks.removeMarkers });
   });
 
@@ -141,16 +143,98 @@ describe('TradingChart', () => {
     expect(mocks.removePriceLine).toHaveBeenCalled();
   });
 
-  it('sets marker overlays and cleans up chart resources', () => {
+  it('sets marker overlays with inline text stripped and cleans up chart resources', () => {
     const markers: MarkerOverlay[] = [{ id: 'touch:t1', time: 1 as MarkerOverlay['time'], position: 'belowBar', shape: 'arrowUp', color: '#36d399', text: 'touch' }];
     const { unmount } = renderChart({ markers });
 
-    expect(mocks.setMarkers).toHaveBeenCalledWith(markers);
+    // The always-on `text` is dropped before reaching lightweight-charts (the
+    // label is shown on hover instead); `id` is preserved for hover hit-testing.
+    expect(mocks.setMarkers).toHaveBeenCalledWith([{ id: 'touch:t1', time: 1, position: 'belowBar', shape: 'arrowUp', color: '#36d399' }]);
 
+    const subscribedHandler = mocks.subscribeCrosshairMove.mock.calls.at(-1)?.[0];
     unmount();
 
+    // Must unsubscribe the SAME handler reference (lightweight-charts removes by
+    // identity); a call-count-only assertion would miss a leaked listener.
+    expect(mocks.unsubscribeCrosshairMove).toHaveBeenCalledWith(subscribedHandler);
     expect(mocks.removeMarkers).toHaveBeenCalled();
     expect(mocks.remove).toHaveBeenCalled();
+  });
+
+  it('reveals a marker label tooltip on hover and hides it when the marker is not hovered', () => {
+    const markers: MarkerOverlay[] = [{ id: 'prediction:p1', time: 5 as MarkerOverlay['time'], position: 'aboveBar', shape: 'arrowDown', color: '#36d399', text: 'pred tradeable_reversal (ineligible)' }];
+    renderChart({ markers });
+
+    const handler = mocks.subscribeCrosshairMove.mock.calls.at(-1)?.[0] as (param: unknown) => void;
+    const tooltip = screen.getByTestId('marker-tooltip');
+    expect(tooltip).toHaveStyle({ display: 'none' });
+
+    handler({ hoveredObjectId: 'prediction:p1', point: { x: 120, y: 40 } });
+    expect(tooltip).toHaveStyle({ display: 'block' });
+    expect(tooltip).toHaveTextContent('pred tradeable_reversal (ineligible)');
+    // Positioned at the crosshair point; jsdom has no layout (clientWidth/Height 0)
+    // so neither the right-edge flip nor the top/bottom anchor engages.
+    expect(tooltip.style.left).toBe('120px');
+    expect(tooltip.style.top).toBe('40px');
+    expect(tooltip.style.transform).toBe('translate(14px, -50%)');
+
+    // Crosshair moves onto a bar with no marker → tooltip hides.
+    handler({ hoveredObjectId: undefined, point: { x: 200, y: 60 } });
+    expect(tooltip).toHaveStyle({ display: 'none' });
+
+    // Re-show, then hover an unknown object id (e.g. a price line): a real
+    // block→none transition, so this proves the map-miss branch hides the tooltip.
+    handler({ hoveredObjectId: 'prediction:p1', point: { x: 120, y: 40 } });
+    expect(tooltip).toHaveStyle({ display: 'block' });
+    handler({ hoveredObjectId: 'not-a-marker', point: { x: 200, y: 60 } });
+    expect(tooltip).toHaveStyle({ display: 'none' });
+  });
+
+  it('keeps the tooltip on-chart near the right, top, and bottom edges', () => {
+    const markers: MarkerOverlay[] = [{ id: 'm', time: 5 as MarkerOverlay['time'], position: 'aboveBar', shape: 'circle', color: '#7c8b9b', text: 'pred x (ineligible)' }];
+    renderChart({ markers });
+    const container = screen.getByTestId('trading-chart-canvas');
+    Object.defineProperty(container, 'clientWidth', { configurable: true, value: 600 });
+    Object.defineProperty(container, 'clientHeight', { configurable: true, value: 400 });
+    const handler = mocks.subscribeCrosshairMove.mock.calls.at(-1)?.[0] as (param: unknown) => void;
+    const tooltip = screen.getByTestId('marker-tooltip');
+
+    handler({ hoveredObjectId: 'm', point: { x: 560, y: 200 } }); // x > 600-180 → flip left
+    expect(tooltip.style.transform).toBe('translate(calc(-100% - 14px), -50%)');
+    handler({ hoveredObjectId: 'm', point: { x: 100, y: 10 } });   // y < 24 → anchor top edge
+    expect(tooltip.style.transform).toBe('translate(14px, 0%)');
+    handler({ hoveredObjectId: 'm', point: { x: 100, y: 395 } });  // y > 400-24 → anchor bottom edge
+    expect(tooltip.style.transform).toBe('translate(14px, -100%)');
+  });
+
+  it('reconciles an open tooltip when markers refresh under a stationary cursor', () => {
+    const active: MarkerOverlay = { id: 'observation:o1', time: 5 as MarkerOverlay['time'], position: 'belowBar', shape: 'square', color: '#4ea1ff', text: 'PDH obs active' };
+    const other: MarkerOverlay = { id: 'prediction:p1', time: 6 as MarkerOverlay['time'], position: 'aboveBar', shape: 'circle', color: '#7c8b9b', text: 'pred x (ineligible)' };
+    const { rerender } = renderChart({ markers: [active, other] });
+    const handler = mocks.subscribeCrosshairMove.mock.calls.at(-1)?.[0] as (param: unknown) => void;
+    const tooltip = screen.getByTestId('marker-tooltip');
+
+    handler({ hoveredObjectId: 'observation:o1', point: { x: 80, y: 40 } });
+    expect(tooltip).toHaveTextContent('PDH obs active');
+
+    // Same id, label flips (active→expired): text updates in place, stays visible.
+    rerender(<TradingChart timeframe={147} bars={[]} levels={[]} markers={[{ ...active, text: 'PDH obs expired' }, other]} emptyTitle="empty" emptySubtitle="offline" />);
+    expect(tooltip).toHaveStyle({ display: 'block' });
+    expect(tooltip).toHaveTextContent('PDH obs expired');
+
+    // Hovered marker dropped from the refreshed set: tooltip hides.
+    rerender(<TradingChart timeframe={147} bars={[]} levels={[]} markers={[other]} emptyTitle="empty" emptySubtitle="offline" />);
+    expect(tooltip).toHaveStyle({ display: 'none' });
+  });
+
+  it('keeps the tooltip hidden when hovering a marker that has no label text', () => {
+    const markers: MarkerOverlay[] = [{ id: 'm', time: 5 as MarkerOverlay['time'], position: 'aboveBar', shape: 'circle', color: '#7c8b9b' }];
+    renderChart({ markers });
+    const handler = mocks.subscribeCrosshairMove.mock.calls.at(-1)?.[0] as (param: unknown) => void;
+    const tooltip = screen.getByTestId('marker-tooltip');
+
+    handler({ hoveredObjectId: 'm', point: { x: 100, y: 50 } });
+    expect(tooltip).toHaveStyle({ display: 'none' });
   });
 
   it('removes all created price lines on unmount', () => {

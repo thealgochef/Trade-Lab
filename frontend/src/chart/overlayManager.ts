@@ -39,7 +39,16 @@ export class ChartOverlayManager {
   }
 
   syncMarkers(markers: SeriesMarker<Time>[]) {
-    this.markerApi.setMarkers(markers);
+    // Drop each marker's inline `text`: lightweight-charts renders it as an
+    // always-on label with no collision handling, so same-bar markers stack into
+    // an unreadable pile. Shape + colour still convey the outcome at a glance, and
+    // the full label is surfaced on hover by the TradingChart tooltip (which keys
+    // off the marker `id`, so `id` is intentionally preserved here).
+    this.markerApi.setMarkers(markers.map((marker) => {
+      const next = { ...marker };
+      delete next.text;
+      return next;
+    }));
   }
 
   destroy() {
