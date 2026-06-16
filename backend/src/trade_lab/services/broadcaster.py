@@ -75,6 +75,19 @@ class WebSocketBroadcaster:
     async def broadcast_update(self, update: RuntimeUpdate) -> None:
         await self._fanout_messages(self.messages_for_update(update))
 
+    async def broadcast_snapshot(self) -> None:
+        """Fan a full ``system.snapshot`` out to every connected client.
+
+        Used by the live warm-start catch-up: instead of streaming every replayed bar
+        (which floods slow browsers into dropped frames / chart gaps and burns
+        serialization on the consumer), the live service pushes a throttled full
+        snapshot so the chart advances coherently, then resumes per-event deltas once
+        the feed reaches real time. ``applySnapshot`` on the client replaces state, so
+        repeated snapshots are idempotent.
+        """
+
+        await self._fanout(self.envelope_bytes("system.snapshot", self.snapshot_payload()))
+
     def messages_for_update(self, update: RuntimeUpdate) -> tuple[bytes, ...]:
         messages: list[bytes] = []
         # W2 P2c: the typed reset frame goes FIRST so clients clear stale panes

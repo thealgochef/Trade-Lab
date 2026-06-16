@@ -314,7 +314,7 @@ def create_app(
                 trade_schema=config.trade_schema,
                 quote_schema=config.quote_schema,
                 context_schemas=config.context_schemas,
-                # W2 P1b (D-P-06): replay the current trading day from 18:00 ET
+                # W2 P1b (D-P-06): replay the current trading day from the session open
                 # through the same adapter path before flowing into real time.
                 intraday_replay=True,
                 historical_source=historical_source,
@@ -325,9 +325,14 @@ def create_app(
             live_config,
             live_feed_factory,
             historical_source=historical_source,
+            # Throttle the warm-start replay's broadcasts so catching up the trading day
+            # doesn't flood the browser (dropped frames -> chart gaps); per-event
+            # streaming resumes once the frontier reaches real time.
+            throttle_warm_start=True,
         )
     if not live.has_update_callback:
         live.set_update_callback(broadcaster.broadcast_update)
+        live.set_snapshot_callback(broadcaster.broadcast_snapshot)
     app.state.live = live
     catalog = build_replay_catalog(
         data_path=settings.data_path,

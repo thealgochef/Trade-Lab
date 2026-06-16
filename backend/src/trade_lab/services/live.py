@@ -41,6 +41,18 @@ from trade_lab.services.runtime import ApplicationRuntime, RuntimeUpdate, _safe_
 
 logger = logging.getLogger(__name__)
 
+#: Warm-start broadcast throttle (frontier-lag based). During an intraday warm-start
+#: replay the engine processes the whole trading day; streaming every replayed bar
+#: floods the browser (dropped frames -> chart gaps) and burns serialization on the
+#: single-threaded consumer. While the processed frontier lags wall clock by more than
+#: ``_WARMING_LAG_SECONDS`` the live service suppresses per-event deltas and emits a
+#: throttled full snapshot for progress instead; once the frontier is within
+#: ``_LIVE_LAG_SECONDS`` of now it flushes one snapshot and resumes per-event streaming.
+#: The two thresholds give hysteresis so the mode does not flap at the boundary.
+_LIVE_LAG_SECONDS = 5.0
+_WARMING_LAG_SECONDS = 30.0
+_WARM_SNAPSHOT_MIN_INTERVAL_SECONDS = 1.0
+
 
 class LiveState(StrEnum):
     IDLE = "idle"
@@ -103,14 +115,25 @@ class LiveMarketDataService:
         feed_factory: FeedFactory,
         *,
         on_update: Callable[[RuntimeUpdate], Awaitable[None]] | None = None,
+        on_snapshot: Callable[[], Awaitable[None]] | None = None,
         historical_source: DatabentoHistoricalSource | None = None,
         reconnect_delay_seconds: float = 1.0,
         now_provider: Callable[[], datetime] | None = None,
+        throttle_warm_start: bool = False,
     ) -> None:
         self.runtime = runtime
         self.config = config
         self._feed_factory = feed_factory
         self._on_update = on_update
+        self._on_snapshot = on_snapshot
+        # When True, the intraday warm-start replay's per-event deltas are not streamed
+        # while the frontier lags wall clock (it advances the browser via throttled
+        # snapshots instead). Off by default so non-warm-start callers/tests are
+        # byte-for-byte unchanged.
+        self._throttle_warm_start = throttle_warm_start
+        self._live_streaming = False
+        self._market_update_lag: float | None = None
+        self._last_warm_snapshot_at: datetime | None = None
         self._historical_source = historical_source
         self._reconnect_delay_seconds = max(reconnect_delay_seconds, 0.01)
         self._now = now_provider or (lambda: datetime.now(UTC))
@@ -142,6 +165,11 @@ class LiveMarketDataService:
         self, callback: Callable[[RuntimeUpdate], Awaitable[None]] | None
     ) -> None:
         self._on_update = callback
+
+    def set_snapshot_callback(
+        self, callback: Callable[[], Awaitable[None]] | None
+    ) -> None:
+        self._on_snapshot = callback
 
     def status(self) -> LiveStatus:
         core_status = None if self.strategy_core_live is None else self.strategy_core_live.status()
@@ -211,6 +239,9 @@ class LiveMarketDataService:
             self._warm_anchor_utc = self._now()
             self._warm_start_state = "warming"
             self._warm_start_events = 0
+            # Each (re)start re-runs the warm-start replay, so re-arm the throttle.
+            self._live_streaming = False
+            self._last_warm_snapshot_at = None
             await self._emit_status(FeedConnectionState.CONNECTING, "live feed connecting")
             feed: MarketDataFeed | None = None
             try:
@@ -219,7 +250,7 @@ class LiveMarketDataService:
                 core_live = CoreLiveRuntime(
                     feed,
                     process_item=self._process_live_item,
-                    on_update=self._emit,
+                    on_update=self._emit_market,
                     is_warning=lambda item: isinstance(item, DataQualityWarning),
                     is_event=lambda item: not isinstance(item, (DataQualityWarning, FeedStatus)),
                     event_timestamp=lambda item: getattr(item, "event_ts_utc", None),
@@ -309,10 +340,17 @@ class LiveMarketDataService:
 
     def _process_live_item(self, item: object) -> RuntimeUpdate:
         if isinstance(item, FeedStatus):
+            self._market_update_lag = None
             return self.runtime.set_feed_status(item)
         if isinstance(item, DataQualityWarning):
+            self._market_update_lag = None
             return self.runtime.record_warning(item)
         self._mark_warm_start(item)
+        # How far the just-processed market event lags wall clock. Read by
+        # _emit_market to decide whether this is warm-start replay (suppress the
+        # per-event broadcast) or real time (stream it). None for non-market items.
+        ts = getattr(item, "event_ts_utc", None)
+        self._market_update_lag = None if ts is None else (self._now() - ts).total_seconds()
         return self.runtime.process_market_event(cast(MarketEvent, item))
 
     def _mark_warm_start(self, item: object) -> None:
@@ -395,6 +433,52 @@ class LiveMarketDataService:
     async def _emit(self, update: RuntimeUpdate) -> None:
         if self._on_update is not None and update.has_deltas():
             await self._on_update(update)
+
+    async def _emit_market(self, update: RuntimeUpdate) -> None:
+        """``on_update`` for the live source: applies the warm-start broadcast throttle.
+
+        With throttling off this is byte-for-byte the prior behaviour (forward to the
+        update callback). With it on, a market delta whose event frontier still lags
+        wall clock is NOT streamed; a throttled full snapshot carries catch-up progress
+        instead, and per-event streaming resumes (after one flush) once the frontier
+        reaches real time. Feed-status / warning items (no event ts) always forward.
+        """
+
+        if not self._throttle_warm_start:
+            await self._emit(update)
+            return
+        if self._on_update is None or not update.has_deltas():
+            return
+        lag = self._market_update_lag
+        if lag is None:
+            await self._on_update(update)
+            return
+        if self._live_streaming:
+            if lag > _WARMING_LAG_SECONDS:
+                self._live_streaming = False
+        elif lag <= _LIVE_LAG_SECONDS:
+            # Caught up: push the whole built-up day once, then stream per event.
+            self._live_streaming = True
+            await self._broadcast_snapshot()
+        if self._live_streaming:
+            await self._on_update(update)
+        else:
+            await self._maybe_emit_warm_snapshot()
+
+    async def _broadcast_snapshot(self) -> None:
+        if self._on_snapshot is None:
+            return
+        self._last_warm_snapshot_at = self._now()
+        await self._on_snapshot()
+
+    async def _maybe_emit_warm_snapshot(self) -> None:
+        last = self._last_warm_snapshot_at
+        if (
+            last is not None
+            and (self._now() - last).total_seconds() < _WARM_SNAPSHOT_MIN_INTERVAL_SECONDS
+        ):
+            return
+        await self._broadcast_snapshot()
 
 
 def _map_core_live_state(state: CoreLiveState, *, fallback: LiveState) -> LiveState:

@@ -174,7 +174,16 @@ class StrategyCoreService:
         return self._map_snapshot(self._runtime.snapshot())
 
     def _map_update(self, update: CoreUpdate) -> StrategyCoreUpdate:
-        snapshot = self._runtime.snapshot()
+        # Perf (live MBP-1 hot path): snapshot() rebuilds the full level set TWICE per
+        # call (current_levels() + snapshot_zones() -> zones() -> levels()), each doing
+        # per-level ZoneInfo/astimezone work. Its result is read ONLY inside the
+        # display_levels and touches comprehensions below, which iterate update.levels /
+        # update.touches. Quotes (the very high-volume stream) carry empty levels AND
+        # touches, so building a snapshot per quote is pure waste. Build it only when a
+        # comprehension will actually read it; output is byte-identical for every event.
+        # INVARIANT: keep every snapshot.* access confined to those two comprehensions —
+        # reading snapshot unconditionally would dereference this None.
+        snapshot = self._runtime.snapshot() if (update.levels or update.touches) else None
         return StrategyCoreUpdate(
             feed_status=None
             if update.feed_status is None

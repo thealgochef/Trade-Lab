@@ -756,6 +756,242 @@ def test_databento_queue_overflow_is_bounded_and_warns_without_secret() -> None:
     asyncio.run(run())
 
 
+def test_databento_overflow_preserves_arriving_trade_over_queued_quote() -> None:
+    # RC3: under a quote-driven full queue an arriving TRADE (the only record that
+    # advances bars/touches/the trade ring) must NOT be dropped. The queued quote is
+    # evicted to admit the trade.
+    async def run() -> None:
+        FakeDatabentoSdk.clients = []
+        feed = DatabentoMarketDataFeed(
+            api_key="db-secret",
+            requested_symbol="NQ.c.0",
+            dataset="GLBX.MDP3",
+            queue_maxsize=1,
+            sdk_module=FakeDatabentoSdk,
+        )
+        await feed.start()
+        callback = FakeDatabentoSdk.clients[0].callbacks[0]
+        callback(
+            {"event_ts_utc": "2026-01-05T14:30:00Z", "bid_px": "16999.75", "ask_px": "17000.00"}
+        )
+        callback({"ts_event": 1_767_000_000_000_000_000, "price": "17000.25"})
+
+        events = feed.events()
+        assert isinstance(await anext(events), FeedStatus)
+        warning = await anext(events)
+        survivor = await anext(events)
+        await feed.stop()
+        await events.aclose()
+
+        assert isinstance(warning, DataQualityWarning)
+        assert warning.code == DataQualityCode.BACKPRESSURE_DROP
+        assert warning.metadata["dropped"] == 1
+        # The trade survived (the quote was evicted), not the other way around.
+        assert isinstance(survivor, TradeEvent)
+        assert survivor.price_ticks == 68_001
+
+    asyncio.run(run())
+
+
+def test_databento_overflow_drops_arriving_quote_and_keeps_queued_trade() -> None:
+    # RC3 mirror: a queued trade is preserved and the newer QUOTE is drop-newest.
+    async def run() -> None:
+        FakeDatabentoSdk.clients = []
+        feed = DatabentoMarketDataFeed(
+            api_key="db-secret",
+            requested_symbol="NQ.c.0",
+            dataset="GLBX.MDP3",
+            queue_maxsize=1,
+            sdk_module=FakeDatabentoSdk,
+        )
+        await feed.start()
+        callback = FakeDatabentoSdk.clients[0].callbacks[0]
+        callback({"ts_event": 1_767_000_000_000_000_000, "price": "17000.00"})
+        callback(
+            {"event_ts_utc": "2026-01-05T14:30:01Z", "bid_px": "16999.75", "ask_px": "17000.00"}
+        )
+
+        events = feed.events()
+        assert isinstance(await anext(events), FeedStatus)
+        warning = await anext(events)
+        survivor = await anext(events)
+        await feed.stop()
+        await events.aclose()
+
+        assert isinstance(warning, DataQualityWarning)
+        assert warning.metadata["dropped"] == 1
+        assert warning.metadata.get("dropped_trades") is None
+        # The queued trade survived; the arriving quote was dropped.
+        assert isinstance(survivor, TradeEvent)
+        assert survivor.price_ticks == 68_000
+
+    asyncio.run(run())
+
+
+def test_databento_overflow_all_trades_evicts_oldest_and_logs_loudly(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # RC3 pathological branch: a queue saturated with trades cannot admit a newer trade
+    # without evicting an older one. The newest trade survives, the loss is counted in
+    # dropped_trades and logged loudly so it is never silent.
+    async def run() -> None:
+        FakeDatabentoSdk.clients = []
+        feed = DatabentoMarketDataFeed(
+            api_key="db-secret",
+            requested_symbol="NQ.c.0",
+            dataset="GLBX.MDP3",
+            queue_maxsize=1,
+            sdk_module=FakeDatabentoSdk,
+        )
+        await feed.start()
+        callback = FakeDatabentoSdk.clients[0].callbacks[0]
+        callback({"ts_event": 1_767_000_000_000_000_000, "price": "17000.00"})
+        callback({"ts_event": 1_767_000_000_000_000_001, "price": "17000.25"})
+
+        events = feed.events()
+        assert isinstance(await anext(events), FeedStatus)
+        warning = await anext(events)
+        survivor = await anext(events)
+        await feed.stop()
+        await events.aclose()
+
+        assert warning.metadata["dropped"] == 1
+        assert warning.metadata["dropped_trades"] == 1
+        # The NEWER trade is the survivor.
+        assert isinstance(survivor, TradeEvent)
+        assert survivor.price_ticks == 68_001
+
+    with caplog.at_level(logging.WARNING, logger="trade_lab.adapters.databento"):
+        asyncio.run(run())
+
+    assert any("saturated with trades" in record.message for record in caplog.records)
+
+
+def test_warm_start_throttle_suppresses_replay_deltas_until_caught_up() -> None:
+    # W3c: with throttle_warm_start on, the intraday replay must NOT stream every
+    # replayed bar to the browser (the cause of the live-chart gaps). Deep-historical
+    # trades advance the engine silently while a throttled snapshot carries progress;
+    # per-event streaming resumes only once the frontier reaches real time.
+    runtime = _runtime()
+    now = datetime(2026, 6, 16, 16, 0, 0, tzinfo=UTC)
+    update_calls: list[object] = []
+    snapshot_calls: list[bool] = []
+
+    async def on_update(update: object) -> None:
+        update_calls.append(update)
+
+    async def on_snapshot() -> None:
+        snapshot_calls.append(True)
+
+    live = LiveMarketDataService(
+        runtime,
+        LiveConfig(
+            requested_symbol="NQ.c.0",
+            dataset="GLBX.MDP3",
+            trade_schema="trades",
+            quote_schema="mbp-1",
+            context_schemas=(),
+            api_key_configured=True,
+            enabled=True,
+        ),
+        lambda _config: None,
+        on_update=on_update,
+        throttle_warm_start=True,
+        now_provider=lambda: now,
+    )
+    live.set_snapshot_callback(on_snapshot)
+    live._warm_anchor_utc = now
+
+    def trade(hour: int, minute: int, second: int, price_ticks: int) -> TradeEvent:
+        return TradeEvent(
+            datetime(2026, 6, 16, hour, minute, second, tzinfo=UTC),
+            None,
+            1,
+            "NQ.c.0",
+            "NQM6",
+            price_ticks,
+            1,
+        )
+
+    events = [
+        trade(6, 0, 0, 68000),  # ~10h behind -> warm-start replay
+        trade(7, 0, 0, 68004),  # ~9h behind  -> warm-start replay
+        trade(8, 0, 0, 68008),  # ~8h behind  -> warm-start replay
+        trade(15, 59, 59, 68012),  # 1s behind -> real time
+    ]
+
+    async def run() -> None:
+        for event in events:
+            update = live._process_live_item(event)
+            await live._emit_market(update)
+
+    asyncio.run(run())
+
+    streamed_market = [
+        update
+        for update in update_calls
+        if update.current_bars or update.closed_bars  # type: ignore[attr-defined]
+    ]
+    # Exactly one delta streamed: the caught-up (real-time) trade (close 68012),
+    # not any of the three warm-start trades.
+    assert len(streamed_market) == 1
+    closed = streamed_market[0].closed_bars  # type: ignore[attr-defined]
+    assert closed and closed[0].close_ticks == 68012
+    # The warm-start replay advanced the browser via snapshots, not per-event deltas.
+    assert len(snapshot_calls) >= 1
+
+
+def test_warm_start_throttle_off_streams_every_event() -> None:
+    # Default (throttle off): behaviour is unchanged — every market delta streams,
+    # regardless of how far its timestamp lags wall clock.
+    runtime = _runtime()
+    now = datetime(2026, 6, 16, 16, 0, 0, tzinfo=UTC)
+    update_calls: list[object] = []
+
+    async def on_update(update: object) -> None:
+        update_calls.append(update)
+
+    live = LiveMarketDataService(
+        runtime,
+        LiveConfig(
+            requested_symbol="NQ.c.0",
+            dataset="GLBX.MDP3",
+            trade_schema="trades",
+            quote_schema="mbp-1",
+            context_schemas=(),
+            api_key_configured=True,
+            enabled=True,
+        ),
+        lambda _config: None,
+        on_update=on_update,
+        now_provider=lambda: now,
+    )
+    live._warm_anchor_utc = now
+
+    async def run() -> None:
+        for second in range(3):
+            event = TradeEvent(
+                datetime(2026, 6, 16, 6, 0, second, tzinfo=UTC),
+                None,
+                1,
+                "NQ.c.0",
+                "NQM6",
+                68000 + second,
+                1,
+            )
+            update = live._process_live_item(event)
+            await live._emit_market(update)
+
+    asyncio.run(run())
+
+    streamed_market = [
+        update
+        for update in update_calls
+        if update.current_bars or update.closed_bars  # type: ignore[attr-defined]
+    ]
+    assert len(streamed_market) == 3
+
+
 def test_databento_partial_start_failure_stops_fake_client() -> None:
     class FailingClient(FakeDatabentoClient):
         def start(self) -> None:

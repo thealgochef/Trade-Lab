@@ -12,7 +12,7 @@ import heapq
 import importlib.util
 import logging
 import re
-from collections.abc import AsyncIterator, Callable, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -54,6 +54,11 @@ _TRADE_SCHEMA_ALIASES = {"trade", "trades"}
 _QUOTE_SCHEMA_ALIASES = {"mbp-1", "cmbp-1", "bbo", "tbbo", "cbbo", "tcbbo"}
 _QUOTE_MESSAGE_ALIASES = {"bbomsg", "mbp1msg", "cmbp1msg", "tbbomsg", "cbbomsg", "tcbbomsg"}
 _CONTEXT_SCHEMAS = {"definition", "status", "statistics"}
+
+#: RC2: max provider messages drained from the callback queue per event-loop cycle
+#: before yielding control. Bounds consumer latency while letting a single wake-up
+#: clear a burst instead of paying asyncio.wait_for timer setup for every message.
+_PROVIDER_BATCH_LIMIT = 256
 
 
 def is_databento_sdk_available() -> bool:
@@ -163,7 +168,10 @@ class DatabentoMarketDataFeed:
         trade_schema: str = "trades",
         quote_schema: str = "mbp-1",
         context_schemas: tuple[str, ...] = ("definition", "status", "statistics"),
-        queue_maxsize: int = 10_000,
+        # Burst headroom for the MBP-1 callback stream. With the consumer-throughput
+        # fixes in place the queue stays near-empty in steady state; this larger bound
+        # only absorbs transient provider bursts so overflow is rare-to-never.
+        queue_maxsize: int = 100_000,
         sdk_module: Any | None = None,
         sdk_facade: _DatabentoSdkFacade | None = None,
         intraday_replay: bool = False,
@@ -196,6 +204,9 @@ class DatabentoMarketDataFeed:
         self._client: Any = None
         self._queue: asyncio.Queue[_QueuedProviderMessage] = asyncio.Queue(maxsize=queue_maxsize)
         self._overflow_count = 0
+        # RC3: trades evicted to admit newer trades when the queue is saturated with
+        # trades (the pathological all-trades-full case). Should stay 0 in practice.
+        self._dropped_trades = 0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._intraday_replay = intraday_replay
         self._historical_source = historical_source
@@ -356,43 +367,78 @@ class DatabentoMarketDataFeed:
             # failure here propagates and surfaces as a live-feed failure.
             self._connect(replay_start=None)
         while self._started or not self._queue.empty():
+            # RC2: a leading cooperative yield lets the loop run the provider callbacks
+            # that call_soon_threadsafe'd their enqueues from the SDK thread, so the
+            # overflow counter is current before we surface its warning AND the warning
+            # precedes the messages that survived the same overflow. With batch draining
+            # this runs ~once per drained burst, not once per message (the old per-
+            # message wait_for + sleep was the consumer-throughput tax). Then drain
+            # everything already queued in one cycle via cheap FIFO get_nowait; only when
+            # the queue is empty do we block on a single wait_for, so an idle adapter
+            # waits without busy-spinning and still re-checks _started promptly on stop().
             await asyncio.sleep(0)
             warning = self._take_overflow_warning()
             if warning is not None:
                 yield warning
                 continue
+            drained = False
+            for _ in range(_PROVIDER_BATCH_LIMIT):
+                try:
+                    queued = self._queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                drained = True
+                for item in self._emit_queued(queued):
+                    yield item
+            if drained:
+                continue
             try:
                 queued = await asyncio.wait_for(self._queue.get(), timeout=0.25)
             except TimeoutError:
                 continue
-            if isinstance(queued.message, BaseException):
-                yield _warning(
-                    DataQualityCode.UNSUPPORTED_SCHEMA,
-                    "Databento provider callback reported an exception",
-                    schema=queued.schema,
-                    detail=_redact(str(queued.message), (self._api_key,)),
-                )
-                continue
-            control = _classify_provider_control_message(
-                queued.message, schema=queued.schema, secrets=(self._api_key,)
+            for item in self._emit_queued(queued):
+                yield item
+
+    def _emit_queued(
+        self, queued: _QueuedProviderMessage
+    ) -> Iterator[MarketEvent | DataQualityWarning]:
+        """Normalize one dequeued provider message into 0..1 downstream items.
+
+        Shared by the get_nowait batch drain and the blocking-wait fallback in
+        :meth:`events` so control-message drops, schema inference, normalization, and
+        error-to-warning handling are applied IDENTICALLY however the item left the
+        queue (RC2). Pure and synchronous: it awaits nothing, so callers iterate it
+        with a plain ``for`` and re-yield.
+        """
+
+        if isinstance(queued.message, BaseException):
+            yield _warning(
+                DataQualityCode.UNSUPPORTED_SCHEMA,
+                "Databento provider callback reported an exception",
+                schema=queued.schema,
+                detail=_redact(str(queued.message), (self._api_key,)),
             )
-            if control.drop:
-                if control.warning is not None:
-                    yield control.warning
-                continue
-            schema = _normalize_provider_schema(queued.schema, self.quote_schema)
-            try:
-                schema = schema or _infer_schema(queued.message, self.quote_schema)
-                yield normalize_provider_message(
-                    queued.message, requested_symbol=self.requested_symbol, schema=schema
-                )
-            except Exception as exc:
-                yield _warning(
-                    _code_for_normalization_error(exc),
-                    "Databento provider message could not be normalized safely",
-                    schema=schema,
-                    detail=_redact(str(exc), (self._api_key,)),
-                )
+            return
+        control = _classify_provider_control_message(
+            queued.message, schema=queued.schema, secrets=(self._api_key,)
+        )
+        if control.drop:
+            if control.warning is not None:
+                yield control.warning
+            return
+        schema = _normalize_provider_schema(queued.schema, self.quote_schema)
+        try:
+            schema = schema or _infer_schema(queued.message, self.quote_schema)
+            yield normalize_provider_message(
+                queued.message, requested_symbol=self.requested_symbol, schema=schema
+            )
+        except Exception as exc:
+            yield _warning(
+                _code_for_normalization_error(exc),
+                "Databento provider message could not be normalized safely",
+                schema=schema,
+                detail=_redact(str(exc), (self._api_key,)),
+            )
 
     async def _drain_warm_start_streams(
         self, streams: tuple[tuple[str, Iterable[Any]], ...]
@@ -463,9 +509,73 @@ class DatabentoMarketDataFeed:
         try:
             self._queue.put_nowait(_QueuedProviderMessage(schema, message))
         except asyncio.QueueFull:
-            # Preserve callback arrival order already in the queue and drop newest;
-            # this bounds memory under provider bursts. events() emits a warning.
+            self._handle_overflow(schema, message)
+
+    def _handle_overflow(self, schema: str | None, message: Any) -> None:
+        # RC3: under a provider burst the queue fills with very high-volume QUOTES. The
+        # old policy dropped whatever arrived next regardless of type — INCLUDING a
+        # trade, the only record that advances bars/touches/the trade ring. Never drop
+        # an arriving trade: evict the oldest queued message to make room for it.
+        # Non-trades keep the drop-newest policy (only the latest book state matters).
+        # Runs entirely on the loop thread with NO await between get_nowait and
+        # put_nowait, so it is atomic w.r.t. the events() consumer. events() emits the
+        # backpressure warning.
+        if not self._is_trade_message(schema, message):
             self._overflow_count += 1
+            return
+        try:
+            evicted: _QueuedProviderMessage | None = self._queue.get_nowait()
+        except asyncio.QueueEmpty:  # pragma: no cover - unreachable inside the full branch
+            evicted = None
+        try:
+            self._queue.put_nowait(_QueuedProviderMessage(schema, message))
+        except asyncio.QueueFull:  # pragma: no cover - a slot was just freed
+            self._overflow_count += 1
+            return
+        self._overflow_count += 1
+        if evicted is not None and self._is_trade_message(evicted.schema, evicted.message):
+            # Pathological: the queue was full of TRADES (the consumer is behind on the
+            # trade rate alone), so admitting a trade still costs an older trade. Should
+            # not happen at NQ trade rates with the consumer fixes in place — log loudly
+            # and count it so it is observable rather than silent.
+            self._dropped_trades += 1
+            logger.warning(
+                "Databento adapter queue saturated with trades; evicted an older trade "
+                "to admit a newer one (dropped_trades=%d)",
+                self._dropped_trades,
+            )
+
+    def _is_trade_message(self, schema: str | None, message: Any) -> bool:
+        """Cheaply decide whether a queued provider message is a TRADE.
+
+        Mirrors :func:`_infer_schema`'s ordering (explicit schema, then record type
+        name, then field shape) but WITHOUT decoding/normalizing, so it is safe on the
+        enqueue hot path. Exception-safe and conservative: anything it cannot positively
+        identify as a trade is treated as a droppable non-trade, so a real trade is
+        never misread as a quote and dropped.
+        """
+
+        try:
+            if schema is not None:
+                normalized = _normalize_provider_schema(schema, self.quote_schema)
+                if normalized == "trades":
+                    return True
+                if normalized is not None:
+                    return False
+            type_name = type(message).__name__
+            lowered = type_name.lower()
+            if type_name == "TradeMsg" or "trade" in lowered:
+                return True
+            if "bbo" in lowered or "mbp" in lowered or "cbbo" in lowered:
+                return False
+            quote_source = _top_of_book_source(message)
+            if _get(quote_source, "bid_px", "bid_price", "ask_px", "ask_price") is not None:
+                return False
+            if _get(message, "price", "px") is not None:
+                return True
+        except Exception:
+            return False
+        return False
 
     def _take_overflow_warning(self) -> DataQualityWarning | None:
         count = self._overflow_count
@@ -474,9 +584,11 @@ class DatabentoMarketDataFeed:
             return None
         return _warning(
             DataQualityCode.BACKPRESSURE_DROP,
-            "Databento adapter queue overflow; newest provider messages were dropped",
+            "Databento adapter queue overflow; provider messages were dropped "
+            "(arriving trades are preserved)",
             schema=None,
             dropped=count,
+            dropped_trades=self._dropped_trades or None,
         )
 
 
@@ -828,6 +940,7 @@ def _warning(
     schema: str | None,
     detail: str | None = None,
     dropped: int | None = None,
+    dropped_trades: int | None = None,
 ) -> DataQualityWarning:
     metadata: dict[str, Any] = {}
     if schema is not None:
@@ -836,6 +949,8 @@ def _warning(
         metadata["detail"] = detail
     if dropped is not None:
         metadata["dropped"] = dropped
+    if dropped_trades is not None:
+        metadata["dropped_trades"] = dropped_trades
     return DataQualityWarning(
         code=code,
         message=message,
