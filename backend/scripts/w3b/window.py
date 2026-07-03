@@ -32,8 +32,22 @@ from datetime import date, timedelta
 from functools import lru_cache
 from pathlib import Path
 
+# ── Per-worker pyarrow thread cap (perf only; set via W3B_THREAD_CAP) ─────────
+# Opt-in: caps each gate worker's pyarrow thread pools so many workers
+# can run without oversubscribing arrow threads. Throughput/correctness-neutral —
+# it only bounds thread pools (BLAS/OMP are capped via env at launch).
+_cap = os.environ.get("W3B_THREAD_CAP")
+if _cap:
+    try:
+        import pyarrow as _pa
+
+        _pa.set_cpu_count(int(_cap))
+        _pa.set_io_thread_count(int(_cap))
+    except Exception:
+        pass
+
 # ── Bundle / contract constants (the bundle under test) ──────────────────────
-BUNDLE_ID = "NQ_W3_20260613T055600Z"
+BUNDLE_ID = "NQ_W3_20260617T220752Z"
 EXPECTED_CACHE_TAG = "7850272e"
 CACHE_FILENAME = f"ml_utility_{EXPECTED_CACHE_TAG}.parquet"
 TICK_SIZE = 0.25

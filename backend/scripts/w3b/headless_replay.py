@@ -25,7 +25,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import shutil
+import traceback
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import date
@@ -66,6 +68,20 @@ _TERMINAL_STATES = {
     ReplayState.STOPPED,
     ReplayState.CANCELLED,
 }
+
+
+class ReplayTaskFailed(RuntimeError):
+    """A day's replay task failed to reach a terminal state.
+
+    A ``RuntimeError`` (hence an ``Exception``) ON PURPOSE: ``run_window`` catches
+    ``Exception`` to mark one bad day RED and continue, so any replay-task failure
+    that is *recoverable at the day level* — a watchdog-tripped hang, a cancelled
+    or non-terminal task, or a stray non-Exception ``BaseException`` (e.g.
+    ``asyncio.CancelledError``) escaping the runtime — must surface as this type,
+    NOT as a raw ``BaseException`` (which would bypass ``except Exception`` and
+    abort the whole run). Genuine process-level interrupts (``KeyboardInterrupt``,
+    ``SystemExit``) are deliberately NOT wrapped — they propagate and abort.
+    """
 
 
 @dataclass(frozen=True)
@@ -137,13 +153,101 @@ def build_serving_stack(
     return runtime, registry, engine
 
 
+#: _drive waits on the replay's background asyncio.Task rather than busy-polling
+#: status(). The replay runs as ``HistoricalReplayService._task``; its state only
+#: advances to a terminal value from inside that task. If the task finishes WITHOUT
+#: a terminal state — e.g. killed by a BaseException the core's ``except Exception``
+#: cannot catch — status() reports ``running`` forever, so a status()-only poll
+#: spins indefinitely (the W3b 2025-12-18 wedge). Awaiting the task surfaces that
+#: error; the watchdog bounds a genuine no-progress hang.
+_DRIVE_POLL_SECONDS = 1.0
+_DRIVE_WATCHDOG_SECONDS = float(os.environ.get("W3B_DRIVE_WATCHDOG_S", "120"))
+_DRIVE_DEBUG = bool(os.environ.get("W3B_DRIVE_DEBUG"))
+
+
+def _drive_dump(
+    replay: HistoricalReplayService,
+    task: "asyncio.Task[None] | None",
+    loop: asyncio.AbstractEventLoop,
+    reason: str,
+) -> None:
+    status = replay.status()
+    core = replay.strategy_core_replay
+    core_state = None if core is None else core.status().state
+    pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+    print(
+        f"[_drive] DUMP reason={reason} wall={loop.time():.1f}"
+        f" status.state={status.state!r} type={type(status.state).__name__}"
+        f" core_state={core_state!r} TERMINAL={ {s.value for s in _TERMINAL_STATES} }"
+        f" events_processed={status.events_processed}"
+        f" last_event_ts={status.last_event_ts_utc} last_error={status.last_error}"
+        f" task.done={None if task is None else task.done()}"
+        f" task.cancelled={None if task is None else task.cancelled()}"
+        f" pending_tasks={len(pending)}",
+        flush=True,
+    )
+    if task is not None and task.done() and not task.cancelled():
+        exc = task.exception()
+        print(f"[_drive] DUMP task.exception={exc!r}", flush=True)
+        if exc is not None:
+            traceback.print_exception(type(exc), exc, exc.__traceback__)
+
+
 async def _drive(
     replay: HistoricalReplayService, source: HistoricalMarketDataSource, config: ReplayConfig
 ) -> ReplayState:
     await replay.start(source, config)
-    while replay.status().state not in _TERMINAL_STATES:
-        await asyncio.sleep(0)
-    return replay.status().state
+    loop = asyncio.get_running_loop()
+    task = replay._task
+    progress_key: tuple[ReplayState, int] | None = None
+    progress_t = loop.time()
+    last_log_t = progress_t
+    while task is not None and not task.done():
+        done, _ = await asyncio.wait({task}, timeout=_DRIVE_POLL_SECONDS)
+        if done:
+            break
+        status = replay.status()
+        now = loop.time()
+        key = (status.state, status.events_processed)
+        if key != progress_key:
+            progress_key = key
+            progress_t = now
+        if _DRIVE_DEBUG and now - last_log_t >= 5.0:
+            last_log_t = now
+            _drive_dump(replay, task, loop, "tick")
+        if now - progress_t >= _DRIVE_WATCHDOG_SECONDS and status.state not in _TERMINAL_STATES:
+            _drive_dump(replay, task, loop, "watchdog-no-progress")
+            task.cancel()
+            raise ReplayTaskFailed(
+                f"_drive watchdog: no replay progress for {_DRIVE_WATCHDOG_SECONDS:.0f}s with "
+                f"non-terminal state {status.state!r} (events_processed={status.events_processed})"
+            )
+    # Task finished (or never existed): surface any error status() can never see,
+    # then require a terminal state so a silent non-terminal completion cannot pass.
+    # Categorise the exit so run_window can keep its `except Exception` contract:
+    #   * KeyboardInterrupt / SystemExit -> re-raise RAW (propagate, abort the run);
+    #   * ordinary Exception            -> re-raise RAW (run_window marks RED, continues);
+    #   * cancellation / non-terminal / other non-Exception BaseException
+    #                                   -> wrap as ReplayTaskFailed (catchable -> RED).
+    if task is not None:
+        if task.cancelled():
+            _drive_dump(replay, task, loop, "task-cancelled")
+            raise ReplayTaskFailed("replay task was cancelled before reaching a terminal state")
+        exc = task.exception()
+        if exc is not None:
+            _drive_dump(replay, task, loop, "task-raised")
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise exc
+            if isinstance(exc, Exception):
+                raise exc
+            raise ReplayTaskFailed(
+                f"replay task aborted with {type(exc).__name__}: {exc}"
+            ) from exc
+    state = replay.status().state
+    if state not in _TERMINAL_STATES:
+        _drive_dump(replay, task, loop, "non-terminal-after-task")
+        raise ReplayTaskFailed(f"replay task completed but state={state!r} is non-terminal")
+    return state
 
 
 def replay_day_to_journal(

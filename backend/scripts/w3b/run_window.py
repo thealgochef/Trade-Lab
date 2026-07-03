@@ -90,6 +90,11 @@ def run_window(
             t0 = time.perf_counter()
             try:
                 diff = _process_day(day, journal_base, window, score=score, resume=resume)
+            except (KeyboardInterrupt, SystemExit):
+                # Operator/process interrupt: abort the whole run — never record it
+                # as a RED day. (A non-terminal replay task surfaces as the catchable
+                # ReplayTaskFailed instead, so cancellation still becomes a RED day.)
+                raise
             except Exception as exc:  # one bad day must not kill a multi-hour run
                 diff = _failed_diff(day, exc)
             results.append(diff)
@@ -108,6 +113,8 @@ def run_window(
                 day = futs[fut]
                 try:
                     diff = fut.result()
+                except (KeyboardInterrupt, SystemExit):
+                    raise  # abort the run; never swallow an interrupt as a RED day
                 except Exception as exc:
                     diff = _failed_diff(day, exc)
                 results.append(diff)
