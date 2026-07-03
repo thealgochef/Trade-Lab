@@ -25,9 +25,10 @@ _SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-from trade_lab.services.replay import ReplayState, ReplayStatus  # noqa: E402
 from w3b import headless_replay  # noqa: E402
 from w3b.headless_replay import ReplayTaskFailed, _drive  # noqa: E402
+
+from trade_lab.services.replay import ReplayState, ReplayStatus  # noqa: E402
 
 # Generous relative to the stub's sub-second behaviour; small enough that a
 # reverted busy-poll _drive trips it quickly instead of wedging the suite.
@@ -55,7 +56,7 @@ class _StubReplay:
             state=self._state, events_processed=self._events, warnings_recorded=0
         )
 
-    async def start(self, source, config) -> None:  # noqa: ANN001 - test stub
+    async def start(self, source, config) -> None:
         self._state = ReplayState.RUNNING
         self._task = asyncio.create_task(self._worker(self))
 

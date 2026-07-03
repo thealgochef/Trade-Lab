@@ -44,7 +44,7 @@ def _install(monkeypatch: pytest.MonkeyPatch, behaviors: dict) -> None:
         rw, "resolve_window", lambda: types.SimpleNamespace(window_dates=tuple(behaviors))
     )
 
-    def fake_process_day(date_str, journal_base, window, *, score, resume):  # noqa: ANN001
+    def fake_process_day(date_str, journal_base, window, *, score, resume):
         outcome = behaviors[date_str]
         if isinstance(outcome, BaseException):
             raise outcome
@@ -90,7 +90,9 @@ def test_B_wrapped_replaytaskfailed_marks_red_and_continues(
     """The form `_drive` produces for a cancelled/non-terminal replay task is
     catchable -> day RED, run continues."""
 
-    _install(monkeypatch, {_D1: ReplayTaskFailed("replay task was cancelled"), _D2: DayDiff(day=_D2)})
+    _install(
+        monkeypatch, {_D1: ReplayTaskFailed("replay task was cancelled"), _D2: DayDiff(day=_D2)}
+    )
 
     results = _run(tmp_path)
 

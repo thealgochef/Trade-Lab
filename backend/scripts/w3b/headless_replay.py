@@ -167,7 +167,7 @@ _DRIVE_DEBUG = bool(os.environ.get("W3B_DRIVE_DEBUG"))
 
 def _drive_dump(
     replay: HistoricalReplayService,
-    task: "asyncio.Task[None] | None",
+    task: asyncio.Task[None] | None,
     loop: asyncio.AbstractEventLoop,
     reason: str,
 ) -> None:
