@@ -238,6 +238,10 @@ def create_app(
         tick_timeframes=settings.tick_timeframes,
         observation_duration_seconds=settings.observation_duration_seconds,
         seed_bar_limit_per_timeframe=settings.seed_max_bars_per_timeframe,
+        # Hold 2 full trading days (plus the current partial) of closed bars per timeframe so the
+        # live warm-start is never truncated; 147t is the busiest at a few thousand bars per active
+        # RTH session, so two full days can run ~5-7k.
+        recent_closed_bar_limit=8_000,
         market_context_retention_minutes=settings.market_context_retention_minutes,
         # W2 P2e (D-P-07): append-only prediction/outcome/drop journaling.
         journal=PredictionJournal(settings.journal_path),

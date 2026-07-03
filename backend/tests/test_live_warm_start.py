@@ -16,7 +16,9 @@ from trade_lab.services.runtime import ApplicationRuntime
 from trade_lab.services.strategy_core_service import StrategyCoreService
 
 _NOW = datetime(2026, 6, 11, 15, 0, tzinfo=UTC)  # Thursday 11:00 ET
-_SESSION_OPEN = datetime(2026, 6, 10, 22, 0, tzinfo=UTC)  # Wednesday 18:00 ET
+# Warm-start replays 2 FULL prior trading days plus the current partial one, so it anchors at the
+# 18:00 ET open two trading days back (Mon) — not the prior session's open (Tue) — through now.
+_WARM_START_ANCHOR = datetime(2026, 6, 8, 22, 0, tzinfo=UTC)  # Monday 18:00 ET
 
 
 def _runtime() -> ApplicationRuntime:
@@ -90,20 +92,18 @@ def _feed(sdk: _FakeSdk, **kwargs: object) -> DatabentoMarketDataFeed:
     )
 
 
-def test_intraday_replay_subscribes_trade_and_quote_with_trading_day_start() -> None:
-    asyncio.run(_run_replay_start_subscribe())
+def test_intraday_replay_without_historical_access_subscribes_live_only() -> None:
+    asyncio.run(_run_no_historical_warm_start())
 
 
-async def _run_replay_start_subscribe() -> None:
+async def _run_no_historical_warm_start() -> None:
+    # The 2-trading-day warm-start needs the Historical API; without it, the feed subscribes
+    # live-only (no intraday history) rather than handing the gateway an out-of-range start.
     sdk = _FakeSdk()
-    feed = _feed(sdk, intraday_replay=True)
+    feed = _feed(sdk, intraday_replay=True)  # no historical_source configured
     await feed.start()
-    client = sdk.clients[0]
-    by_schema = {sub["schema"]: sub for sub in client.subscriptions}
-    assert by_schema["trades"]["start"] == _SESSION_OPEN
-    assert by_schema["mbp-1"]["start"] == _SESSION_OPEN
-    assert by_schema["definition"].get("start") is None
-    assert client.started is True
+    assert all(sub.get("start") is None for sub in sdk.clients[0].subscriptions)
+    assert sdk.clients[0].started is True
     await feed.stop()
 
 
@@ -153,24 +153,25 @@ def _historical_records(
     )
 
 
-def test_rejected_replay_start_falls_back_to_historical_records_then_live(
+def test_intraday_replay_warm_starts_from_historical_api_then_subscribes_live(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    asyncio.run(_run_fallback_warm_start(caplog))
+    asyncio.run(_run_historical_warm_start(caplog))
 
 
-async def _run_fallback_warm_start(caplog: pytest.LogCaptureFixture) -> None:
-    sdk = _FakeSdk(reject_replay_start=True)
+async def _run_historical_warm_start(caplog: pytest.LogCaptureFixture) -> None:
+    # 2 trading days exceeds the live gateway's intraday-replay window, so the warm-start
+    # comes from the Historical API (start = prior trading day's open); the live subscribe
+    # happens only AFTER those records drain inside events().
+    sdk = _FakeSdk()
     fetch_calls: list[tuple[str, datetime, datetime]] = []
     feed = _feed(sdk, intraday_replay=True, historical_source=_historical_records(fetch_calls))
     await feed.start()
-    # The rejecting client was torn down; no live client exists until the
-    # historical records drain inside events().
-    assert len(sdk.clients) == 1
-    assert sdk.clients[0].stopped is True
+    # No gateway client is created during start(); the Historical API supplied the history.
+    assert len(sdk.clients) == 0
     assert [(schema, start) for schema, start, _end in fetch_calls] == [
-        ("trades", _SESSION_OPEN),
-        ("mbp-1", _SESSION_OPEN),
+        ("trades", _WARM_START_ANCHOR),
+        ("mbp-1", _WARM_START_ANCHOR),
     ]
 
     events: list[object] = []
@@ -182,7 +183,7 @@ async def _run_fallback_warm_start(caplog: pytest.LogCaptureFixture) -> None:
     task = asyncio.create_task(consume())
     with caplog.at_level("WARNING"):
         for _ in range(300):
-            if len(sdk.clients) == 2:
+            if len(sdk.clients) == 1:
                 break
             await asyncio.sleep(0.01)
         await feed.stop()
@@ -196,8 +197,8 @@ async def _run_fallback_warm_start(caplog: pytest.LogCaptureFixture) -> None:
     assert events[1].side.value == "sell"  # Databento 'A' = sell aggressor
     assert events[2].bid_price_ticks == 80_000
     # After the drain the feed subscribed live WITHOUT a start parameter.
-    assert len(sdk.clients) == 2
-    live_client = sdk.clients[1]
+    assert len(sdk.clients) == 1
+    live_client = sdk.clients[0]
     assert all(sub.get("start") is None for sub in live_client.subscriptions)
     assert live_client.started is True
     # W2-FIX F2: the seam between the fallback slice's (clamped) end and the

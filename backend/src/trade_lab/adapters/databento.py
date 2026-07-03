@@ -34,7 +34,11 @@ from trade_lab.domain.events import (
 )
 from trade_lab.domain.feed import FeedConnectionState, FeedStatus
 from trade_lab.domain.prices import NQ_TICK_SIZE, price_to_ticks
-from trade_lab.domain.trading_day import most_recent_session_open_utc
+from trade_lab.domain.trading_day import (
+    prior_trading_day,
+    trading_day_for,
+    trading_day_start_utc,
+)
 
 if TYPE_CHECKING:
     from trade_lab.adapters.databento_historical import DatabentoHistoricalSource
@@ -52,6 +56,9 @@ _WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:\\[^\s,;]+")
 _POSIX_PATH_RE = re.compile(r"/(?:[^\s,;]+/)+[^\s,;]+")
 _TRADE_SCHEMA_ALIASES = {"trade", "trades"}
 _QUOTE_SCHEMA_ALIASES = {"mbp-1", "cmbp-1", "bbo", "tbbo", "cbbo", "tcbbo"}
+# Warm-start replays this many FULL prior trading days, plus the current (in-progress) one — so
+# 2 loads two full trading days of history onto the chart (the live session is always partial).
+_WARM_START_PRIOR_TRADING_DAYS = 2
 _QUOTE_MESSAGE_ALIASES = {"bbomsg", "mbp1msg", "cmbp1msg", "tbbomsg", "cbbomsg", "tcbbomsg"}
 _CONTEXT_SCHEMAS = {"definition", "status", "statistics"}
 
@@ -221,27 +228,26 @@ class DatabentoMarketDataFeed:
             return
         self._warm_start_streams = None
         if self._intraday_replay:
-            replay_start = most_recent_session_open_utc(self._now())
-            try:
-                self._connect(replay_start=replay_start)
+            # Warm-start replays _WARM_START_PRIOR_TRADING_DAYS full prior trading days plus the
+            # current partial one: anchor at the 18:00 ET open of the trading day that many days
+            # back, through now. That window far exceeds the Databento live gateway's ~24h
+            # intraday-replay limit (a deeper `start` is rejected), so the history comes from the
+            # Historical API; the live subscribe then happens in events() AFTER those records
+            # drain, so the warm-start can never overflow the live queue. prior_trading_day skips
+            # weekends.
+            day = trading_day_for(self._now())
+            for _ in range(_WARM_START_PRIOR_TRADING_DAYS):
+                day = prior_trading_day(day)
+            replay_start = trading_day_start_utc(day)
+            self._warm_start_streams = await self._fetch_warm_start_streams(replay_start)
+            if self._warm_start_streams is not None:
+                self._loop = asyncio.get_running_loop()
                 self._started = True
                 return
-            except Exception as exc:
-                # W2 P1b: the gateway/entitlement rejected the replay-start subscribe
-                # at runtime — fall back to the Historical API for the same window.
-                logger.warning(
-                    "Databento live replay-start subscribe was rejected "
-                    "(exception_type=%s); falling back to the Historical API warm start",
-                    type(exc).__name__,
-                )
-                self._teardown_client()
-                self._warm_start_streams = await self._fetch_warm_start_streams(replay_start)
-                if self._warm_start_streams is not None:
-                    # The live subscribe happens in events() AFTER the historical
-                    # records drain, so warm-start can never overflow the live queue.
-                    self._loop = asyncio.get_running_loop()
-                    self._started = True
-                    return
+            logger.warning(
+                "Databento warm-start unavailable: Historical API access is not configured; "
+                "subscribing live without intraday history"
+            )
         self._connect(replay_start=None)
         self._started = True
 
@@ -279,18 +285,6 @@ class DatabentoMarketDataFeed:
             self._started = False
             raise
 
-    def _teardown_client(self) -> None:
-        if self._client is not None:
-            try:
-                self._sdk_facade.stop(self._client)
-            except Exception as stop_exc:  # pragma: no cover - defensive logging
-                logger.warning(
-                    "Databento client cleanup after rejected replay-start raised: "
-                    "exception_type=%s",
-                    type(stop_exc).__name__,
-                )
-        self._client = None
-        self._loop = None
 
     async def _fetch_warm_start_streams(
         self, replay_start: datetime
