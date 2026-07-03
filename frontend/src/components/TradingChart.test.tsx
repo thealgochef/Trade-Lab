@@ -16,6 +16,11 @@ const mocks = vi.hoisted(() => ({
   removeMarkers: vi.fn(),
   subscribeCrosshairMove: vi.fn(),
   unsubscribeCrosshairMove: vi.fn(),
+  timeScale: vi.fn(),
+  scrollPosition: vi.fn(() => 0),
+  getVisibleRange: vi.fn((): { from: number; to: number } | null => null),
+  setVisibleRange: vi.fn(),
+  fitContent: vi.fn(),
 }));
 
 vi.mock('lightweight-charts', () => ({
@@ -37,7 +42,10 @@ describe('TradingChart', () => {
     mocks.createChart.mockReset();
     mocks.createSeriesMarkers.mockReset();
     mocks.addSeries.mockReturnValue({ setData: mocks.setData, update: mocks.update, createPriceLine: mocks.createPriceLine, removePriceLine: mocks.removePriceLine });
-    mocks.createChart.mockReturnValue({ addSeries: mocks.addSeries, remove: mocks.remove, subscribeCrosshairMove: mocks.subscribeCrosshairMove, unsubscribeCrosshairMove: mocks.unsubscribeCrosshairMove });
+    mocks.scrollPosition.mockReturnValue(0);
+    mocks.getVisibleRange.mockReturnValue(null);
+    mocks.timeScale.mockReturnValue({ scrollPosition: mocks.scrollPosition, getVisibleRange: mocks.getVisibleRange, setVisibleRange: mocks.setVisibleRange, fitContent: mocks.fitContent });
+    mocks.createChart.mockReturnValue({ addSeries: mocks.addSeries, remove: mocks.remove, subscribeCrosshairMove: mocks.subscribeCrosshairMove, unsubscribeCrosshairMove: mocks.unsubscribeCrosshairMove, timeScale: mocks.timeScale });
     mocks.createSeriesMarkers.mockReturnValue({ setMarkers: mocks.setMarkers, remove: mocks.removeMarkers });
   });
 
@@ -130,6 +138,76 @@ describe('TradingChart', () => {
     expect(mocks.update).not.toHaveBeenCalled();
   });
 
+  it('does not fit on a tiny fresh load — the default zoom gives a readable rolling window, not a zoom onto the opening batch', () => {
+    renderChart({ bars: [chartBar('a', 1, 100), chartBar('b', 2, 101), chartBar('c', 3, 102)] });
+    expect(mocks.fitContent).not.toHaveBeenCalled();
+  });
+
+  it('fits on a substantial fresh load (e.g. a restart after the warm-up already completed) so all retained bars show', () => {
+    const bars = Array.from({ length: 80 }, (_, index) => chartBar(`b${index}`, index + 1, 100 + index));
+    renderChart({ bars });
+    expect(mocks.fitContent).toHaveBeenCalled();
+  });
+
+  it('renders warm-up growth incrementally (no full redraw) and fits once when it settles', () => {
+    const first = [chartBar('a', 1, 100)];
+    const { rerender } = renderChart({ bars: first });
+    mocks.setData.mockClear();
+    mocks.update.mockClear();
+    mocks.fitContent.mockClear();
+
+    // A warm-up snapshot appends many bars onto the unchanged prefix → incremental update, NOT a
+    // full setData redraw of the whole set, and no per-snapshot re-fit. This is the lag fix.
+    const grown = [chartBar('a', 1, 100), chartBar('b', 2, 101), chartBar('c', 3, 102), chartBar('d', 4, 103)];
+    rerender(<TradingChart timeframe={147} bars={grown} levels={[]} markers={[]} emptyTitle="empty" emptySubtitle="offline" />);
+    expect(mocks.setData).not.toHaveBeenCalled();
+    expect(mocks.update).toHaveBeenCalled();
+    expect(mocks.fitContent).not.toHaveBeenCalled();
+
+    // Settles into a single-bar live append → fit ONCE to reveal the full range.
+    rerender(<TradingChart timeframe={147} bars={[...grown, chartBar('e', 5, 104)]} levels={[]} markers={[]} emptyTitle="empty" emptySubtitle="offline" />);
+    expect(mocks.fitContent).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not refit on a single live append', () => {
+    const first = [chartBar('a', 1, 100), chartBar('b', 2, 101)];
+    const { rerender } = renderChart({ bars: first });
+    mocks.fitContent.mockClear();
+
+    rerender(<TradingChart timeframe={147} bars={[...first, chartBar('c', 3, 102)]} levels={[]} markers={[]} emptyTitle="empty" emptySubtitle="offline" />);
+
+    expect(mocks.update).toHaveBeenCalled();
+    expect(mocks.fitContent).not.toHaveBeenCalled();
+  });
+
+  it('does not refit on a retention-cap eviction at the live edge (stable bar count, not a warm-up batch)', () => {
+    const first = [chartBar('a', 1, 100), chartBar('b', 2, 101), chartBar('c', 3, 102)];
+    const { rerender } = renderChart({ bars: first });
+    mocks.fitContent.mockClear();
+
+    const evicted = [chartBar('b', 2, 101), chartBar('c', 3, 102), chartBar('d', 4, 103)];
+    rerender(<TradingChart timeframe={147} bars={evicted} levels={[]} markers={[]} emptyTitle="empty" emptySubtitle="offline" />);
+
+    expect(mocks.setData).toHaveBeenCalledWith(evicted);
+    expect(mocks.fitContent).not.toHaveBeenCalled();
+  });
+
+  it('does not refit a user who has scrolled back to inspect a label; it pins their window instead', () => {
+    const first = [chartBar('a', 1, 100), chartBar('b', 2, 101), chartBar('c', 3, 102)];
+    const { rerender } = renderChart({ bars: first });
+    mocks.fitContent.mockClear();
+
+    const scrolledRange = { from: 1, to: 2 };
+    mocks.scrollPosition.mockReturnValue(-50); // scrolled back into history
+    mocks.getVisibleRange.mockReturnValue(scrolledRange);
+
+    const evicted = [chartBar('b', 2, 101), chartBar('c', 3, 102), chartBar('d', 4, 103)];
+    rerender(<TradingChart timeframe={147} bars={evicted} levels={[]} markers={[]} emptyTitle="empty" emptySubtitle="offline" />);
+
+    expect(mocks.fitContent).not.toHaveBeenCalled();
+    expect(mocks.setVisibleRange).toHaveBeenCalledWith(scrolledRange);
+  });
+
   it('updates and removes level price lines', () => {
     const eligible: LevelOverlay = { id: 'pdh', price: 19000, title: 'PDH EL', color: '#fff', lineWidth: 2, lineStyle: 0, eligible: true };
     const display: LevelOverlay = { id: 'asia', price: 18950, title: 'ASIA DISP', color: '#708194', lineWidth: 1, lineStyle: 2, eligible: false };
@@ -143,13 +221,13 @@ describe('TradingChart', () => {
     expect(mocks.removePriceLine).toHaveBeenCalled();
   });
 
-  it('sets marker overlays with inline text stripped and cleans up chart resources', () => {
+  it('sets marker overlays with inline text labels and an enlarged glyph, and cleans up chart resources', () => {
     const markers: MarkerOverlay[] = [{ id: 'touch:t1', time: 1 as MarkerOverlay['time'], position: 'belowBar', shape: 'arrowUp', color: '#36d399', text: 'touch' }];
     const { unmount } = renderChart({ markers });
 
-    // The always-on `text` is dropped before reaching lightweight-charts (the
-    // label is shown on hover instead); `id` is preserved for hover hit-testing.
-    expect(mocks.setMarkers).toHaveBeenCalledWith([{ id: 'touch:t1', time: 1, position: 'belowBar', shape: 'arrowUp', color: '#36d399' }]);
+    // The inline `text` reaches lightweight-charts as an always-on label and the glyph is
+    // enlarged (size: 2); `id` is preserved for hover hit-testing.
+    expect(mocks.setMarkers).toHaveBeenCalledWith([{ id: 'touch:t1', time: 1, position: 'belowBar', shape: 'arrowUp', color: '#36d399', text: 'touch', size: 2 }]);
 
     const subscribedHandler = mocks.subscribeCrosshairMove.mock.calls.at(-1)?.[0];
     unmount();

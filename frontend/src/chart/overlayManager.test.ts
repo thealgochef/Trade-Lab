@@ -62,7 +62,7 @@ describe('ChartOverlayManager', () => {
     expect(firstPass[3]).toMatchObject({ lineWidth: 1, lineStyle: 2, eligible: false });
   });
 
-  it('replaces marker sets without accumulating duplicate markers and strips inline text', () => {
+  it('replaces marker sets without accumulating duplicates and keeps inline text with an enlarged glyph', () => {
     const series = createSeries();
     const manager = new ChartOverlayManager(series as never);
     const markers: SeriesMarker<Time>[] = [
@@ -73,14 +73,14 @@ describe('ChartOverlayManager', () => {
     manager.syncMarkers(markers);
     manager.syncMarkers(markers.slice(1));
 
-    // Always-on inline `text` is removed so same-bar markers no longer stack into
-    // an unreadable pile; everything else (incl. id when present) passes through.
+    // Inline `text` stays as an always-on label and each marker gets an enlarged `size` so the
+    // symbols read clearly; everything else (incl. id when present) passes through.
     expect(mocks.setMarkers).toHaveBeenNthCalledWith(1, [
-      { time: 1, position: 'belowBar', shape: 'arrowUp', color: '#36d399' },
-      { time: 2, position: 'aboveBar', shape: 'square', color: '#4ea1ff' },
+      { time: 1, position: 'belowBar', shape: 'arrowUp', color: '#36d399', text: 'touch', size: 2 },
+      { time: 2, position: 'aboveBar', shape: 'square', color: '#4ea1ff', text: 'observation', size: 2 },
     ]);
     expect(mocks.setMarkers).toHaveBeenNthCalledWith(2, [
-      { time: 2, position: 'aboveBar', shape: 'square', color: '#4ea1ff' },
+      { time: 2, position: 'aboveBar', shape: 'square', color: '#4ea1ff', text: 'observation', size: 2 },
     ]);
     expect(mocks.setMarkers).toHaveBeenCalledTimes(2);
   });

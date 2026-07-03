@@ -2,7 +2,10 @@ import type { CandlestickData, SeriesMarker, Time, UTCTimestamp } from 'lightwei
 import type { MarketBar, MarketLevel, MarketTouch, Observation, Prediction, Timeframe } from '../domain/models';
 
 export const PRICE_TICK_SIZE = 0.25;
-export const MAX_BARS_PER_TIMEFRAME = 2_500;
+// Sized to hold 2 full trading days (plus the current partial) per timeframe — the live
+// warm-start replays two full prior trading days; matches the backend recent_closed_bar_limit
+// so the chart never truncates below what the backend retains and sends.
+export const MAX_BARS_PER_TIMEFRAME = 8_000;
 
 export type ChartBar = CandlestickData<Time> & {
   key: string;

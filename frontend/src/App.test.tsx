@@ -26,7 +26,7 @@ vi.mock('lightweight-charts', () => ({
   CandlestickSeries: 'CandlestickSeries',
   ColorType: { Solid: 'solid' },
   CrosshairMode: { Normal: 1 },
-  createChart: vi.fn(() => ({ addSeries: vi.fn(() => ({ setData: mocks.setData, update: mocks.update, createPriceLine: mocks.createPriceLine, removePriceLine: mocks.removePriceLine })), remove: mocks.chartRemove, subscribeCrosshairMove: vi.fn(), unsubscribeCrosshairMove: vi.fn() })),
+  createChart: vi.fn(() => ({ addSeries: vi.fn(() => ({ setData: mocks.setData, update: mocks.update, createPriceLine: mocks.createPriceLine, removePriceLine: mocks.removePriceLine })), remove: mocks.chartRemove, subscribeCrosshairMove: vi.fn(), unsubscribeCrosshairMove: vi.fn(), timeScale: () => ({ scrollPosition: () => 0, getVisibleRange: () => null, setVisibleRange: () => {}, fitContent: () => {} }) })),
   createSeriesMarkers: vi.fn(() => ({ setMarkers: mocks.setMarkers, remove: mocks.removeMarkers })),
 }));
 

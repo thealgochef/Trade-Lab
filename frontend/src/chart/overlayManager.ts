@@ -4,6 +4,10 @@ import type { LevelOverlay } from './viewModels';
 
 type MarkerApi = { setMarkers: (markers: SeriesMarker<Time>[]) => void; remove?: () => void };
 
+// Enlarge the marker glyph (default is 1) so touch/prediction/outcome symbols read clearly
+// against the candles instead of getting lost next to them.
+const MARKER_SIZE = 2;
+
 export class ChartOverlayManager {
   private readonly priceLines = new Map<string, IPriceLine>();
   private readonly markerApi: MarkerApi;
@@ -39,16 +43,10 @@ export class ChartOverlayManager {
   }
 
   syncMarkers(markers: SeriesMarker<Time>[]) {
-    // Drop each marker's inline `text`: lightweight-charts renders it as an
-    // always-on label with no collision handling, so same-bar markers stack into
-    // an unreadable pile. Shape + colour still convey the outcome at a glance, and
-    // the full label is surfaced on hover by the TradingChart tooltip (which keys
-    // off the marker `id`, so `id` is intentionally preserved here).
-    this.markerApi.setMarkers(markers.map((marker) => {
-      const next = { ...marker };
-      delete next.text;
-      return next;
-    }));
+    // Render each marker's inline `text` as an always-on label (plus a larger glyph) so the
+    // touch/prediction/outcome annotations are legible on the chart without hovering. The hover
+    // tooltip still works for the full label; `id` is preserved for that hit-testing.
+    this.markerApi.setMarkers(markers.map((marker) => ({ ...marker, size: MARKER_SIZE })));
   }
 
   destroy() {

@@ -4,6 +4,16 @@ import { ChartOverlayManager } from '../chart/overlayManager';
 import type { ChartBar, LevelOverlay, MarkerOverlay } from '../chart/viewModels';
 import type { Timeframe } from '../domain/models';
 
+// Treat the viewport as "parked at the live edge" while its right edge sits within this many
+// bars of the newest bar. timeScale.scrollPosition() returns that right offset in bars: ~0
+// while following the latest bar, increasingly negative once the user scrolls back to inspect.
+const FOLLOW_EDGE_BARS = 2;
+// On a fresh load carrying at least this many bars (e.g. a restart after the warm-up already
+// completed, or any substantial snapshot), frame the whole retained range. Below it — the tiny
+// opening batch at the start of a streaming warm-up — we skip the fit so the chart doesn't zoom
+// onto 2-3 bars; the settle branch reveals the full range once that warm-up finishes growing.
+const REVEAL_MIN_BARS = 50;
+
 type TradingChartProps = {
   timeframe: Timeframe;
   bars: ChartBar[];
@@ -19,8 +29,13 @@ export function TradingChart({ timeframe, bars, levels, markers, emptyTitle, emp
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const overlaysRef = useRef<ChartOverlayManager | null>(null);
   const previousBarsRef = useRef<{ timeframe: Timeframe; bars: ChartBar[] } | null>(null);
+  // True while warm-up / backfill snapshots are still growing the bar set. The reveal
+  // fitContent() is deferred until they settle (the first incremental live update) rather
+  // than re-laying-out the whole chart on every snapshot — which made a multi-session
+  // warm-up (one big snapshot per second for minutes) lag badly.
+  const warmGrowingRef = useRef(false);
   const tooltipRef = useRef<HTMLDivElement | null>(null);
-  // Marker labels are no longer drawn inline (they overlapped); this id→text map
+  // Marker labels render inline (with an enlarged glyph); this id→text map still
   // backs the hover tooltip, keyed by the same marker id lightweight-charts
   // reports via MouseEventParams.hoveredObjectId.
   const markerLabelsRef = useRef<Map<string, string>>(new Map());
@@ -96,9 +111,47 @@ export function TradingChart({ timeframe, bars, levels, markers, emptyTitle, emp
 
   useEffect(() => {
     const series = seriesRef.current;
-    if (!series) return;
-    applyBarData(series, timeframe, bars, previousBarsRef.current);
+    const chart = chartRef.current;
+    if (!series || !chart) return;
+    const previous = previousBarsRef.current;
+    const timeScale = chart.timeScale();
+
+    // A "fresh" series generation: the first bars, a timeframe switch, or a repopulate after the
+    // store cleared (warm-up / replay (re)start).
+    const fresh = !previous || previous.timeframe !== timeframe || previous.bars.length === 0;
+    const following = timeScale.scrollPosition() >= -FOLLOW_EDGE_BARS;
+    // A wholesale snapshot that grows the set by more than one bar is the warm-up filling in (or
+    // a backfill) — as opposed to a single live append or a retention-cap shift.
+    const batchGrew = !!previous && bars.length > previous.bars.length + 1;
+    // While the user is scrolled back inspecting, capture their time window so a wholesale
+    // setData below cannot drift it out from under them (e.g. a cap eviction). A time range
+    // stays anchored to the same bars across that shift.
+    const preserved = !fresh && !following && bars.length > 0 ? timeScale.getVisibleRange() : null;
+
+    const replaced = applyBarData(series, timeframe, bars, previous);
     previousBarsRef.current = { timeframe, bars };
+    if (bars.length === 0) {
+      warmGrowingRef.current = false;
+      return;
+    }
+
+    // Reveal the FULL retained range — so warm-up bars and the labels printed on them stay
+    // reachable instead of scrolling off the live edge — but WITHOUT re-laying-out the chart on
+    // every snapshot. Fit once on a fresh load; while warm-up snapshots keep growing the set
+    // (which now render incrementally, not via setData), just remember it and fit ONCE when they
+    // settle into single-bar live updates. fitContent() scales to the actual data (no dead
+    // whitespace), and a user scrolled back to inspect a marker is never refit or yanked forward.
+    if (fresh) {
+      if (bars.length >= REVEAL_MIN_BARS) timeScale.fitContent();
+      warmGrowingRef.current = false;
+    } else if (following && batchGrew) {
+      warmGrowingRef.current = true;
+    } else if (warmGrowingRef.current && following && !batchGrew && !replaced) {
+      timeScale.fitContent();
+      warmGrowingRef.current = false;
+    } else if (replaced && preserved) {
+      timeScale.setVisibleRange(preserved);
+    }
   }, [timeframe, bars]);
 
   useEffect(() => overlaysRef.current?.syncLevels(levels), [levels]);
@@ -145,19 +198,24 @@ export function TradingChart({ timeframe, bars, levels, markers, emptyTitle, emp
   );
 }
 
-const applyBarData = (series: ISeriesApi<'Candlestick'>, timeframe: Timeframe, bars: ChartBar[], previous: { timeframe: Timeframe; bars: ChartBar[] } | null) => {
-  if (!previous || previous.timeframe !== timeframe || shouldReplaceBarData(previous.bars, bars)) {
+// Returns true when the series was wholesale-replaced via setData (first load, timeframe switch,
+// shrink/prefix change, retention-cap eviction, or a warm-up snapshot), false when only the
+// trailing bars were incrementally updated. The caller uses this to decide whether the viewport
+// needs (re)framing — only the wholesale-replace path can drop the user's history out of view.
+const applyBarData = (series: ISeriesApi<'Candlestick'>, timeframe: Timeframe, bars: ChartBar[], previous: { timeframe: Timeframe; bars: ChartBar[] } | null): boolean => {
+  if (!previous || previous.timeframe !== timeframe || previous.bars.length === 0 || shouldReplaceBarData(previous.bars, bars)) {
     series.setData(bars);
-    return;
+    return true;
   }
 
   if (bars.length === 0) {
     series.setData([]);
-    return;
+    return true;
   }
 
   const start = Math.max(previous.bars.length - 1, 0);
   for (const bar of bars.slice(start)) series.update(bar);
+  return false;
 };
 
 const shouldReplaceBarData = (previous: ChartBar[], next: ChartBar[]) => {
@@ -168,11 +226,11 @@ const shouldReplaceBarData = (previous: ChartBar[], next: ChartBar[]) => {
     return !hasMatchingPrefix(previous, next, previous.length - 1) || !isSameLogicalBar(previous[previous.length - 1], next[next.length - 1]);
   }
 
-  if (next.length === previous.length + 1) {
-    return !hasMatchingPrefix(previous, next, previous.length);
-  }
-
-  return true;
+  // next is longer: a clean append (the existing bars unchanged) is pushed incrementally — only
+  // the new bars reach the series instead of redrawing the whole set, which keeps a multi-session
+  // warm-up (snapshots that append many bars at once) smooth. A changed prefix (e.g. a
+  // retention-cap eviction dropping the front bar) still needs a full setData.
+  return !hasMatchingPrefix(previous, next, previous.length);
 };
 
 const hasMatchingPrefix = (previous: ChartBar[], next: ChartBar[], length: number) => {
