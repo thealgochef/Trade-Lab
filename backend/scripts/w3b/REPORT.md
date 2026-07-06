@@ -1,3 +1,6 @@
+> HISTORICAL (2026-06-15): the first 51/73 run against the 06-13 bundle on the pre-adoption reader.
+> Superseded by the D-P-16 reduced-coverage re-gate on NQ_W3_20260617T220752Z — see SC docs/PLATFORM_REFACTOR_PROGRESS.md §W3b CLOSE.
+
 # W3b — Batch↔Serving Parity Gate + Falsification — Report
 
 **Verdict: HARD-GREEN on the evaluated window (51/73 D-036 days), zero mismatches on
