@@ -9,13 +9,16 @@ training's ``prev_full_hl`` carry in SEED_PARITY_RECON.md §5.
 
 import asyncio
 import logging
+import threading
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from strategy_core.data.prior_day import PriorDayExtremes
 
+import trade_lab.services.replay as replay_module
 from trade_lab.domain.events import TradeEvent
 from trade_lab.domain.levels import LevelKind
 from trade_lab.ports.market_data import HistoricalMarketDataSource
@@ -150,6 +153,99 @@ async def test_walk_miss_warns_and_replay_completes_unseeded(
     assert "seeded PDH/PDL" not in (runtime.snapshot().feed_status.last_message or "")
     assert _level_ticks(runtime, LevelKind.PDH) == set()
     assert _level_ticks(runtime, LevelKind.PDL) == set()
+
+
+@pytest.mark.asyncio
+async def test_seed_exception_warns_and_replay_completes_unseeded(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ANY seed-path failure proceeds unseeded — a seed problem never kills a replay."""
+    symbol_dir = tmp_path / "NQ"
+    _write_prior_day(symbol_dir)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("synthetic seed failure")
+
+    monkeypatch.setattr(replay_module, "prior_full_day_extremes", boom)
+    runtime = _runtime()
+    service = HistoricalReplayService(runtime)
+    with caplog.at_level(logging.WARNING, logger="trade_lab.services.replay"):
+        await service.start(
+            FakeDaySource((_replay_trade(0, 68010, 1), _replay_trade(1, 68012, 2))),
+            _day_config(symbol_dir),
+        )
+        await _wait_terminal(service)
+    assert any(
+        "seed resolution failed" in record.getMessage() for record in caplog.records
+    )
+    assert _level_ticks(runtime, LevelKind.PDH) == set()
+
+
+class _GatedSeed:
+    """Seed stub whose Nth call blocks on an event (runs inside asyncio.to_thread)."""
+
+    def __init__(self, gate_from_call: int) -> None:
+        self.calls = 0
+        self.release = threading.Event()
+        self._gate_from_call = gate_from_call
+
+    def __call__(self, *args, **kwargs):
+        self.calls += 1
+        if self.calls >= self._gate_from_call:
+            assert self.release.wait(timeout=5), "seed gate never released"
+        return PriorDayExtremes(source_day=date(2026, 3, 9), high_ticks=68004, low_ticks=68001)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_start_rejected_and_status_loading_during_seed_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """During the seed drain: a second start() raises, and status() reports LOADING —
+    not the PREVIOUS run's COMPLETED (which would punch through the app-level
+    live/replay 409 exclusion)."""
+    symbol_dir = tmp_path / "NQ"
+    _write_prior_day(symbol_dir)
+    seed = _GatedSeed(gate_from_call=2)  # first run seeds instantly, second blocks
+    monkeypatch.setattr(replay_module, "prior_full_day_extremes", seed)
+    runtime = _runtime()
+    service = HistoricalReplayService(runtime)
+    await service.start(FakeDaySource((_replay_trade(0, 68010, 1),)), _day_config(symbol_dir))
+    await _wait_terminal(service)
+    assert service.status().state == ReplayState.COMPLETED
+
+    second = asyncio.ensure_future(
+        service.start(FakeDaySource((_replay_trade(1, 68012, 2),)), _day_config(symbol_dir))
+    )
+    while seed.calls < 2:  # the drain is in flight
+        await asyncio.sleep(0.01)
+    assert service.status().state == ReplayState.LOADING
+    with pytest.raises(RuntimeError, match="already running"):
+        await service.start(FakeDaySource(()), _day_config(symbol_dir))
+    seed.release.set()
+    await second
+    await _wait_terminal(service)
+
+
+@pytest.mark.asyncio
+async def test_stop_during_seed_drain_aborts_before_any_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    symbol_dir = tmp_path / "NQ"
+    _write_prior_day(symbol_dir)
+    seed = _GatedSeed(gate_from_call=1)  # blocks immediately
+    monkeypatch.setattr(replay_module, "prior_full_day_extremes", seed)
+    runtime = _runtime()
+    service = HistoricalReplayService(runtime)
+    starter = asyncio.ensure_future(
+        service.start(FakeDaySource((_replay_trade(0, 68010, 1),)), _day_config(symbol_dir))
+    )
+    while seed.calls < 1:
+        await asyncio.sleep(0.01)
+    await service.stop()  # lands mid-drain: nothing to cancel yet
+    seed.release.set()
+    await starter
+    assert service.status().state == ReplayState.STOPPED
+    assert service.status().events_processed == 0
 
 
 @pytest.mark.asyncio

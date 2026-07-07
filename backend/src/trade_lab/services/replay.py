@@ -120,6 +120,7 @@ class HistoricalReplayService:
             raise ValueError("update_queue_depth must be positive")
         self.runtime = runtime
         self._state = ReplayState.IDLE
+        self._starting = False
         self._events_processed = 0
         self._warnings_recorded = 0
         self._last_error: str | None = None
@@ -186,8 +187,22 @@ class HistoricalReplayService:
         )
 
     async def start(self, source: HistoricalMarketDataSource, config: ReplayConfig) -> None:
-        if self._task is not None and not self._task.done():
+        # The seed drain below yields the event loop for seconds, so an in-flight start
+        # must be visible to concurrent callers before self._task exists.
+        if self._starting or (self._task is not None and not self._task.done()):
             raise RuntimeError("replay is already running")
+        self._starting = True
+        try:
+            await self._start_locked(source, config)
+        finally:
+            self._starting = False
+
+    async def _start_locked(self, source: HistoricalMarketDataSource, config: ReplayConfig) -> None:
+        # Drop the previous run's core handle FIRST: status() prefers the core state, and
+        # during the seed drain a stale handle would report the PREVIOUS replay's
+        # COMPLETED — which also punches through the app-level live/replay 409 exclusion
+        # (LOADING is an active state; the stale COMPLETED is not).
+        self.strategy_core_replay = None
         self._config = config
         self._events_processed = 0
         self._warnings_recorded = 0
@@ -224,13 +239,6 @@ class HistoricalReplayService:
                     requested_symbol=config.requested_symbol,
                     max_walk_days=_SEED_MAX_WALK_DAYS,
                 )
-            except Exception as exc:  # a seed problem must never kill a replay
-                logger.warning(
-                    "replay PDH/PDL seed resolution failed for %s (%s); proceeding unseeded",
-                    config.trading_day,
-                    exc,
-                )
-            else:
                 if extremes is None:
                     logger.warning(
                         "replay unseeded: no prior store day with trades within %d days of %s",
@@ -244,6 +252,12 @@ class HistoricalReplayService:
                         low_ticks=extremes.low_ticks,
                     )
                     seed_note = f"; seeded PDH/PDL from {extremes.source_day.isoformat()}"
+            except Exception as exc:  # ANY seed problem must never kill a replay
+                logger.warning(
+                    "replay PDH/PDL seed resolution failed for %s (%s); proceeding unseeded",
+                    config.trading_day,
+                    exc,
+                )
         await self._emit(
             self.runtime.set_feed_status(
                 FeedStatus(
@@ -256,6 +270,14 @@ class HistoricalReplayService:
                 )
             )
         )
+        # A stop() issued during the seed drain must win: abort before spawning the
+        # core replay (stop() found nothing to cancel while _task was still None).
+        if self._stop_requested:
+            if self._state is not ReplayState.STOPPED:
+                self._state = ReplayState.STOPPED
+                self._completed_at_utc = datetime.now(UTC)
+                await self._emit_terminal_feed_status("historical replay stopped")
+            return
         adapter = _StrategyCoreHistoricalSourceAdapter(source, config)
         self.strategy_core_replay = CoreReplayRuntime(
             None,
