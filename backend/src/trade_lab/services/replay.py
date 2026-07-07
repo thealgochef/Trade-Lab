@@ -10,6 +10,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import cast
 
+from strategy_core.data.prior_day import prior_full_day_extremes
 from strategy_core.runtime import ReplayConfig as CoreReplayConfig
 from strategy_core.runtime import ReplayRuntime as CoreReplayRuntime
 from strategy_core.runtime import ReplayState as CoreReplayState
@@ -32,6 +33,10 @@ logger = logging.getLogger(__name__)
 # market.bar.closed messages (which shows up as gaps in the chart).
 _REPLAY_FLUSH_INTERVAL_SECONDS = 0.05
 _REPLAY_MAX_PENDING_UPDATES = 4000
+
+# SEED: how far back the prior-day PDH/PDL store walk looks. Passed explicitly so the
+# unseeded warning states the bound actually used.
+_SEED_MAX_WALK_DAYS = 10
 
 class _StrategyCoreHistoricalSourceAdapter:
     """Expose a Trade-Lab historical source as a Strategy-Core replay source."""
@@ -203,6 +208,42 @@ class HistoricalReplayService:
                 reset_reason="replay_reset",
             )
         )
+        # SEED: give day-mode replays the training-parity PDH/PDL seed — the canonical
+        # store walk (SEED_PARITY_RECON.md §5: tick-exact equal to QL's prev_full_hl
+        # carry). Must run AFTER runtime.reset (the reset rebuilds the SC service, so an
+        # earlier seed would be wiped) and BEFORE the core replay task starts (so the
+        # summary is banked before the first event). A walk miss or a seed failure never
+        # kills the replay — it proceeds unseeded, QL's cold-start equivalent.
+        seed_note = ""
+        if config.trading_day is not None and config.symbol_dir is not None:
+            try:
+                extremes = await asyncio.to_thread(
+                    prior_full_day_extremes,
+                    config.symbol_dir,
+                    config.trading_day,
+                    requested_symbol=config.requested_symbol,
+                    max_walk_days=_SEED_MAX_WALK_DAYS,
+                )
+            except Exception as exc:  # a seed problem must never kill a replay
+                logger.warning(
+                    "replay PDH/PDL seed resolution failed for %s (%s); proceeding unseeded",
+                    config.trading_day,
+                    exc,
+                )
+            else:
+                if extremes is None:
+                    logger.warning(
+                        "replay unseeded: no prior store day with trades within %d days of %s",
+                        _SEED_MAX_WALK_DAYS,
+                        config.trading_day,
+                    )
+                else:
+                    self.runtime.levels.load_prior_day_summary(
+                        extremes.source_day,
+                        high_ticks=extremes.high_ticks,
+                        low_ticks=extremes.low_ticks,
+                    )
+                    seed_note = f"; seeded PDH/PDL from {extremes.source_day.isoformat()}"
         await self._emit(
             self.runtime.set_feed_status(
                 FeedStatus(
@@ -210,7 +251,7 @@ class HistoricalReplayService:
                     mode="replay",
                     requested_symbol=config.requested_symbol,
                     schema=config.schema,
-                    last_message="historical replay loading",
+                    last_message=f"historical replay loading{seed_note}",
                     metadata={"source_id": config.source_id} if config.source_id else {},
                 )
             )
