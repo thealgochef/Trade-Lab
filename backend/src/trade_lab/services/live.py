@@ -256,6 +256,9 @@ class LiveMarketDataService:
             self._warm_anchor_utc = self._now()
             self._warm_start_state = "warming"
             self._warm_start_events = 0
+            # WARM-FIX P3: no predictions (and thus no resolver registrations and no
+            # journal rows) while the warm replay drains; cleared on the live flip.
+            self.runtime.set_live_warm_inference_gate(True)
             # Each (re)start re-runs the warm-start replay, so re-arm the throttle.
             self._live_streaming = False
             self._last_warm_snapshot_at = None
@@ -277,6 +280,7 @@ class LiveMarketDataService:
             except Exception as exc:
                 self._state = LiveState.FAILED
                 self._last_error = type(exc).__name__
+                self.runtime.set_live_warm_inference_gate(False)
                 if feed is not None:
                     with suppress(Exception):
                         await feed.stop()
@@ -325,6 +329,9 @@ class LiveMarketDataService:
             self._feed = None
             self._state = LiveState.STOPPED
             self._stopped_at_utc = datetime.now(UTC)
+            # WARM-FIX P3: a stop mid-warm must not leave the shared runtime gated
+            # (the next replay/live start resets anyway; this is belt-and-braces).
+            self.runtime.set_live_warm_inference_gate(False)
             # W2 P2a (F10): finalize open setups whose cutoff has already passed;
             # the flushed drops ride the normal drop -> DroppedPrediction surface.
             await self._emit(self.runtime.flush_resolver(datetime.now(UTC)))
@@ -391,6 +398,10 @@ class LiveMarketDataService:
             # WARM-FIX P2: the live phase delivered — the watchdog loop disarms on
             # this flip, and a fresh silence episode starts from zero strikes.
             self._watchdog_strikes = 0
+            # WARM-FIX P3: this runs BEFORE process_market_event for the same item
+            # (live.py _process_live_item ordering), so the flipping event itself
+            # already predicts/journals normally.
+            self.runtime.set_live_warm_inference_gate(False)
 
     async def _wait_strategy_core_live(self) -> None:
         core = self.strategy_core_live
@@ -517,6 +528,7 @@ class LiveMarketDataService:
             if strike >= 2:
                 self._state = LiveState.FAILED
                 self._last_error = "live_watchdog_silent_after_reconnect"
+                self.runtime.set_live_warm_inference_gate(False)
                 await self._emit_status(
                     FeedConnectionState.DISCONNECTED,
                     "live feed failed: watchdog found no live messages after reconnect",
