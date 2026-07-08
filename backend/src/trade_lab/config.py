@@ -26,6 +26,12 @@ class Settings(BaseSettings):
 
     backend_host: str = "127.0.0.1"
     backend_port: int = 8001
+
+    # WARM-FIX P5 (WEDGE_CAPTURE.md §A.2: the deployment had NO logging surface —
+    # app/SDK records below WARNING went nowhere, which kept the wedge invisible).
+    # Root logging level for the dev-server entrypoint; DEBUG also raises the
+    # databento SDK logger to DEBUG (soak-evidence instrumentation).
+    log_level: str = Field(default="INFO", min_length=1, max_length=16)
     allowed_origins: str = "http://localhost:5174,http://127.0.0.1:5174"
     data_path: Path | None = None
 
