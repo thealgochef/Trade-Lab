@@ -3,7 +3,7 @@ PDH/PDL seeding, warm/live status marking, and disconnect auto-reconnect."""
 
 import asyncio
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -205,6 +205,120 @@ async def _run_historical_warm_start(caplog: pytest.LogCaptureFixture) -> None:
         "warm-start fallback slice ends 0.0 s before live subscribe "
         "(historical availability lag)"
     ]
+
+
+def test_quote_warm_fetch_is_scoped_to_retention_plus_slack() -> None:
+    asyncio.run(_run_scoped_quote_fetch())
+
+
+async def _run_scoped_quote_fetch() -> None:
+    # WARM-FIX P4: trades keep the full 2-prior-trading-day span; the quote schema
+    # starts at now - (retention + 10 min slack) - here 30 + 10 = 40 minutes.
+    sdk = _FakeSdk()
+    fetch_calls: list[tuple[str, datetime, datetime]] = []
+    feed = _feed(
+        sdk,
+        intraday_replay=True,
+        historical_source=_historical_records(fetch_calls),
+        quote_warm_retention_provider=lambda: timedelta(minutes=30),
+    )
+    await feed.start()
+    assert [(schema, start) for schema, start, _end in fetch_calls] == [
+        ("trades", _WARM_START_ANCHOR),
+        ("mbp-1", _NOW - timedelta(minutes=40)),
+    ]
+    await feed.stop()
+
+
+def test_drain_merge_tolerates_asymmetric_schema_spans() -> None:
+    asyncio.run(_run_asymmetric_drain())
+
+
+async def _run_asymmetric_drain() -> None:
+    # WARM-FIX P4: heapq.merge only needs each stream individually sorted — with a
+    # scoped quote span the trades yield alone until the (later) quote head appears.
+    base_ns = 1_781_200_000_000_000_000
+
+    def record_fetcher(schema: str, start: datetime, end: datetime):
+        if schema == "trades":
+            return [
+                SimpleNamespace(
+                    ts_event=base_ns + i * 1_000_000_000,
+                    price=20_000_250_000_000,
+                    size=1,
+                    side="B",
+                )
+                for i in range(3)
+            ]
+        return [
+            SimpleNamespace(
+                ts_event=base_ns + 10_000_000_000,
+                levels=[
+                    SimpleNamespace(
+                        bid_px=20_000_000_000_000, bid_sz=3, ask_px=20_000_500_000_000, ask_sz=4
+                    )
+                ],
+            )
+        ]
+
+    source = DatabentoHistoricalSource(
+        api_key=None,
+        dataset="GLBX.MDP3",
+        requested_symbol="NQ.c.0",
+        stype_in="continuous",
+        record_fetcher=record_fetcher,
+    )
+    feed = _feed(_FakeSdk(), intraday_replay=True, historical_source=source)
+    await feed.start()
+
+    events: list[object] = []
+
+    async def consume() -> None:
+        async for item in feed.events():
+            events.append(item)
+
+    task = asyncio.create_task(consume())
+    for _ in range(300):
+        if len(events) >= 5:
+            break
+        await asyncio.sleep(0.01)
+    await feed.stop()
+    await task
+    # events[0] is the initial FeedStatus; then all three trades precede the quote.
+    assert [type(event).__name__ for event in events[1:5]] == [
+        "TradeEvent",
+        "TradeEvent",
+        "TradeEvent",
+        "TopOfBookEvent",
+    ]
+
+
+def test_dbn_record_streams_guards_end_le_start_per_schema() -> None:
+    # WARM-FIX P4: the end<=start guard is per schema — an entirely-swallowed quote
+    # window yields an empty stream while trades still fetch.
+    calls: list[str] = []
+
+    def record_fetcher(schema: str, start: datetime, end: datetime):
+        calls.append(schema)
+        return [SimpleNamespace(ts_event=1)]
+
+    source = DatabentoHistoricalSource(
+        api_key=None,
+        dataset="GLBX.MDP3",
+        requested_symbol="NQ.c.0",
+        stype_in="continuous",
+        record_fetcher=record_fetcher,
+    )
+    end = datetime(2026, 6, 11, 15, 0, tzinfo=UTC)
+    streams = dict(
+        source.dbn_record_streams(
+            end=end,
+            schema_starts=(("trades", end - timedelta(hours=2)), ("mbp-1", end)),
+        )
+    )
+    assert calls == ["trades"]
+    assert tuple(streams["mbp-1"]) == ()
+    assert source.last_stream_end == end
 
 
 def _ohlcv_source(calls: list[tuple[datetime, datetime]]) -> DatabentoHistoricalSource:

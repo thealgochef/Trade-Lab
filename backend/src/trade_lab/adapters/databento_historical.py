@@ -4,9 +4,12 @@ D-P-03: the Historical API exists solely for the live warm-start slice. Two
 consumers remain after the Chicago display seed retired (W2 P1e):
 
 * ``dbn_record_streams`` — the warm-start FALLBACK when the live gateway rejects
-  the intraday replay-start subscribe: raw DBN records (trades + MBP-1) for
-  ``[trading-day 18:00 ET, now)``, fed through the SAME
-  ``normalize_provider_message`` path live records take.
+  the intraday replay-start subscribe: raw DBN records fed through the SAME
+  ``normalize_provider_message`` path live records take. WARM-FIX P4: spans are
+  per-schema — trades keep ``[trading-day 18:00 ET, now)`` while the quote schema
+  is scoped to the market-context retention window (quotes only survive the
+  drain inside that rolling buffer). The retention is read at fetch time; a
+  later hot-swap to a wider-retention contract does NOT refetch.
 * ``ohlcv_frame`` — the tiny prior-trading-day ohlcv-1h request reduced to
   (max high, min low) for ``runtime.load_prior_day_summary`` (W2 P1c), the same
   seed path research and cold replay use.
@@ -66,34 +69,54 @@ class DatabentoHistoricalSource:
         return self._api_key is not None and is_databento_sdk_available()
 
     def dbn_record_streams(
-        self, *, start: datetime, end: datetime, schemas: tuple[str, ...]
+        self, *, end: datetime, schema_starts: tuple[tuple[str, datetime], ...]
     ) -> tuple[tuple[str, Iterable[Any]], ...]:
-        """Per-schema DBN record streams over ``[start, end)`` for warm start."""
+        """Per-schema DBN record streams over ``[start_of(schema), end)`` for warm start.
+
+        WARM-FIX P4: each schema carries its own start (trades full-span, quotes
+        retention-scoped), and the ``end <= start`` guard plus the availability
+        clamp apply PER SCHEMA — a quote window that the availability lag has
+        entirely swallowed yields an empty stream while trades still fetch.
+        ``heapq.merge`` in the adapter drain tolerates the asymmetric spans (each
+        stream is individually sorted; trades simply yield alone until the quote
+        head appears).
+        """
 
         if self._record_fetcher is not None:
             self.last_stream_end = end
-            return tuple((schema, self._record_fetcher(schema, start, end)) for schema in schemas)
+            return tuple(
+                (schema, () if end <= start else self._record_fetcher(schema, start, end))
+                for schema, start in schema_starts
+            )
         client = self._client()
         # Historical data lags real time by minutes; an unclamped end (≈ now)
-        # triggers a 422 data_end_after_available_end error.
-        end = self._clamp_end_to_available(client, end, schemas[0])
-        self.last_stream_end = end
-        if end <= start:
-            return tuple((schema, ()) for schema in schemas)
-        return tuple(
-            (
-                schema,
-                client.timeseries.get_range(
-                    dataset=self._dataset,
-                    schema=schema,
-                    symbols=[self._requested_symbol],
-                    stype_in=self._stype_in,
-                    start=start,
-                    end=end,
-                ),
+        # triggers a 422 data_end_after_available_end error. One metadata call
+        # serves every schema's clamp.
+        availability = self._dataset_availability(client)
+        streams: list[tuple[str, Iterable[Any]]] = []
+        effective_ends: list[datetime] = []
+        for schema, start in schema_starts:
+            schema_end = self._clamped_end(availability, end, schema)
+            effective_ends.append(schema_end)
+            if schema_end <= start:
+                streams.append((schema, ()))
+                continue
+            streams.append(
+                (
+                    schema,
+                    client.timeseries.get_range(
+                        dataset=self._dataset,
+                        schema=schema,
+                        symbols=[self._requested_symbol],
+                        stype_in=self._stype_in,
+                        start=start,
+                        end=schema_end,
+                    ),
+                )
             )
-            for schema in schemas
-        )
+        # The seam-gap warning reads the latest end any schema actually used.
+        self.last_stream_end = max(effective_ends) if effective_ends else end
+        return tuple(streams)
 
     def ohlcv_frame(self, *, start: datetime, end: datetime) -> "pd.DataFrame":
         """Hourly ohlcv bars over ``[start, end)`` (the prior-day summary input)."""
@@ -125,19 +148,23 @@ class DatabentoHistoricalSource:
 
         return databento.Historical(self._api_key)
 
-    def _clamp_end_to_available(self, client: Any, end: datetime, schema: str) -> datetime:
+    def _dataset_availability(self, client: Any) -> Any:
+        try:
+            return client.metadata.get_dataset_range(self._dataset)
+        except Exception:
+            return None
+
+    def _clamped_end(self, availability: Any, end: datetime, schema: str) -> datetime:
         import pandas as pd
 
-        try:
-            available = client.metadata.get_dataset_range(self._dataset)
-        except Exception:
+        if availability is None:
             return end
         raw_end = None
-        schema_ranges = available.get("schema") if isinstance(available, dict) else None
+        schema_ranges = availability.get("schema") if isinstance(availability, dict) else None
         if isinstance(schema_ranges, dict) and isinstance(schema_ranges.get(schema), dict):
             raw_end = schema_ranges[schema].get("end")
-        if raw_end is None and isinstance(available, dict):
-            raw_end = available.get("end")
+        if raw_end is None and isinstance(availability, dict):
+            raw_end = availability.get("end")
         if raw_end is None:
             return end
         available_end = pd.Timestamp(raw_end).to_pydatetime()

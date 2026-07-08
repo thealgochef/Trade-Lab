@@ -4,6 +4,7 @@ import hmac
 import ipaddress
 import re
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -307,6 +308,16 @@ def create_app(
             stype_in=settings.databento_stype_in,
         )
 
+        def _quote_warm_retention() -> timedelta:
+            # WARM-FIX P4: effective quote retention at FETCH time — the runtime's
+            # contract-driven buffer retention (runtime.py W1 P3b) floored at the
+            # settings baseline. A post-start hot-swap to a wider-retention
+            # contract does NOT refetch (see the adapter docstring caveat).
+            return max(
+                runtime.market_context.retention,
+                timedelta(minutes=settings.market_context_retention_minutes),
+            )
+
         def live_feed_factory(config: LiveConfig):
             if settings.databento_api_key is None:
                 raise RuntimeError("Databento API key is not configured")
@@ -322,6 +333,8 @@ def create_app(
                 # through the same adapter path before flowing into real time.
                 intraday_replay=True,
                 historical_source=historical_source,
+                # WARM-FIX P4: scope the mbp-1 warm fetch to retention + slack.
+                quote_warm_retention_provider=_quote_warm_retention,
             )
 
         live = LiveMarketDataService(

@@ -60,6 +60,12 @@ _QUOTE_SCHEMA_ALIASES = {"mbp-1", "cmbp-1", "bbo", "tbbo", "cbbo", "tcbbo"}
 # Warm-start replays this many FULL prior trading days, plus the current (in-progress) one — so
 # 2 loads two full trading days of history onto the chart (the live session is always partial).
 _WARM_START_PRIOR_TRADING_DAYS = 2
+# WARM-FIX P4: slack added to the effective market-context retention when scoping the
+# quote-schema warm fetch. Quotes only feed the rolling context buffer (WARM_PERF_RECON
+# §3: every other survivor of the drain is trades-only or latest-wins), so fetching
+# quotes beyond retention+slack is pure eviction fodder — 96.9% of the measured 20-min
+# warm was full-span mbp-1.
+_QUOTE_WARM_SLACK = timedelta(minutes=10)
 _QUOTE_MESSAGE_ALIASES = {"bbomsg", "mbp1msg", "cmbp1msg", "tbbomsg", "cbbomsg", "tcbbomsg"}
 _CONTEXT_SCHEMAS = {"definition", "status", "statistics"}
 
@@ -281,6 +287,7 @@ class DatabentoMarketDataFeed:
         intraday_replay: bool = False,
         historical_source: "DatabentoHistoricalSource | None" = None,
         now_provider: Callable[[], datetime] | None = None,
+        quote_warm_retention_provider: Callable[[], timedelta] | None = None,
     ) -> None:
         if not api_key:
             raise ValueError("Databento API key must be configured in backend environment")
@@ -315,6 +322,11 @@ class DatabentoMarketDataFeed:
         self._intraday_replay = intraday_replay
         self._historical_source = historical_source
         self._now = now_provider or (lambda: datetime.now(UTC))
+        # WARM-FIX P4: when set, the quote schema's warm fetch is scoped to the last
+        # (provider() + slack) instead of the full trades span. The provider is read
+        # at FETCH time (the live service's runtime handle carries the contract-driven
+        # retention); None keeps the legacy both-schemas-full-span shape.
+        self._quote_warm_retention_provider = quote_warm_retention_provider
         # W2 P1b FALLBACK: per-schema historical record streams staged by start()
         # when the gateway rejects the replay-start subscribe; drained by events()
         # BEFORE the live subscription so the queue can never overflow on history.
@@ -336,7 +348,26 @@ class DatabentoMarketDataFeed:
             for _ in range(_WARM_START_PRIOR_TRADING_DAYS):
                 day = prior_trading_day(day)
             replay_start = trading_day_start_utc(day)
-            self._warm_start_streams = await self._fetch_warm_start_streams(replay_start)
+            quote_start, quote_retention = self._quote_warm_start(replay_start)
+            if quote_retention is None:
+                logger.info(
+                    "warm fetch: trades from %s, quotes from %s (full span; no "
+                    "retention provider)",
+                    replay_start.isoformat(),
+                    quote_start.isoformat(),
+                )
+            else:
+                logger.info(
+                    "warm fetch: trades from %s, quotes from %s (retention %dm + "
+                    "%dm slack)",
+                    replay_start.isoformat(),
+                    quote_start.isoformat(),
+                    int(quote_retention.total_seconds() // 60),
+                    int(_QUOTE_WARM_SLACK.total_seconds() // 60),
+                )
+            self._warm_start_streams = await self._fetch_warm_start_streams(
+                ((self.trade_schema, replay_start), (self.quote_schema, quote_start))
+            )
             if self._warm_start_streams is not None:
                 self._loop = asyncio.get_running_loop()
                 self._started = True
@@ -387,8 +418,32 @@ class DatabentoMarketDataFeed:
             raise
 
 
+    def _quote_warm_start(self, replay_start: datetime) -> tuple[datetime, timedelta | None]:
+        """WARM-FIX P4: the quote schema's scoped warm-fetch anchor (+ retention used).
+
+        Quotes only survive the drain inside the rolling market-context buffer
+        (WARM_PERF_RECON §3 — everything else is trades-only or latest-wins), so
+        the quote span is now - (effective retention + 10 min slack), floored at
+        the trades anchor. Trades keep the full ``_WARM_START_PRIOR_TRADING_DAYS``
+        span (owner-ruled constant: bars/levels/touches need the full days).
+
+        Staleness caveat: the retention provider is read at FETCH time. A LATER
+        hot-swap to a contract with wider retention does not refetch — the buffer
+        simply starts that contract with the narrower already-fetched window
+        (exactly like a mid-session activation today).
+        """
+
+        provider = self._quote_warm_retention_provider
+        if provider is None:
+            return replay_start, None
+        retention = provider()
+        quote_start = self._now() - retention - _QUOTE_WARM_SLACK
+        if quote_start < replay_start:
+            return replay_start, retention
+        return quote_start, retention
+
     async def _fetch_warm_start_streams(
-        self, replay_start: datetime
+        self, schema_starts: tuple[tuple[str, datetime], ...]
     ) -> tuple[tuple[str, Iterable[Any]], ...] | None:
         source = self._historical_source
         if source is None or not source.available:
@@ -400,9 +455,8 @@ class DatabentoMarketDataFeed:
         try:
             return await asyncio.to_thread(
                 source.dbn_record_streams,
-                start=replay_start,
                 end=self._now(),
-                schemas=(self.trade_schema, self.quote_schema),
+                schema_starts=schema_starts,
             )
         except asyncio.CancelledError:
             raise
