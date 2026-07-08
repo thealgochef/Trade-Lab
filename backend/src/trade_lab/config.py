@@ -57,6 +57,11 @@ class Settings(BaseSettings):
     observation_duration_seconds: int = 300
     tick_timeframes: tuple[int, ...] = (147, 987, 2000)
 
+    # WARM-FIX P2 (WEDGE_CAPTURE.md): live liveness watchdog — seconds of
+    # post-drain silence (zero provider messages after the live subscribe) before
+    # the feed is marked DEGRADED and the D-P-06 single-attempt reconnect runs.
+    live_watchdog_seconds: float = Field(default=120.0, gt=0, le=3600)
+
     # Rolling L1/L0 context retention for pre-touch order-flow features. Inference
     # fires at observation completion (~interaction window after the touch) but
     # approach features reach back approach_window before the touch, so retention must

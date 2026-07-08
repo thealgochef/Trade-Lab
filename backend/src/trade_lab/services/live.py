@@ -53,6 +53,14 @@ _LIVE_LAG_SECONDS = 5.0
 _WARMING_LAG_SECONDS = 30.0
 _WARM_SNAPSHOT_MIN_INTERVAL_SECONDS = 1.0
 
+#: WARM-FIX P2 liveness watchdog default: if ZERO provider messages arrive within
+#: this many seconds after the post-drain live subscribe (the drain's last item),
+#: the feed is marked DEGRADED and the single-attempt D-P-06 reconnect runs. The
+#: wedge this catches (WEDGE_CAPTURE.md): an authenticated-but-silent session that
+#: neither the SDK's own monitor (blind before the first record) nor the status
+#: surface (CONNECTED-by-construction, "warming" forever) will ever report.
+_DEFAULT_WATCHDOG_SECONDS = 120.0
+
 
 class LiveState(StrEnum):
     IDLE = "idle"
@@ -120,6 +128,7 @@ class LiveMarketDataService:
         reconnect_delay_seconds: float = 1.0,
         now_provider: Callable[[], datetime] | None = None,
         throttle_warm_start: bool = False,
+        watchdog_seconds: float = _DEFAULT_WATCHDOG_SECONDS,
     ) -> None:
         self.runtime = runtime
         self.config = config
@@ -156,6 +165,14 @@ class LiveMarketDataService:
         # path (reset + prior-day seed + trading-day replay), killing the old
         # wipe-without-recovery behavior.
         self._reconnect_task: asyncio.Task[None] | None = None
+        # WARM-FIX P2: post-subscribe liveness watchdog. Armed on every (re)start,
+        # disarmed by the warm->live flip (the first real gateway message); strikes
+        # survive a watchdog reconnect so a second silence turns FAILED (D-P-06
+        # single retry), and reset on flip or operator stop.
+        self._watchdog_seconds = max(watchdog_seconds, 0.01)
+        self._watchdog_task: asyncio.Task[None] | None = None
+        self._watchdog_strikes = 0
+        self._last_item_wall_utc: datetime | None = None
 
     @property
     def has_update_callback(self) -> bool:
@@ -284,9 +301,14 @@ class LiveMarketDataService:
             self._state = LiveState.RUNNING
             await self._emit_status(FeedConnectionState.CONNECTED, "live feed running")
             self._task = asyncio.create_task(self._wait_strategy_core_live())
+            # WARM-FIX P2: (re)arm the liveness watchdog for this start's live phase.
+            self._last_item_wall_utc = self._now()
+            self._arm_watchdog()
 
     async def stop(self) -> None:
         async with self._lock:
+            await self._disarm_watchdog()
+            self._watchdog_strikes = 0
             if self._reconnect_task is not None and not self._reconnect_task.done():
                 self._reconnect_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -339,6 +361,10 @@ class LiveMarketDataService:
             )
 
     def _process_live_item(self, item: object) -> RuntimeUpdate:
+        # WARM-FIX P2: any provider item advances the liveness clock (during the
+        # warm drain this keeps the watchdog quiet; after the drain only real
+        # gateway traffic does).
+        self._last_item_wall_utc = self._now()
         if isinstance(item, FeedStatus):
             self._market_update_lag = None
             return self.runtime.set_feed_status(item)
@@ -362,6 +388,9 @@ class LiveMarketDataService:
             self._warm_start_events += 1
         elif self._warm_start_state != "live":
             self._warm_start_state = "live"
+            # WARM-FIX P2: the live phase delivered — the watchdog loop disarms on
+            # this flip, and a fresh silence episode starts from zero strikes.
+            self._watchdog_strikes = 0
 
     async def _wait_strategy_core_live(self) -> None:
         core = self.strategy_core_live
@@ -413,6 +442,93 @@ class LiveMarketDataService:
                 type(exc).__name__,
                 _redact_configured_secrets(str(exc), self.config.secret_values),
             )
+
+    def _arm_watchdog(self) -> None:
+        stale = self._watchdog_task
+        if stale is not None and not stale.done():
+            stale.cancel()
+        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+
+    async def _disarm_watchdog(self) -> None:
+        task = self._watchdog_task
+        self._watchdog_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    async def _watchdog_loop(self) -> None:
+        """WARM-FIX P2: post-subscribe liveness watchdog (WEDGE_CAPTURE.md).
+
+        The wedge signature this exists for: state=running, warm_start_state
+        stuck at "warming", event counters frozen at the warm total, feed
+        "connected", zero live messages — with no error from the SDK (its own
+        monitor is blind before the first record) and none from TL. The loop
+        disarms on the first received live message (the warm->live flip) and is
+        re-armed by every (re)start; wall-clock silence beyond the threshold
+        triggers the D-P-06 single-attempt reconnect, and a second silent episode
+        marks the feed FAILED for the operator.
+        """
+
+        interval = min(max(self._watchdog_seconds / 4.0, 0.01), 1.0)
+        while True:
+            await asyncio.sleep(interval)
+            if self._state is not LiveState.RUNNING:
+                return
+            if self._warm_start_state == "live":
+                return
+            last = self._last_item_wall_utc
+            if last is None:
+                continue
+            silent_for = (self._now() - last).total_seconds()
+            if silent_for <= self._watchdog_seconds:
+                continue
+            await self._handle_watchdog_timeout(silent_for)
+            return
+
+    async def _handle_watchdog_timeout(self, silent_for: float) -> None:
+        async with self._lock:
+            if self._state is not LiveState.RUNNING or self._warm_start_state == "live":
+                return
+            self._watchdog_strikes += 1
+            strike = self._watchdog_strikes
+            logger.error(
+                "live liveness watchdog: ZERO provider messages for %.0f s after the "
+                "post-drain live subscribe (wedge signature: state=running, "
+                "warm_start_state=warming, events frozen at the warm total — "
+                "WEDGE_CAPTURE.md); %s",
+                silent_for,
+                "forcing the D-P-06 single-attempt reconnect"
+                if strike == 1
+                else "second silent episode — marking the live feed FAILED",
+            )
+            # Tear the wedged session down. core.stop() stops the feed it owns
+            # (mirrors stop()); dropping the core handle makes status() report from
+            # this service's state instead of the stopped core's.
+            core = self.strategy_core_live
+            self.strategy_core_live = None
+            if core is not None:
+                with suppress(Exception):
+                    await core.stop()
+            elif self._feed is not None:
+                with suppress(Exception):
+                    await self._feed.stop()
+            self._feed = None
+            if strike >= 2:
+                self._state = LiveState.FAILED
+                self._last_error = "live_watchdog_silent_after_reconnect"
+                await self._emit_status(
+                    FeedConnectionState.DISCONNECTED,
+                    "live feed failed: watchdog found no live messages after reconnect",
+                )
+                return
+            self._state = LiveState.DISCONNECTED
+            await self._emit_status(
+                FeedConnectionState.DEGRADED,
+                "live feed degraded: no live messages after the warm drain "
+                "(wedge signature); reconnecting",
+            )
+            self._schedule_reconnect()
 
     async def _emit_status(self, state: FeedConnectionState, message: str) -> None:
         await self._emit(

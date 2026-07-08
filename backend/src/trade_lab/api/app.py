@@ -333,6 +333,8 @@ def create_app(
             # doesn't flood the browser (dropped frames -> chart gaps); per-event
             # streaming resumes once the frontier reaches real time.
             throttle_warm_start=True,
+            # WARM-FIX P2: post-drain silence -> DEGRADED + single-attempt reconnect.
+            watchdog_seconds=settings.live_watchdog_seconds,
         )
     if not live.has_update_callback:
         live.set_update_callback(broadcaster.broadcast_update)
