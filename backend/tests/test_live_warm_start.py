@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from live_sdk_fakes import FakeLiveClient
 from trade_lab.adapters.databento import DatabentoMarketDataFeed, _DatabentoSdkFacade
 from trade_lab.adapters.databento_historical import DatabentoHistoricalSource
 from trade_lab.domain.events import TopOfBookEvent, TradeEvent
@@ -41,26 +42,17 @@ def _live_config(*, key: bool = True, enabled: bool = True) -> LiveConfig:
     )
 
 
-class _RecordingClient:
-    def __init__(self, *, reject_replay_start: bool = False) -> None:
-        self.reject_replay_start = reject_replay_start
-        self.subscriptions: list[dict[str, object]] = []
-        self.started = False
-        self.stopped = False
+class _RecordingClient(FakeLiveClient):
+    """Session-shaped recording fake (WEDGE fix: the facade marshals onto its loop)."""
 
-    def add_callback(self, callback: object) -> None:
-        self.callback = callback
+    def __init__(self, *, reject_replay_start: bool = False) -> None:
+        super().__init__(key="")
+        self.reject_replay_start = reject_replay_start
 
     def subscribe(self, **kwargs: object) -> None:
         if self.reject_replay_start and kwargs.get("start") is not None:
             raise ValueError("gateway rejected the replay start parameter")
-        self.subscriptions.append(kwargs)
-
-    def start(self) -> None:
-        self.started = True
-
-    def stop(self) -> None:
-        self.stopped = True
+        super().subscribe(**kwargs)
 
 
 class _FakeSdk:
@@ -349,6 +341,47 @@ async def _run_warm_marking() -> None:
     status = live.status()
     assert status.warm_start_state == "live"
     assert status.warm_start_events == 2
+    await live.stop()
+
+
+def test_authenticated_but_silent_session_never_reports_a_live_flip() -> None:
+    """WEDGE regression (P1c): a session that connects and authenticates but never
+    delivers a post-anchor message must NOT report a healthy warm->live flip — the
+    status must keep saying "warming" rather than lie "live"."""
+
+    asyncio.run(_run_silent_session())
+
+
+async def _run_silent_session() -> None:
+    class _SilentAfterDrainFeed:
+        def __init__(self) -> None:
+            self.release = asyncio.Event()
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            self.release.set()
+
+        async def events(self) -> AsyncIterator[object]:
+            # The replayed (warm) history drains fine...
+            yield _trade(datetime(2026, 6, 11, 14, 0, tzinfo=UTC))
+            # ...then the authenticated-but-silent live session delivers nothing.
+            await self.release.wait()
+
+    feed = _SilentAfterDrainFeed()
+    live = LiveMarketDataService(
+        _runtime(), _live_config(), lambda _config: feed, now_provider=lambda: _NOW
+    )
+    await live.start()
+    for _ in range(200):
+        if live.status().warm_start_events == 1:
+            break
+        await asyncio.sleep(0.01)
+    status = live.status()
+    assert status.warm_start_events == 1
+    assert status.warm_start_state == "warming"
+    assert status.state == LiveState.RUNNING
     await live.stop()
 
 

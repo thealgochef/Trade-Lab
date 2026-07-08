@@ -10,6 +10,7 @@ from typing import ClassVar
 import pytest
 from fastapi.testclient import TestClient
 
+from live_sdk_fakes import FAKE_SESSION_THREAD_NAME, FakeLiveClient
 from trade_lab.adapters.databento import (
     DatabentoMarketDataFeed,
     DatabentoUnavailableError,
@@ -401,25 +402,8 @@ async def _capture_update(updates: list[object], update: object) -> None:
     updates.append(update)
 
 
-class FakeDatabentoClient:
-    def __init__(self, key: str) -> None:
-        self.key = key
-        self.callbacks: list[object] = []
-        self.subscriptions: list[dict[str, object]] = []
-        self.started = False
-        self.stopped = False
-
-    def add_callback(self, callback: object) -> None:
-        self.callbacks.append(callback)
-
-    def subscribe(self, **kwargs: object) -> None:
-        self.subscriptions.append(kwargs)
-
-    def start(self) -> None:
-        self.started = True
-
-    def stop(self) -> None:
-        self.stopped = True
+class FakeDatabentoClient(FakeLiveClient):
+    """The shared session-shaped fake (tests/live_sdk_fakes.py), local name kept."""
 
 
 class FakeDatabentoSdk:
@@ -484,6 +468,96 @@ def test_databento_adapter_subscribes_and_registers_callbacks_with_fake_sdk() ->
         ]
         await feed.stop()
         assert client.stopped is True
+
+    asyncio.run(run())
+
+
+def test_wedge_fix_subscribe_and_start_execute_on_the_session_loop_thread() -> None:
+    """WEDGE fix (P1c): the facade must connect first (caller thread, zero writes),
+    then run every subscribe and the start ON the SDK session loop — never on the
+    caller thread whose unsynchronized transport writes caused the silent wedge."""
+
+    async def run() -> None:
+        FakeDatabentoSdk.clients = []
+        feed = DatabentoMarketDataFeed(
+            api_key="db-secret",
+            requested_symbol="NQ.c.0",
+            dataset="GLBX.MDP3",
+            trade_schema="trades",
+            quote_schema="mbp-1",
+            context_schemas=("definition",),
+            sdk_module=FakeDatabentoSdk,
+        )
+        await feed.start()
+        client = FakeDatabentoSdk.clients[0]
+        caller = threading.current_thread().name
+
+        # Connect+auth was forced BEFORE any subscription, from the caller thread
+        # (the SDK's _connect is the blocking, thread-safe entry).
+        assert client._session.connect_calls == [("GLBX.MDP3", caller)]
+        # add_callback stays caller-thread (pre-connect list append, no transport).
+        assert ("add_callback", caller) in client.call_threads
+        # Every subscription write and the session start executed on the session loop.
+        marshaled = [
+            (label, thread)
+            for label, thread in client.call_threads
+            if label.startswith("subscribe:") or label == "start"
+        ]
+        assert [label for label, _ in marshaled] == [
+            "subscribe:trades",
+            "subscribe:mbp-1",
+            "subscribe:definition",
+            "start",
+        ]
+        assert all(thread == FAKE_SESSION_THREAD_NAME for _, thread in marshaled), marshaled
+        # And the subscriptions landed before the start, in schema order, post-connect.
+        assert client.started is True
+        await feed.stop()
+
+    asyncio.run(run())
+
+
+def test_wedge_fix_fails_loud_when_session_handles_are_missing() -> None:
+    """WEDGE fix (P1b): an SDK client without the session/loop handles must fail
+    LOUDLY at connect time — never silently fall back to calling-thread writes."""
+
+    class HandlelessClient:
+        def __init__(self, key: str) -> None:
+            self.key = key
+            self.stopped = False
+
+        def add_callback(self, callback: object) -> None:
+            pass
+
+        def subscribe(self, **kwargs: object) -> None:  # pragma: no cover - unreached
+            raise AssertionError("subscribe must not run without session marshaling")
+
+        def start(self) -> None:  # pragma: no cover - unreached
+            raise AssertionError("start must not run without session marshaling")
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    class HandlelessSdk:
+        clients: ClassVar[list[HandlelessClient]] = []
+
+        class Live(HandlelessClient):
+            def __init__(self, key: str) -> None:
+                super().__init__(key)
+                HandlelessSdk.clients.append(self)
+
+    async def run() -> None:
+        HandlelessSdk.clients = []
+        feed = DatabentoMarketDataFeed(
+            api_key="db-secret",
+            requested_symbol="NQ.c.0",
+            dataset="GLBX.MDP3",
+            sdk_module=HandlelessSdk,
+        )
+        with pytest.raises(DatabentoUnavailableError, match="session/loop handles"):
+            await feed.start()
+        # The failed start cleaned up the client it created.
+        assert HandlelessSdk.clients[0].stopped is True
 
     asyncio.run(run())
 

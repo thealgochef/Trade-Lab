@@ -20,6 +20,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+live = [
+  # WEDGE fix floor (WEDGE_CAPTURE.md at the repo root): databento 0.79.0 is the first
+  # release that marshals Live.start()/terminate() onto the SDK session loop instead of
+  # writing to its transport from the calling thread (the silent post-drain wedge);
+  # subscribe() still writes caller-thread as of 0.81.0, which the adapter facade
+  # marshals itself (adapters/databento.py connect_session/_run_on_session_loop). The
+  # SDK stays optional — tests run offline with fakes; the live host installs .[live].
+  "databento>=0.79",
+]
 dev = [
   # starlette 1.x's TestClient backend (cold CI resolves starlette>=1.x, whose
   # testclient imports `httpx2 as httpx`); sole consumers are the TestClient tests,

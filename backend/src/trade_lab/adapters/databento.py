@@ -12,6 +12,7 @@ import heapq
 import importlib.util
 import logging
 import re
+import threading
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -67,6 +68,12 @@ _CONTEXT_SCHEMAS = {"definition", "status", "statistics"}
 #: clear a burst instead of paying asyncio.wait_for timer setup for every message.
 _PROVIDER_BATCH_LIMIT = 256
 
+#: WEDGE fix: upper bound on one marshaled subscribe/start call executing on the SDK
+#: session loop. The loop runs these in microseconds when healthy (proven by stop()'s
+#: 1 ms call_soon_threadsafe turnaround mid-wedge, WEDGE_CAPTURE.md §C.5); a miss
+#: means the session loop is dead and the connect must fail LOUDLY, never wedge.
+_SESSION_LOOP_CALL_TIMEOUT_SECONDS = 10.0
+
 
 def is_databento_sdk_available() -> bool:
     """Return whether the optional Databento SDK appears importable.
@@ -118,6 +125,35 @@ class _DatabentoSdkFacade:
             )
         client.add_callback(callback)
 
+    def connect_session(self, client: Any, *, dataset: str) -> None:
+        """WEDGE fix: force the gateway connect+auth with ZERO subscription writes.
+
+        The SDK connects lazily inside ``subscribe()``, whose post-connect
+        subscription write then executes on the CALLING thread — an unsynchronized
+        write to a transport owned by the SDK's private session loop, which is the
+        silent post-drain wedge (WEDGE_CAPTURE.md §C.4: auth writes on the loop
+        thread succeeded; the six caller-thread subscribe/start writes never reached
+        the wire). Connecting first from the caller thread (the SDK's ``_connect``
+        blocks through connect+auth via ``run_coroutine_threadsafe`` — safe from any
+        non-loop thread) lets every subsequent subscribe/start run ON the session
+        loop. The private-handle access is guarded: an SDK whose internals moved
+        fails LOUDLY here at connect time instead of silently falling back to the
+        calling-thread write (databento 0.71.0 and 0.81.0 both expose this shape;
+        upstream fixed only ``start()``/``terminate()`` marshaling in 0.79.0 —
+        ``subscribe()`` still writes caller-thread as of 0.81.0).
+        """
+
+        session = getattr(client, "_session", None)
+        connect = getattr(session, "_connect", None)
+        if session is None or not callable(connect) or self._session_loop(client) is None:
+            raise DatabentoUnavailableError(
+                "Databento Live client does not expose the session/loop handles the "
+                "wedge-safe connect requires (client._session._connect and a session "
+                "event loop). Refusing to fall back to calling-thread subscription "
+                "writes; pin a databento version with the expected Live client shape."
+            )
+        connect(dataset=dataset)
+
     def subscribe(
         self,
         client: Any,
@@ -134,27 +170,88 @@ class _DatabentoSdkFacade:
             )
         # W2 P1b: ``start`` engages the gateway's intraday replay (warm start). It is
         # only forwarded when set so fakes/older clients keep the narrow signature.
-        if start is None:
-            client.subscribe(dataset=dataset, schema=schema, symbols=[symbol], stype_in=stype_in)
-        else:
-            client.subscribe(
-                dataset=dataset,
-                schema=schema,
-                symbols=[symbol],
-                stype_in=stype_in,
-                start=start,
-            )
+        kwargs: dict[str, Any] = {
+            "dataset": dataset,
+            "schema": schema,
+            "symbols": [symbol],
+            "stype_in": stype_in,
+        }
+        if start is not None:
+            kwargs["start"] = start
+        # WEDGE fix: the subscription request write must execute on the session loop.
+        self._run_on_session_loop(
+            client, lambda: client.subscribe(**kwargs), label=f"subscribe({schema})"
+        )
 
     def start(self, client: Any) -> None:
-        if hasattr(client, "start"):
-            client.start()
-            return
-        if hasattr(client, "run"):
-            client.run()
-            return
+        for name in ("start", "run"):
+            method = getattr(client, name, None)
+            if method is not None:
+                # WEDGE fix: the SessionStart write must execute on the session loop
+                # (0.79.0 marshals it upstream; running the whole call there is safe
+                # on 0.79+ — call_soon_threadsafe from the loop thread is call_soon —
+                # and also repairs the pre-0.79 caller-thread write).
+                self._run_on_session_loop(client, method, label=name)
+                return
         raise DatabentoUnavailableError(
             "Databento Live client does not expose start/run. Upgrade the databento SDK."
         )
+
+    def _session_loop(self, client: Any) -> asyncio.AbstractEventLoop | None:
+        session = getattr(client, "_session", None)
+        loop = getattr(session, "_loop", None)
+        if loop is None:
+            # databento keeps one shared session loop as a Live class attribute.
+            loop = getattr(type(client), "_loop", None)
+        return loop if isinstance(loop, asyncio.AbstractEventLoop) else None
+
+    def _run_on_session_loop(
+        self, client: Any, action: Callable[[], Any], *, label: str
+    ) -> None:
+        """Execute ``action`` on the SDK session loop and wait for it (bounded).
+
+        The wait blocks the calling thread for microseconds when the session loop is
+        healthy — comparable to the existing blocking connect+auth on this same path
+        — and raises loudly on timeout instead of leaving a silently-wedged session.
+        """
+
+        loop = self._session_loop(client)
+        if loop is None:
+            raise DatabentoUnavailableError(
+                f"Databento Live client exposes no session event loop; cannot marshal "
+                f"{label} onto it. Refusing the wedge-prone calling-thread write."
+            )
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            action()
+            return
+        if not loop.is_running():
+            raise DatabentoUnavailableError(
+                f"Databento session event loop is not running; cannot marshal {label}."
+            )
+        done = threading.Event()
+        failure: list[BaseException] = []
+
+        def _invoke() -> None:
+            try:
+                action()
+            except BaseException as exc:
+                failure.append(exc)
+            finally:
+                done.set()
+
+        loop.call_soon_threadsafe(_invoke)
+        if not done.wait(_SESSION_LOOP_CALL_TIMEOUT_SECONDS):
+            raise DatabentoUnavailableError(
+                f"Databento session loop did not execute {label} within "
+                f"{_SESSION_LOOP_CALL_TIMEOUT_SECONDS:.0f}s; treating the live session "
+                "as wedged instead of continuing silently."
+            )
+        if failure:
+            raise failure[0]
 
     def stop(self, client: Any) -> None:
         for name in ("stop", "close"):
@@ -258,6 +355,10 @@ class DatabentoMarketDataFeed:
             self._client = client
             self._loop = asyncio.get_running_loop()
             self._sdk_facade.add_callback(client, self._provider_callback)
+            # WEDGE fix (WEDGE_CAPTURE.md): connect+auth FIRST with zero subscription
+            # writes, so every subscribe below and the start marshal onto the SDK's
+            # session loop instead of writing to its transport from this thread.
+            self._sdk_facade.connect_session(client, dataset=self.dataset)
             replayable = {self.trade_schema.lower(), self.quote_schema.lower()}
             for schema in _unique_schemas(
                 (self.trade_schema, self.quote_schema, *self.context_schemas)
