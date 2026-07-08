@@ -129,6 +129,7 @@ class LiveMarketDataService:
         now_provider: Callable[[], datetime] | None = None,
         throttle_warm_start: bool = False,
         watchdog_seconds: float = _DEFAULT_WATCHDOG_SECONDS,
+        replay_active: Callable[[], bool] | None = None,
     ) -> None:
         self.runtime = runtime
         self.config = config
@@ -167,12 +168,18 @@ class LiveMarketDataService:
         self._reconnect_task: asyncio.Task[None] | None = None
         # WARM-FIX P2: post-subscribe liveness watchdog. Armed on every (re)start,
         # disarmed by the warm->live flip (the first real gateway message); strikes
-        # survive a watchdog reconnect so a second silence turns FAILED (D-P-06
-        # single retry), and reset on flip or operator stop.
+        # survive a WATCHDOG reconnect so a second silence turns FAILED (D-P-06
+        # single retry), and reset on flip, operator stop, and any OPERATOR start
+        # (verify fix: a stale strike must not deny a fresh session its retry).
         self._watchdog_seconds = max(watchdog_seconds, 0.01)
         self._watchdog_task: asyncio.Task[None] | None = None
         self._watchdog_strikes = 0
         self._last_item_wall_utc: datetime | None = None
+        # Verify fix (adversarial-verify major): the internal reconnect path must
+        # honor the same live/replay mutual exclusion the HTTP endpoints enforce
+        # (audit #NN-2) — a reconnect firing under an active replay would reset the
+        # shared runtime and arm the warm gate underneath it.
+        self._replay_active = replay_active
 
     @property
     def has_update_callback(self) -> bool:
@@ -225,7 +232,7 @@ class LiveMarketDataService:
             warm_start_events=self._warm_start_events,
         )
 
-    async def start(self) -> None:
+    async def start(self, *, _preserve_watchdog_strikes: bool = False) -> None:
         async with self._lock:
             if self._state in {LiveState.CONNECTING, LiveState.RUNNING} or (
                 self._task is not None and not self._task.done()
@@ -237,6 +244,11 @@ class LiveMarketDataService:
                 raise RuntimeError("Databento API key is not configured in backend environment")
             self._state = LiveState.CONNECTING
             self._last_error = None
+            # Verify fix: an OPERATOR start begins a fresh watchdog episode (full
+            # DEGRADED + single-retry contract); only the watchdog's own D-P-06
+            # reconnect carries its strike forward so a second silence turns FAILED.
+            if not _preserve_watchdog_strikes:
+                self._watchdog_strikes = 0
             self._events_processed = 0
             self._last_event_ts_utc = None
             self._started_at_utc = datetime.now(UTC)
@@ -256,9 +268,12 @@ class LiveMarketDataService:
             self._warm_anchor_utc = self._now()
             self._warm_start_state = "warming"
             self._warm_start_events = 0
-            # WARM-FIX P3: no predictions (and thus no resolver registrations and no
-            # journal rows) while the warm replay drains; cleared on the live flip.
-            self.runtime.set_live_warm_inference_gate(True)
+            # WARM-FIX P3 (verify fix: anchor-based): observations originating from
+            # touches BEFORE this instant never predict/register/journal — during
+            # the drain AND when their window crosses into the live phase. The
+            # anchor stays set for the whole session; live-originated touches are
+            # unaffected by it.
+            self.runtime.set_live_warm_inference_gate(self._warm_anchor_utc)
             # Each (re)start re-runs the warm-start replay, so re-arm the throttle.
             self._live_streaming = False
             self._last_warm_snapshot_at = None
@@ -280,7 +295,7 @@ class LiveMarketDataService:
             except Exception as exc:
                 self._state = LiveState.FAILED
                 self._last_error = type(exc).__name__
-                self.runtime.set_live_warm_inference_gate(False)
+                self.runtime.set_live_warm_inference_gate(None)
                 if feed is not None:
                     with suppress(Exception):
                         await feed.stop()
@@ -329,9 +344,9 @@ class LiveMarketDataService:
             self._feed = None
             self._state = LiveState.STOPPED
             self._stopped_at_utc = datetime.now(UTC)
-            # WARM-FIX P3: a stop mid-warm must not leave the shared runtime gated
+            # WARM-FIX P3: a stop must not leave the shared runtime gated
             # (the next replay/live start resets anyway; this is belt-and-braces).
-            self.runtime.set_live_warm_inference_gate(False)
+            self.runtime.set_live_warm_inference_gate(None)
             # W2 P2a (F10): finalize open setups whose cutoff has already passed;
             # the flushed drops ride the normal drop -> DroppedPrediction surface.
             await self._emit(self.runtime.flush_resolver(datetime.now(UTC)))
@@ -397,11 +412,9 @@ class LiveMarketDataService:
             self._warm_start_state = "live"
             # WARM-FIX P2: the live phase delivered — the watchdog loop disarms on
             # this flip, and a fresh silence episode starts from zero strikes.
+            # (P3's anchor deliberately stays set: warm-originated observations
+            # whose windows cross the seam must still produce nothing.)
             self._watchdog_strikes = 0
-            # WARM-FIX P3: this runs BEFORE process_market_event for the same item
-            # (live.py _process_live_item ordering), so the flipping event itself
-            # already predicts/journals normally.
-            self.runtime.set_live_warm_inference_gate(False)
 
     async def _wait_strategy_core_live(self) -> None:
         core = self.strategy_core_live
@@ -444,9 +457,23 @@ class LiveMarketDataService:
         await asyncio.sleep(self._reconnect_delay_seconds)
         if self._state != LiveState.DISCONNECTED:
             return
+        # Verify fix (adversarial-verify major): a replay may legitimately have
+        # started during the reconnect delay (DISCONNECTED is not an active live
+        # state for the endpoint 409 guard). Reconnecting now would reset the
+        # shared runtime and arm the warm gate underneath the running replay —
+        # honor audit #NN-2's mutual exclusion on this internal path too.
+        if self._replay_active is not None and self._replay_active():
+            logger.warning(
+                "live auto-reconnect skipped: a replay is active on the shared "
+                "runtime (audit #NN-2 mutual exclusion); restart live manually "
+                "after the replay finishes"
+            )
+            return
         logger.info("live feed reconnecting from the trading-day start (D-P-06)")
         try:
-            await self.start()
+            # D-P-06: the watchdog's single retry carries its strike into this
+            # start so a second silent episode turns FAILED; operator starts reset.
+            await self.start(_preserve_watchdog_strikes=True)
         except Exception as exc:
             logger.error(
                 "live auto-reconnect failed: exception_type=%s message=%s",
@@ -488,7 +515,7 @@ class LiveMarketDataService:
                 return
             if self._warm_start_state == "live":
                 return
-            last = self._last_item_wall_utc
+            last = self._effective_liveness_stamp()
             if last is None:
                 continue
             silent_for = (self._now() - last).total_seconds()
@@ -496,6 +523,28 @@ class LiveMarketDataService:
                 continue
             await self._handle_watchdog_timeout(silent_for)
             return
+
+    def _effective_liveness_stamp(self) -> datetime | None:
+        """The freshest evidence the live session is alive.
+
+        Verify fix (adversarial-verify major): processed items alone are
+        heartbeat-blind — the adapter drops gateway SystemMsg heartbeats and
+        symbology mappings as control messages BEFORE they reach
+        ``_process_live_item``, yet those records are exactly the healthy-vs-wedge
+        discriminator (WEDGE_CAPTURE.md §C.4: a started session heartbeats every
+        30 s even with zero market data; the wedge had zero inbound bytes). The
+        Databento feed therefore exposes ``last_provider_activity_utc``, stamped
+        on EVERY provider callback; folding it in keeps a quiet-but-healthy
+        market (weekend/halt start) from being torn down as a wedge, while a true
+        wedge (no callbacks at all) still trips the watchdog.
+        """
+
+        stamps = [self._last_item_wall_utc]
+        feed_activity = getattr(self._feed, "last_provider_activity_utc", None)
+        if isinstance(feed_activity, datetime):
+            stamps.append(feed_activity)
+        present = [stamp for stamp in stamps if stamp is not None]
+        return max(present) if present else None
 
     async def _handle_watchdog_timeout(self, silent_for: float) -> None:
         async with self._lock:
@@ -528,7 +577,7 @@ class LiveMarketDataService:
             if strike >= 2:
                 self._state = LiveState.FAILED
                 self._last_error = "live_watchdog_silent_after_reconnect"
-                self.runtime.set_live_warm_inference_gate(False)
+                self.runtime.set_live_warm_inference_gate(None)
                 await self._emit_status(
                     FeedConnectionState.DISCONNECTED,
                     "live feed failed: watchdog found no live messages after reconnect",

@@ -24,9 +24,14 @@ def configure_logging(level_name: str) -> None:
     env ``TRADE_LAB_LOG_LEVEL``); ``uvicorn.access`` capped at WARNING (request
     noise); the ``databento`` logger at INFO, raised to DEBUG only when the env
     level is DEBUG (the full session-handshake trace used by the wedge capture).
-    Idempotent: repeat calls re-level but never stack handlers. uvicorn's default
-    dictConfig keeps ``disable_existing_loggers=False`` and never touches root
-    handlers, so this survives ``uvicorn.run()``.
+    Idempotent: repeat calls re-level but never stack handlers.
+
+    Verify fix: ``main()`` passes ``log_config=None`` to ``uvicorn.run`` —
+    uvicorn's DEFAULT dictConfig would re-level every logger it names (it sets
+    ``uvicorn.access`` back to INFO with its own handler; ``disable_existing_
+    loggers=False`` only protects loggers it does NOT name), silently undoing
+    the access cap. With no uvicorn log config, uvicorn's loggers propagate to
+    the root handler configured here and the caps hold.
     """
 
     level = getattr(logging, level_name.strip().upper(), None)
@@ -58,6 +63,10 @@ def main() -> None:
         factory=True,
         host=settings.backend_host,
         port=settings.backend_port,
+        # Verify fix: uvicorn's default dictConfig would reset uvicorn.access to
+        # INFO (it names that logger explicitly). None -> uvicorn loggers propagate
+        # to the root handler configure_logging installed, and the caps hold.
+        log_config=None,
     )
 
 

@@ -19,6 +19,7 @@ fetch method runs, and ``record_fetcher``/``ohlcv_fetcher`` can be injected so
 tests run without the SDK or network.
 """
 
+import logging
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -27,6 +28,8 @@ from trade_lab.adapters.databento import DatabentoUnavailableError, is_databento
 
 if TYPE_CHECKING:
     import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 # (schema, start, end) -> iterable of DBN records for that schema.
 RecordFetcher = Callable[[str, datetime, datetime], Iterable[Any]]
@@ -115,7 +118,21 @@ class DatabentoHistoricalSource:
                 )
             )
         # The seam-gap warning reads the latest end any schema actually used.
+        # Verify fix: with per-schema clamps the ends can DIVERGE (e.g. an mbp-1
+        # ingestion hiccup lags its availability behind trades') and the shared
+        # seam warning would then understate the laggard's hole — surface it.
         self.last_stream_end = max(effective_ends) if effective_ends else end
+        if effective_ends:
+            newest = max(effective_ends)
+            for (schema, _start), schema_end in zip(schema_starts, effective_ends, strict=True):
+                lag = (newest - schema_end).total_seconds()
+                if lag > 60:
+                    logger.warning(
+                        "warm-fetch availability for schema %s lags the freshest "
+                        "schema by %.0f s; that schema's warm slice ends early",
+                        schema,
+                        lag,
+                    )
         return tuple(streams)
 
     def ohlcv_frame(self, *, start: datetime, end: datetime) -> "pd.DataFrame":

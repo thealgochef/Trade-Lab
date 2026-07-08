@@ -74,3 +74,26 @@ def test_debug_level_raises_the_databento_logger_and_calls_are_idempotent(
 def test_settings_expose_the_env_tunable_log_level() -> None:
     assert Settings(_env_file=None).log_level == "INFO"
     assert Settings(_env_file=None, log_level="DEBUG").log_level == "DEBUG"
+
+
+def test_main_disables_uvicorn_log_config_so_the_caps_survive(
+    monkeypatch, _restore_logging
+) -> None:
+    """Verify fix: uvicorn's DEFAULT dictConfig names uvicorn.access and would
+    re-level it back to INFO (disable_existing_loggers=False only protects
+    loggers it does NOT name). main() must pass log_config=None."""
+
+    import trade_lab.api.__main__ as entrypoint
+
+    captured: dict = {}
+
+    def fake_run(*args, **kwargs) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(entrypoint.uvicorn, "run", fake_run)
+    monkeypatch.setattr(
+        entrypoint, "load_settings", lambda: Settings(_env_file=None)
+    )
+    entrypoint.main()
+    assert "log_config" in captured
+    assert captured["log_config"] is None

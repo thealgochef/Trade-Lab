@@ -473,6 +473,9 @@ def test_api_module_entrypoint_imports_and_invokes_uvicorn_with_factory(monkeypa
             "factory": True,
             "host": "127.0.0.1",
             "port": 8765,
+            # Verify fix (WARM-FIX P5): uvicorn's default dictConfig would re-level
+            # uvicorn.access back to INFO; None keeps configure_logging's caps.
+            "log_config": None,
         }
     ]
 

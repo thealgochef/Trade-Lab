@@ -31,8 +31,12 @@ _FIXTURE_STRATEGY = Path(__file__).parent / "fixtures" / "strategy.json"
 _NOW = datetime(2026, 1, 5, 15, 0, tzinfo=UTC)
 #: Warm-day touch: one hour before "now", i.e. replayed history.
 _WARM_TOUCH_TS = datetime(2026, 1, 5, 14, 0, tzinfo=UTC)
-#: Near-live touch whose observation (+300 s) expires shortly AFTER the flip.
-_LIVE_TOUCH_TS = _NOW - timedelta(seconds=250)
+#: Seam-tail touch: warm-originated, but its observation window (+300 s) crosses
+#: the drain's end and expires only AFTER the flip — the adversarial-verify
+#: residual-duplicate case; must still produce nothing (anchor-based gate).
+_SEAM_TOUCH_TS = _NOW - timedelta(seconds=100)
+#: Live touch: originates after the anchor; predicts normally.
+_LIVE_TOUCH_TS = _NOW + timedelta(seconds=1)
 _LEVEL_TICKS = 68_000
 
 
@@ -188,17 +192,21 @@ async def _run_gate_then_flip(tmp_path: Path) -> None:
             _trade(_WARM_TOUCH_TS + timedelta(seconds=301)),
         ],
         live=[
-            # Live phase: the flip event (>= anchor) clears the gate itself...
+            # Live phase: the first post-anchor event flips warming->live...
             _trade(_NOW + timedelta(seconds=1)),
-            # ...and this one expires the near-live observation -> a real prediction.
-            _trade(_NOW + timedelta(seconds=60)),
+            # ...this one expires the SEAM observation (warm-originated, window
+            # crossed the drain's end) -> still suppressed (anchor-based gate)...
+            _trade(_NOW + timedelta(seconds=201)),
+            # ...and this one expires the live-originated observation -> predicts.
+            _trade(_NOW + timedelta(seconds=302)),
         ],
     )
     live = _service(runtime, lambda _config: feed)
     await live.start()
 
-    # Seed both observations AFTER start() (its reset rebuilds the engine state).
+    # Seed the observations AFTER start() (its reset rebuilds the engine state).
     runtime.observations.start_from_touch(_touch("touch-warm", _WARM_TOUCH_TS))
+    runtime.observations.start_from_touch(_touch("touch-seam", _SEAM_TOUCH_TS))
     runtime.observations.start_from_touch(_touch("touch-live", _LIVE_TOUCH_TS))
     feed.begin.set()
 
@@ -211,8 +219,8 @@ async def _run_gate_then_flip(tmp_path: Path) -> None:
     assert _journal_rows(journal_root) == []
 
     feed.live_release.set()
-    # The live trades then flip warm->live and expire the near-live observation:
-    # exactly one prediction, produced and journaled as a normal live row.
+    # The live trades flip warm->live; the seam-tail observation expires post-flip
+    # and must STILL produce nothing; only the live-originated touch predicts.
     await _wait_for(lambda: len(runtime.predictions) == 1)
     assert live.status().warm_start_state == "live"
     assert engine.predict_calls == 1
@@ -224,8 +232,11 @@ async def _run_gate_then_flip(tmp_path: Path) -> None:
     assert len(prediction_rows) == 1
     assert prediction_rows[0]["mode"] == "live"
     assert prediction_rows[0]["touch_id"] == "touch-live"
-    # No warm rows sneaked in for the warm touch.
-    assert all(r["touch_id"] != "touch-warm" for r in _journal_rows(journal_root))
+    # Neither the warm touch nor the seam-tail touch sneaked a row in.
+    assert all(
+        row["touch_id"] not in {"touch-warm", "touch-seam"}
+        for row in _journal_rows(journal_root)
+    )
     await live.stop()
 
 

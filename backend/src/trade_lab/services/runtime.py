@@ -9,7 +9,7 @@ path and DTO mapping remains at the API edge.
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from types import MappingProxyType
 from typing import Any
 
@@ -180,12 +180,15 @@ class ApplicationRuntime:
         # Optional inference seam: when an InferenceEngine with an active model is set,
         # completed observations produce Predictions attached to the RuntimeUpdate.
         self._inference_engine = inference_engine
-        # WARM-FIX P3: while True, _run_inference produces nothing — predict,
-        # resolver-register, and journal are suppressed atomically (journaling and
-        # registration only ever consume produced predictions). Set ONLY by the live
-        # service during its warm-start replay; default off so replay and tests keep
+        # WARM-FIX P3 (verify fix): while set, _run_inference suppresses production
+        # for observations whose ORIGINATING TOUCH predates this anchor — predict,
+        # resolver-register, and journal atomically (both are downstream of
+        # production). Anchor-based rather than a warm-phase boolean so a warm
+        # touch whose observation window crosses the drain's end cannot leak a
+        # duplicate row on the first post-flip event (adversarial-verify finding).
+        # Set ONLY by the live service; None (default) keeps replay and tests on
         # unconditional predict-on-completion.
-        self._live_warm_inference_gate = False
+        self._live_warm_inference_anchor: datetime | None = None
         self._prediction_limit = prediction_limit
         self._outcome_limit = outcome_limit
         self._predictions: list[Prediction] = []
@@ -259,7 +262,7 @@ class ApplicationRuntime:
             timedelta(seconds=self._observation_duration_seconds)
         )
         self.market_context.reset()
-        self._live_warm_inference_gate = False
+        self._live_warm_inference_anchor = None
         self._predictions.clear()
         self._outcomes.clear()
         self._dropped.clear()
@@ -287,21 +290,24 @@ class ApplicationRuntime:
         self._feed_status = status
         return RuntimeUpdate(feed_status=status)
 
-    def set_live_warm_inference_gate(self, active: bool) -> None:
-        """WARM-FIX P3: gate prediction production during the live warm-start drain.
+    def set_live_warm_inference_gate(self, anchor: datetime | None) -> None:
+        """WARM-FIX P3: gate warm-originated prediction production (anchor-based).
 
-        While active, :meth:`_run_inference` yields nothing, which suppresses
-        predict + resolver-register + journal atomically (both are downstream of
-        production). ALL other processing — bars, levels, touches, observations,
-        market context, PDH/PDL banking — is untouched; an observation that expires
-        during warm simply produces nothing. This kills the restart-duplicate
-        journal rows (a warm replay re-detects the prior days' touches with fresh
-        ids on every restart) and the mode="live" mislabeling of replayed touches.
-        The live service arms it at start and clears it on the warm->live flip,
-        on stop, and on watchdog failure; reset() also clears it.
+        While ``anchor`` is set, :meth:`_run_inference` produces nothing for
+        observations whose originating touch (``start_ts_utc``) predates it,
+        suppressing predict + resolver-register + journal atomically. ALL other
+        processing — bars, levels, touches, observations, market context, PDH/PDL
+        banking — is untouched; a warm observation that expires (during the drain
+        OR on the first post-flip events — the seam-tail case the adversarial
+        verify confirmed) produces nothing, while any live-originated touch
+        predicts normally from the first post-anchor event. This kills the
+        restart-duplicate journal rows (a warm replay re-detects the prior days'
+        touches with fresh ids on every restart) and the mode="live" mislabeling
+        of replayed touches. The live service arms it at start and keeps it for
+        the whole session; it clears on stop/failure, and reset() also clears it.
         """
 
-        self._live_warm_inference_gate = active
+        self._live_warm_inference_anchor = anchor
 
     def set_inference_engine(self, engine: InferenceEngine | None) -> None:
         """Attach (or detach) the inference engine and clear prediction state.
@@ -568,13 +574,19 @@ class ApplicationRuntime:
         predictions so they ride the same RuntimeUpdate.
         """
 
-        # WARM-FIX P3: during the live warm-start drain no predictions are produced,
-        # so nothing registers with the resolver and nothing journals — atomically.
-        if self._live_warm_inference_gate:
-            return (), ()
         engine = self._inference_engine
         if engine is None or not engine.has_active_model:
             return (), ()
+        # WARM-FIX P3: observations originating from warm-replayed touches produce
+        # nothing (no predict, no resolver registration, no journal — atomically),
+        # even when their window expires only after the warm->live flip.
+        warm_anchor = self._live_warm_inference_anchor
+        if warm_anchor is not None:
+            changed_observations = tuple(
+                observation
+                for observation in changed_observations
+                if observation.start_ts_utc >= warm_anchor
+            )
         produced: list[Prediction] = []
         # (prediction, observation) pairs: the resolver registers off the TOUCH
         # anchors carried on the observation chain, not off the prediction timestamps.

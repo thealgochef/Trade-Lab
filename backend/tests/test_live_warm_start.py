@@ -321,6 +321,62 @@ def test_dbn_record_streams_guards_end_le_start_per_schema() -> None:
     assert source.last_stream_end == end
 
 
+def test_diverging_per_schema_availability_is_warned(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Verify fix: with per-schema clamps the availability ends can diverge (e.g.
+    # an mbp-1 ingestion hiccup); the laggard's early slice end must be surfaced,
+    # not silently absorbed into the max-based last_stream_end.
+    end = datetime(2026, 6, 11, 15, 0, tzinfo=UTC)
+    trades_end = end.isoformat()
+    quotes_end = (end - timedelta(minutes=30)).isoformat()
+
+    class _FakeStore:
+        def __iter__(self):
+            return iter(())
+
+    class _FakeClient:
+        class metadata:
+            @staticmethod
+            def get_dataset_range(_dataset):
+                return {
+                    "schema": {
+                        "trades": {"end": trades_end},
+                        "mbp-1": {"end": quotes_end},
+                    }
+                }
+
+        class timeseries:
+            @staticmethod
+            def get_range(**_kwargs):
+                return _FakeStore()
+
+    source = DatabentoHistoricalSource(
+        api_key="k" * 32,
+        dataset="GLBX.MDP3",
+        requested_symbol="NQ.c.0",
+        stype_in="continuous",
+    )
+    monkeypatch.setattr(source, "_client", lambda: _FakeClient())
+    with caplog.at_level("WARNING"):
+        source.dbn_record_streams(
+            end=end,
+            schema_starts=(
+                ("trades", end - timedelta(hours=2)),
+                ("mbp-1", end - timedelta(minutes=55)),
+            ),
+        )
+    assert source.last_stream_end == end
+    lag_warnings = [
+        record.message
+        for record in caplog.records
+        if "lags the freshest schema" in record.message
+    ]
+    assert len(lag_warnings) == 1
+    assert "mbp-1" in lag_warnings[0]
+    assert "1800 s" in lag_warnings[0]
+
+
 def _ohlcv_source(calls: list[tuple[datetime, datetime]]) -> DatabentoHistoricalSource:
     def ohlcv_fetcher(start: datetime, end: datetime):
         import pandas as pd

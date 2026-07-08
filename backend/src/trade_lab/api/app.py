@@ -348,6 +348,9 @@ def create_app(
             throttle_warm_start=True,
             # WARM-FIX P2: post-drain silence -> DEGRADED + single-attempt reconnect.
             watchdog_seconds=settings.live_watchdog_seconds,
+            # Verify fix: the internal reconnect honors the same live/replay mutual
+            # exclusion the endpoints enforce (audit #NN-2).
+            replay_active=lambda: _replay_is_active(replay),
         )
     if not live.has_update_callback:
         live.set_update_callback(broadcaster.broadcast_update)

@@ -216,9 +216,12 @@ class _DatabentoSdkFacade:
     ) -> None:
         """Execute ``action`` on the SDK session loop and wait for it (bounded).
 
-        The wait blocks the calling thread for microseconds when the session loop is
-        healthy — comparable to the existing blocking connect+auth on this same path
-        — and raises loudly on timeout instead of leaving a silently-wedged session.
+        The wait blocks the calling thread — normally sub-millisecond per call when
+        the session loop is healthy, though the surrounding connect sequence as a
+        whole blocks ~1-2 s (dominated by the gateway connect+auth RTT, exactly as
+        the pre-fix inline connect did) and is bounded by the SDK's connect/auth
+        timeouts plus this call timeout per marshaled operation. Raises loudly on
+        timeout instead of leaving a silently-wedged session.
         """
 
         loop = self._session_loop(client)
@@ -327,6 +330,14 @@ class DatabentoMarketDataFeed:
         # at FETCH time (the live service's runtime handle carries the contract-driven
         # retention); None keeps the legacy both-schemas-full-span shape.
         self._quote_warm_retention_provider = quote_warm_retention_provider
+        # Verify fix (adversarial-verify major): wall-clock stamp of the LAST provider
+        # callback of any kind — including SystemMsg heartbeats and symbology
+        # mappings that the consumer later drops as control messages. This is the
+        # liveness watchdog's healthy-vs-wedge discriminator (WEDGE_CAPTURE.md §C.4:
+        # a started session heartbeats every 30 s even with zero market data; the
+        # wedge had zero inbound bytes). Written from the SDK callback thread;
+        # single reference assignment, safe to read from the event loop.
+        self.last_provider_activity_utc: datetime | None = None
         # W2 P1b FALLBACK: per-schema historical record streams staged by start()
         # when the gateway rejects the replay-start subscribe; drained by events()
         # BEFORE the live subscription so the queue can never overflow on history.
@@ -632,6 +643,7 @@ class DatabentoMarketDataFeed:
         # Databento invokes callbacks from SDK-managed threads. Keep this function
         # tiny and thread-safe: enqueue provider records only. The async iterator
         # later normalizes them and feeds ApplicationRuntime on the event loop.
+        self.last_provider_activity_utc = datetime.now(UTC)
         schema = _optional_str(kwargs, "schema") if kwargs else None
         message: Any
         if "record" in kwargs:
