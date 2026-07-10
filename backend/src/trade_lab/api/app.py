@@ -4,11 +4,11 @@ import hmac
 import ipaddress
 import re
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -34,6 +34,12 @@ from trade_lab.services.model_registry import (
     ModelValidationError,
     ServingCapabilities,
     is_safe_model_id,
+)
+from trade_lab.services.performance import (
+    InvalidPerformanceFilter,
+    JournalDirectoryNotFound,
+    PerformanceFilters,
+    aggregate_performance,
 )
 from trade_lab.services.replay import HistoricalReplayService, ReplayConfig, ReplayState
 from trade_lab.services.runtime import ApplicationRuntime, RuntimeUpdate
@@ -488,6 +494,66 @@ def create_app(
             RuntimeUpdate(model_reset_reason="activation")
         )
         return model_status_to_dto(runtime.model_status()).model_dump(mode="json")
+
+    @app.get("/api/v1/performance")
+    def performance(
+        mode: str = "all",
+        from_day: str | None = Query(default=None, alias="from"),
+        to_day: str | None = Query(default=None, alias="to"),
+        bundle: str | None = None,
+        session: str | None = None,
+        eligibility: str = "all",
+    ) -> dict[str, object]:
+        # REPORT P3: read-only reporting surface — the trader dashboard AND the
+        # D-P-12 soak adjudication artifact. No runtime/engine/registry access;
+        # journal + bundle files are re-opened on every request because the
+        # journal appends between calls. Sync handler -> threadpool, so the file
+        # reads never block the event loop.
+        def _parse_day(value: str | None, name: str) -> date | None:
+            if value is None:
+                return None
+            try:
+                return date.fromisoformat(value)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400, detail=f"invalid {name} date (expected YYYY-MM-DD)"
+                ) from exc
+
+        bundle_dir: Path | None = None
+        if bundle is not None:
+            # Same id hygiene as activation: path-like ids are a 400, unknown
+            # (but well-formed) ids a 404 — never a filesystem probe.
+            if not is_safe_model_id(bundle):
+                raise HTTPException(status_code=400, detail="invalid model id")
+            candidate = None if settings.models_path is None else settings.models_path / bundle
+            try:
+                if candidate is None or not candidate.is_dir() or candidate.is_symlink():
+                    raise HTTPException(status_code=404, detail="unknown model id")
+            except OSError as exc:
+                raise HTTPException(status_code=404, detail="unknown model id") from exc
+            bundle_dir = candidate
+        try:
+            filters = PerformanceFilters(
+                mode=mode,
+                from_day=_parse_day(from_day, "from"),
+                to_day=_parse_day(to_day, "to"),
+                bundle_id=bundle,
+                session=session,
+                eligibility=eligibility,
+            )
+            report = aggregate_performance(
+                settings.journal_path,
+                filters=filters,
+                models_root=settings.models_path,
+                bundle_dir=bundle_dir,
+            )
+        except InvalidPerformanceFilter as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except JournalDirectoryNotFound as exc:
+            raise HTTPException(
+                status_code=404, detail="journal directory not found"
+            ) from exc
+        return report.to_payload()
 
     @app.get("/api/v1/replay/status")
     async def replay_status() -> dict[str, object]:

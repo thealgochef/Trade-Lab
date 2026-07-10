@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { apiClient } from './api/client';
 import { normalizeLiveStatus, normalizeReplayStatus, normalizeRuntimeStatus } from './domain/normalize';
 import { realtimeClient } from './realtime/client';
@@ -10,8 +10,12 @@ import { EventBlotter } from './components/EventBlotter';
 import { ReplayControls } from './components/ReplayControls';
 import { LiveDataPanel } from './components/LiveDataPanel';
 import { ModelPanel } from './components/ModelPanel';
+import { PerformancePage } from './components/PerformancePage';
+
+type WorkspaceView = 'workstation' | 'performance';
 
 export function App() {
+  const [view, setView] = useState<WorkspaceView>('workstation');
   useEffect(() => {
     let cancelled = false;
     const refreshStatus = async () => {
@@ -38,20 +42,36 @@ export function App() {
   }, []);
 
   return (
-    <main className="workstation-shell">
+    <main className={view === 'workstation' ? 'workstation-shell' : 'workstation-shell performance-view'}>
       <TopStatusBar />
-      <section className="control-row">
-        <ReplayControls />
-        <LiveDataPanel />
-      </section>
-      <section className="control-row model-row">
-        <ModelPanel />
-      </section>
-      <section className="workspace-grid">
-        <ChartWorkspace />
-        <IntelligencePanel />
-      </section>
-      <EventBlotter />
+      <nav className="view-tabs" aria-label="Workspace view">
+        <div className="segmented-control">
+          <button className={view === 'workstation' ? 'active' : ''} onClick={() => setView('workstation')}>
+            Workstation
+          </button>
+          <button className={view === 'performance' ? 'active' : ''} onClick={() => setView('performance')}>
+            Performance
+          </button>
+        </div>
+      </nav>
+      {view === 'workstation' ? (
+        <>
+          <section className="control-row">
+            <ReplayControls />
+            <LiveDataPanel />
+          </section>
+          <section className="control-row model-row">
+            <ModelPanel />
+          </section>
+          <section className="workspace-grid">
+            <ChartWorkspace />
+            <IntelligencePanel />
+          </section>
+          <EventBlotter />
+        </>
+      ) : (
+        <PerformancePage />
+      )}
     </main>
   );
 }

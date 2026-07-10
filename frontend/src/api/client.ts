@@ -1,5 +1,5 @@
 import { config } from '../config';
-import type { ApiResult, HealthDTO, LiveStatusDTO, ModelsResponseDTO, ReplaySourcesResponseDTO, ReplayStartRequestDTO, ReplayStatusDTO, RuntimeStatusDTO } from './types';
+import type { ApiResult, HealthDTO, LiveStatusDTO, ModelsResponseDTO, PerformanceQuery, PerformanceReportDTO, ReplaySourcesResponseDTO, ReplayStartRequestDTO, ReplayStatusDTO, RuntimeStatusDTO } from './types';
 import type { ModelStatusDTO } from '../realtime/types';
 
 type FetchLike = typeof fetch;
@@ -56,6 +56,18 @@ export class ApiClient {
 
   deactivateModel(): Promise<ApiResult<ModelStatusDTO>> {
     return this.post<ModelStatusDTO>('/api/v1/models/deactivate');
+  }
+
+  // Read-only reporting aggregate (REPORT P3); the backend re-reads the journal
+  // files on every call, so polling this endpoint always sees fresh appends.
+  performance(query: PerformanceQuery = {}): Promise<ApiResult<PerformanceReportDTO>> {
+    const params = new URLSearchParams();
+    if (query.mode) params.set('mode', query.mode);
+    if (query.from) params.set('from', query.from);
+    if (query.to) params.set('to', query.to);
+    if (query.bundle) params.set('bundle', query.bundle);
+    const suffix = params.toString();
+    return this.get<PerformanceReportDTO>(`/api/v1/performance${suffix ? `?${suffix}` : ''}`);
   }
 
   startReplay(request: ReplayStartRequestDTO): Promise<ApiResult<ReplayStatusDTO>> {
