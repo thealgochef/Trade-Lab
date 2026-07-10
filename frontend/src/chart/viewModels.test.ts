@@ -154,8 +154,8 @@ describe('chart view model normalization', () => {
       { id: 't1', timeUtc: '2026-05-21T14:00:10Z', session: 'ny', levelKind: 'pdh', priceTicks: 76000, createdObservation: true },
     ];
     const observations: Observation[] = [
-      { id: 'o1', status: 'expired', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:00:11Z', scheduledEndUtc: '2026-05-21T14:10:11Z' },
-      { id: 'o1', status: 'expired', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:00:11Z', scheduledEndUtc: '2026-05-21T14:10:11Z' },
+      { id: 'o1', status: 'expired', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:00:11Z', scheduledEndUtc: '2026-05-21T14:10:11Z', originatingTouchId: null, levelPriceTicks: null, direction: null },
+      { id: 'o1', status: 'expired', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:00:11Z', scheduledEndUtc: '2026-05-21T14:10:11Z', originatingTouchId: null, levelPriceTicks: null, direction: null },
     ];
 
     const markers = combineMarkers(touches, observations, [], bars);
@@ -187,7 +187,7 @@ describe('chart view model normalization', () => {
       { id: 't1', timeUtc: '2026-05-21T14:00:10Z', session: 'ny', levelKind: 'pdh', priceTicks: 76000, createdObservation: true },
     ];
     const observations: Observation[] = [
-      { id: 'o1', status: 'expired', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:00:11Z', scheduledEndUtc: '2026-05-21T14:10:11Z' },
+      { id: 'o1', status: 'expired', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:00:11Z', scheduledEndUtc: '2026-05-21T14:10:11Z', originatingTouchId: null, levelPriceTicks: null, direction: null },
     ];
 
     expect(combineMarkers(touches, observations, [], [])).toEqual([]);
@@ -199,7 +199,7 @@ describe('chart view model normalization', () => {
       bar({ barIndex: 1, barId: '147t:2026-05-21:1', openTimeUtc: '2026-05-21T14:10:00Z', closeTimeUtc: '2026-05-21T14:15:00Z' }),
     ], 147);
     const observations: Observation[] = [
-      { id: 'o1', status: 'completed', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:00:11Z', scheduledEndUtc: '2026-05-21T14:10:11Z' },
+      { id: 'o1', status: 'completed', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:00:11Z', scheduledEndUtc: '2026-05-21T14:10:11Z', originatingTouchId: null, levelPriceTicks: null, direction: null },
     ];
 
     const markers = normalizeObservationMarkers(observations, createChartTimeResolver(bars));
@@ -296,7 +296,7 @@ describe('chart view model normalization', () => {
       { id: 't1', timeUtc: '2026-05-21T14:00:10Z', session: 'ny', levelKind: 'pdh', priceTicks: 76000, createdObservation: true },
     ];
     const observations: Observation[] = [
-      { id: 'o1', status: 'expired', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:00:11Z', scheduledEndUtc: '2026-05-21T14:10:11Z' },
+      { id: 'o1', status: 'expired', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:00:11Z', scheduledEndUtc: '2026-05-21T14:10:11Z', originatingTouchId: null, levelPriceTicks: null, direction: null },
     ];
 
     const markers = combineMarkers(touches, observations, [prediction({ outcome: outcome() })], bars);

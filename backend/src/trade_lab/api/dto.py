@@ -99,6 +99,11 @@ class ObservationDTO(ApiModel):
     session: str
     level_kind: str
     level_price_ticks: int
+    # COCKPIT P3c (display only): the AUTHORITATIVE touch direction carried on the
+    # domain observation (audit #NN-1) — clients must never re-derive it from
+    # level_kind, which inverts for mixed-side merged zones. None for legacy
+    # observations that predate direction carry.
+    direction: str | None = None
 
 
 class PredictionDTO(ApiModel):
@@ -353,6 +358,7 @@ def observation_to_dto(observation: Observation) -> ObservationDTO:
         session=observation.session.value,
         level_kind=observation.level_kind.value,
         level_price_ticks=observation.level_price_ticks,
+        direction=None if observation.direction is None else observation.direction.value,
     )
 
 

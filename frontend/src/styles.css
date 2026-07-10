@@ -206,6 +206,28 @@ button { font: inherit; }
 .expand-toggle { border: 1px solid var(--line); border-radius: 8px; background: #071017; color: var(--muted); padding: 4px 10px; cursor: pointer; margin-left: auto; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
 .replay-heading .expand-toggle { margin-left: 0; }
 
+/* --- Decision surfaces (COCKPIT P3): distance levels, gate math, setup card --- */
+.level-row { grid-template-columns: 1fr auto auto 64px; }
+.level-row.nearest { background: rgba(78,161,255,.08); border-radius: 8px; padding-left: 6px; padding-right: 6px; margin: 0 -6px; }
+.level-row strong.dist-above { color: var(--green); }
+.level-row strong.dist-below { color: var(--red); }
+.level-row .level-price { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 11px; text-align: right; }
+.gate-math { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+.gate-figures { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--text); }
+.gate-bar { position: relative; height: 6px; border-radius: 999px; background: rgba(255,255,255,.06); overflow: visible; }
+.gate-fill { height: 100%; border-radius: 999px; }
+.gate-fill.pass { background: var(--green); }
+.gate-fill.fail { background: var(--amber); }
+.gate-threshold { position: absolute; top: -2px; width: 2px; height: 10px; background: var(--text); opacity: .8; }
+.gate-reason { color: var(--amber); font-size: 11px; }
+.setup-card { border: 1px solid rgba(78,161,255,.45); border-radius: 10px; padding: 10px 12px; background: rgba(78,161,255,.06); display: flex; flex-direction: column; gap: 6px; }
+.setup-card-head { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.setup-level-price { color: var(--muted); font-variant-numeric: tabular-nums; }
+.setup-card-meta { display: flex; flex-wrap: wrap; gap: 8px 14px; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.setup-countdown { color: var(--blue); font-weight: 600; }
+.intel-badge.long { color: var(--green); border-color: rgba(54,211,153,.45); }
+.intel-badge.short { color: var(--red); border-color: rgba(255,107,107,.45); }
+
 /* EXEC P3c: paper-execution panel (open-position cards + closed table). */
 .executions-panel { display: flex; flex-direction: column; }
 .exec-note { margin-left: auto; color: var(--muted); font-size: 11px; }

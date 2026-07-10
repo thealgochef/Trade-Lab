@@ -89,6 +89,9 @@ export type ObservationDTO = {
   session: string;
   level_kind: string;
   level_price_ticks: number;
+  // COCKPIT P3c: authoritative touch direction (audit #NN-1) — never re-derive
+  // from level_kind client-side; null for legacy observations.
+  direction?: string | null;
 };
 
 export type PredictionDTO = {
@@ -183,6 +186,13 @@ export type ModelStatusDTO = {
   class_map: Record<string, string>;
   validation_ok: boolean;
   validation_detail: string | null;
+  // COCKPIT P1: serving-gate parameters from the active contract (display only;
+  // the gate verdict itself is is_eligible on each prediction). All null when no
+  // model is loaded. eligible_sessions uses the runtime session vocabulary
+  // ("ny"), matching the session field on predictions.
+  confidence_gate?: number | null;
+  eligible_class?: string | null;
+  eligible_sessions?: string[] | null;
 };
 
 export type SnapshotPayloadDTO = {

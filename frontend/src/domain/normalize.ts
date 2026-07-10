@@ -100,6 +100,9 @@ export const normalizeObservation = (dto: ObservationDTO): Observation => ({
   levelKind: dto.level_kind,
   startUtc: dto.start_ts_utc,
   scheduledEndUtc: dto.scheduled_end_ts_utc,
+  originatingTouchId: typeof dto.originating_touch_id === 'string' ? dto.originating_touch_id : null,
+  levelPriceTicks: typeof dto.level_price_ticks === 'number' && Number.isFinite(dto.level_price_ticks) ? dto.level_price_ticks : null,
+  direction: dto.direction === 'long' || dto.direction === 'short' ? dto.direction : null,
 });
 
 export const normalizeWarning = (dto: DataQualityWarningDTO): Warning => ({
@@ -206,6 +209,11 @@ export const normalizeModelStatus = (dto: ModelStatusDTO): ModelStatus => ({
   classMap: safeStringRecord(dto.class_map),
   validationOk: dto.validation_ok,
   validationDetail: dto.validation_detail ?? null,
+  confidenceGate: typeof dto.confidence_gate === 'number' && Number.isFinite(dto.confidence_gate) ? dto.confidence_gate : null,
+  eligibleClass: typeof dto.eligible_class === 'string' ? dto.eligible_class : null,
+  eligibleSessions: Array.isArray(dto.eligible_sessions)
+    ? dto.eligible_sessions.filter((session): session is string => typeof session === 'string')
+    : null,
 });
 
 export const normalizeModelBundle = (dto: ModelBundleDTO): ModelBundle => ({

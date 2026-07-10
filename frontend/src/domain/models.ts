@@ -57,6 +57,13 @@ export type Observation = {
   levelKind: string;
   startUtc: string;
   scheduledEndUtc: string;
+  // COCKPIT P3c: fields for the active-setup card. originatingTouchId joins the
+  // touches stream for the touch price; levelPriceTicks anchors the setup;
+  // direction is the AUTHORITATIVE carried touch direction (audit #NN-1 — never
+  // re-derived from levelKind), null for legacy observations.
+  originatingTouchId: string | null;
+  levelPriceTicks: number | null;
+  direction: string | null;
 };
 
 export type Warning = {
@@ -210,6 +217,12 @@ export type ModelStatus = {
   classMap: Record<string, string>;
   validationOk: boolean;
   validationDetail: string | null;
+  // COCKPIT P1/P3: serving-gate parameters for the gate-math card. Null when no
+  // model is loaded (or an older backend omits them). eligibleSessions is the
+  // runtime session vocabulary, comparable to prediction.session directly.
+  confidenceGate: number | null;
+  eligibleClass: string | null;
+  eligibleSessions: string[] | null;
 };
 
 export type ModelBundle = {

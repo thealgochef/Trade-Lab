@@ -468,7 +468,7 @@ describe('RealtimeClient', () => {
     intelligenceStore.setState({
       levels: [{ kind: 'pdh', priceTicks: 76000, tradingDay: '2026-05-21', originSession: 'ny', developing: false, eligible: true }],
       touches: [{ id: 'touch-1', timeUtc: '2026-05-21T14:02:00Z', session: 'ny', levelKind: 'pdh', priceTicks: 76000, createdObservation: true }],
-      observations: [{ id: 'obs-1', status: 'active', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:02:00Z', scheduledEndUtc: '2026-05-21T14:17:00Z' }],
+      observations: [{ id: 'obs-1', status: 'active', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:02:00Z', scheduledEndUtc: '2026-05-21T14:17:00Z', originatingTouchId: null, levelPriceTicks: null, direction: null }],
       warnings: [normalizeWarning(warning(1))],
     });
     client.start();
@@ -485,7 +485,7 @@ describe('RealtimeClient', () => {
     intelligenceStore.setState({
       levels: [{ kind: 'pdh', priceTicks: 76000, tradingDay: '2026-05-21', originSession: 'ny', developing: false, eligible: true }],
       touches: [{ id: 'touch-1', timeUtc: '2026-05-21T14:02:00Z', session: 'ny', levelKind: 'pdh', priceTicks: 76000, createdObservation: true }],
-      observations: [{ id: 'obs-1', status: 'active', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:02:00Z', scheduledEndUtc: '2026-05-21T14:17:00Z' }],
+      observations: [{ id: 'obs-1', status: 'active', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:02:00Z', scheduledEndUtc: '2026-05-21T14:17:00Z', originatingTouchId: null, levelPriceTicks: null, direction: null }],
       warnings: [normalizeWarning(warning(1))],
     });
     client.start();

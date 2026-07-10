@@ -168,7 +168,7 @@ describe('workstation stores', () => {
     addPrediction(makePrediction('pred-1'));
     addOutcome(makeOutcome('pred-1'));
     addDropped(makeDropped('pred-2'));
-    setModelStatus({ loaded: true, modelId: 'model-a', strategyId: null, trainingMode: null, instrument: null, featureNames: [], classMap: {}, validationOk: true, validationDetail: null });
+    setModelStatus({ loaded: true, modelId: 'model-a', strategyId: null, trainingMode: null, instrument: null, featureNames: [], classMap: {}, validationOk: true, validationDetail: null, confidenceGate: null, eligibleClass: null, eligibleSessions: null });
 
     clearPredictions();
 

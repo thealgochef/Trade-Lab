@@ -670,6 +670,44 @@ def test_empty_snapshot_payload_has_required_shape() -> None:
     }
 
 
+def test_observation_dto_carries_authoritative_direction() -> None:
+    """COCKPIT P3c: the observation DTO ships the audit #NN-1 direction.
+
+    Clients must never re-derive direction from level_kind (it inverts for
+    mixed-side merged zones); the DTO passes the domain observation's carried
+    direction through, and stays null-safe for legacy observations.
+    """
+
+    from datetime import date
+
+    from trade_lab.api.dto import observation_to_dto
+    from trade_lab.domain.levels import LevelDirection, LevelKind
+    from trade_lab.domain.observations import Observation, ObservationStatus
+    from trade_lab.domain.sessions import SessionName
+
+    base = Observation(
+        observation_id="obs-1",
+        originating_touch_id="touch-1",
+        start_ts_utc=datetime(2026, 1, 5, 8, 0, tzinfo=UTC),
+        scheduled_end_ts_utc=datetime(2026, 1, 5, 8, 5, tzinfo=UTC),
+        status=ObservationStatus.ACTIVE,
+        trading_day=date(2026, 1, 5),
+        session=SessionName.LONDON,
+        level_kind=LevelKind.ASIA_HIGH,
+        level_price_ticks=68_020,
+        direction=LevelDirection.SHORT,
+    )
+
+    dto = observation_to_dto(base)
+    assert dto.direction == "short"
+    assert dto.scheduled_end_ts_utc == base.scheduled_end_ts_utc
+
+    from dataclasses import replace as dc_replace
+
+    legacy = dc_replace(base, direction=None)
+    assert observation_to_dto(legacy).direction is None
+
+
 def test_make_envelope_has_required_fields() -> None:
     envelope = make_envelope("system.heartbeat", 7, {"status": "ok"})
 
