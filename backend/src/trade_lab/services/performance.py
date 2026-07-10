@@ -49,6 +49,10 @@ KNOWN_RESOLUTIONS = frozenset({RESOLUTION_TP, RESOLUTION_SL})
 
 MODES = frozenset({"replay", "live", "all"})
 ELIGIBILITY_FILTERS = frozenset({"all", "eligible", "ineligible"})
+#: The plugin session vocabulary journal prediction rows carry (REPORT_RECON (a)).
+#: A filter value outside it can never match a row, so it is a caller error (400),
+#: not an all-zeros 200.
+KNOWN_SESSIONS = frozenset({"asia", "london", "ny"})
 
 _STRATEGY_FILE = "strategy.json"
 _EVALUATION_FILE = "evaluation.json"
@@ -81,6 +85,8 @@ class PerformanceFilters:
             raise InvalidPerformanceFilter(
                 f"eligibility must be one of {sorted(ELIGIBILITY_FILTERS)}"
             )
+        if self.session is not None and self.session not in KNOWN_SESSIONS:
+            raise InvalidPerformanceFilter(f"session must be one of {sorted(KNOWN_SESSIONS)}")
         if (
             self.from_day is not None
             and self.to_day is not None

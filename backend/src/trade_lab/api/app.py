@@ -521,17 +521,19 @@ def create_app(
 
         bundle_dir: Path | None = None
         if bundle is not None:
-            # Same id hygiene as activation: path-like ids are a 400, unknown
-            # (but well-formed) ids a 404 — never a filesystem probe.
+            # Same id hygiene as activation: path-like ids are a 400 — never a
+            # filesystem probe. A well-formed id absent from models_root is NOT
+            # an error: the bundle_id row filter still applies so retired
+            # bundles' journal history stays queryable; only the OOS panel
+            # needs the on-disk bundle dir.
             if not is_safe_model_id(bundle):
                 raise HTTPException(status_code=400, detail="invalid model id")
             candidate = None if settings.models_path is None else settings.models_path / bundle
             try:
-                if candidate is None or not candidate.is_dir() or candidate.is_symlink():
-                    raise HTTPException(status_code=404, detail="unknown model id")
-            except OSError as exc:
-                raise HTTPException(status_code=404, detail="unknown model id") from exc
-            bundle_dir = candidate
+                if candidate is not None and candidate.is_dir() and not candidate.is_symlink():
+                    bundle_dir = candidate
+            except OSError:
+                bundle_dir = None
         try:
             filters = PerformanceFilters(
                 mode=mode,

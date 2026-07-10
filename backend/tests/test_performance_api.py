@@ -1,10 +1,12 @@
 """Contract tests for GET /api/v1/performance (REPORT P3).
 
 Read-only endpoint over the journal directory + model store: 404 clean on a
-missing journal dir, 400 on out-of-domain filters/path-like bundle ids, 404 on
-unknown bundle ids, per-request file opens (a row appended between calls shows
-up on the next call), torn-tail-line tolerance, and a pinned payload shape with
-no path/secret leakage.
+missing journal dir, 400 on out-of-domain filters/path-like bundle ids,
+row-filter-only semantics for well-formed bundle ids absent from the model
+store (retired bundles' journal history stays queryable; no OOS panel),
+per-request file opens (a row appended between calls shows up on the next
+call), torn-tail-line tolerance, and a pinned payload shape with no
+path/secret leakage.
 """
 
 import json
@@ -191,6 +193,9 @@ def test_400_on_bad_filters(tmp_path: Path) -> None:
     assert client.get("/api/v1/performance", params={"mode": "bogus"}).status_code == 400
     assert client.get("/api/v1/performance", params={"from": "not-a-date"}).status_code == 400
     assert client.get("/api/v1/performance", params={"eligibility": "maybe"}).status_code == 400
+    # EXEC P0a: a session outside the plugin vocabulary can never match a row,
+    # so it is a 400 like the other filters — not an all-zeros 200.
+    assert client.get("/api/v1/performance", params={"session": "nyse"}).status_code == 400
     assert (
         client.get(
             "/api/v1/performance", params={"from": "2026-06-19", "to": "2026-06-18"}
@@ -200,11 +205,23 @@ def test_400_on_bad_filters(tmp_path: Path) -> None:
 
 
 def test_bundle_id_hygiene(tmp_path: Path) -> None:
-    client, _ = _client(tmp_path)
+    client, journal = _client(tmp_path)
     # Path-like ids are a 400 before any filesystem access.
     assert (
         client.get("/api/v1/performance", params={"bundle": "..\\escape"}).status_code == 400
     )
     assert client.get("/api/v1/performance", params={"bundle": "a/b"}).status_code == 400
-    # Well-formed but unknown ids are a clean 404.
-    assert client.get("/api/v1/performance", params={"bundle": "NO_SUCH"}).status_code == 404
+    # EXEC P0b: a well-formed id absent from the model store applies the
+    # bundle_id row filter with NO bundle dir — retired bundles' journal
+    # history stays queryable; the OOS panel is simply absent.
+    _append(journal, [_prediction("p1", bundle_id="NO_SUCH"), _outcome("p1", bundle_id="NO_SUCH")])
+    response = client.get("/api/v1/performance", params={"bundle": "NO_SUCH"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["applied_filters"]["bundle_id"] == "NO_SUCH"
+    assert payload["headline"]["resolved_trades"] == 1
+    assert payload["oos_comparison"] is None
+    # The row filter still scopes: the retired-bundle rows are invisible under
+    # a DIFFERENT bundle id (the on-disk one).
+    other = client.get("/api/v1/performance", params={"bundle": BUNDLE}).json()
+    assert other["headline"]["resolved_trades"] == 0
