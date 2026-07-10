@@ -576,6 +576,9 @@ def test_websocket_snapshot_contract_is_versioned_deterministic_and_safe() -> No
         "class_map": {},
         "validation_ok": False,
         "validation_detail": None,
+        "confidence_gate": None,
+        "eligible_class": None,
+        "eligible_sessions": None,
     }
     assert snapshot["payload"]["session"] is None
     assert snapshot["payload"]["trading_day"] is None

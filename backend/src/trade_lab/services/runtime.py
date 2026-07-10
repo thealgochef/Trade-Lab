@@ -31,7 +31,11 @@ from trade_lab.domain.market_context import DEFAULT_RETENTION_MINUTES, MarketCon
 from trade_lab.domain.observations import Observation, ObservationEngine, ObservationStatus
 from trade_lab.domain.outcomes import DroppedPrediction, Outcome
 from trade_lab.services.inference.features import FeatureComputationError
-from trade_lab.services.inference.inference_engine import InferenceEngine, Prediction
+from trade_lab.services.inference.inference_engine import (
+    InferenceEngine,
+    Prediction,
+    eligible_session_tokens,
+)
 from trade_lab.services.inference.resolution_adapter import (
     drop_to_dropped,
     parse_bar_type,
@@ -111,6 +115,13 @@ class ModelStatus:
     )
     validation_ok: bool = False
     validation_detail: str | None = None
+    # Serving-gate parameters from the active contract's InferencePolicy, display
+    # only — the gate itself is applied in InferenceEngine.predict_for_observation.
+    # eligible_sessions carries the runtime session vocabulary (see
+    # eligible_session_tokens), not the contract's raw spelling.
+    confidence_gate: float | None = None
+    eligible_class: str | None = None
+    eligible_sessions: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -566,6 +577,9 @@ class ApplicationRuntime:
             # carried on the active bundle — no longer hardcoded True.
             validation_ok=active.validation_ok,
             validation_detail=active.validation_detail,
+            confidence_gate=contract.inference.confidence_gate,
+            eligible_class=contract.inference.eligible_class,
+            eligible_sessions=eligible_session_tokens(contract.inference.eligible_session),
         )
 
     def session_state(self) -> tuple[str | None, date | None]:

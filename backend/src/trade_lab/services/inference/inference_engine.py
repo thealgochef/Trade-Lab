@@ -99,6 +99,17 @@ def _session_matches(observation_session: str, eligible_session: str) -> bool:
     return eligible.split("_", 1)[0] == obs.split("_", 1)[0]
 
 
+def eligible_session_tokens(eligible_session: str) -> tuple[str, ...]:
+    """Project the contract's eligible session into the runtime session vocabulary.
+
+    Display-side companion of ``_session_matches``: a contract ``ny_rth`` gates on
+    the leading token, so the runtime-vocabulary form shown to clients is ``ny``.
+    Kept beside the predicate so the two conventions cannot drift apart.
+    """
+
+    return (eligible_session.lower().split("_", 1)[0],)
+
+
 class InferenceEngine:
     """Produce predictions from completed observations using the active model."""
 

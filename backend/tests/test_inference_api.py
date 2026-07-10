@@ -23,6 +23,10 @@ from trade_lab.api.dto import MESSAGE_VERSION
 from trade_lab.config import Settings
 from trade_lab.domain.events import TradeEvent
 from trade_lab.services.broadcaster import WebSocketBroadcaster
+from trade_lab.services.inference.inference_engine import (
+    _session_matches,
+    eligible_session_tokens,
+)
 from trade_lab.services.replay import HistoricalReplayService
 from trade_lab.services.runtime import ApplicationRuntime
 
@@ -183,6 +187,52 @@ def test_activate_happy_path_loads_and_reports_status(tmp_path: Path) -> None:
     assert active["model_id"] == "good-model"
     _assert_no_secret_text(payload)
     _assert_no_temp_path(payload, tmp_path)
+
+
+def test_active_model_reports_serving_gate_parameters(tmp_path: Path) -> None:
+    """COCKPIT P1: the model-status DTO carries the contract's serving-gate params.
+
+    eligible_sessions is the runtime session vocabulary (contract ``ny_rth`` gates
+    on the leading token → ``ny``), matching the ``session`` field on predictions.
+    All three fields are null when no model is loaded.
+    """
+
+    client = _good_bundle_app(tmp_path)
+
+    unloaded = client.get("/api/v1/models/active").json()
+    assert unloaded["confidence_gate"] is None
+    assert unloaded["eligible_class"] is None
+    assert unloaded["eligible_sessions"] is None
+
+    activated = client.post(
+        "/api/v1/models/activate", json={"model_id": "good-model"}
+    ).json()
+    assert activated["confidence_gate"] == 0.7
+    assert activated["eligible_class"] == "tradeable_reversal"
+    assert activated["eligible_sessions"] == ["ny"]
+
+    deactivated = client.post("/api/v1/models/deactivate").json()
+    assert deactivated["loaded"] is False
+    assert deactivated["confidence_gate"] is None
+    assert deactivated["eligible_class"] is None
+    assert deactivated["eligible_sessions"] is None
+    _assert_no_secret_text(activated)
+    _assert_no_temp_path(activated, tmp_path)
+
+
+def test_eligible_sessions_agree_with_the_gate_predicate() -> None:
+    """The displayed eligible_sessions and _session_matches cannot disagree.
+
+    Every token eligible_session_tokens ships must satisfy _session_matches
+    against the raw contract spelling, and the runtime label the token stands
+    for must actually pass the gate.
+    """
+
+    for raw in ("ny_rth", "ny", "asia", "london", "NY_RTH"):
+        tokens = eligible_session_tokens(raw)
+        assert tokens
+        for token in tokens:
+            assert _session_matches(token, raw)
 
 
 def test_activate_broadcasts_model_status_over_websocket(tmp_path: Path) -> None:

@@ -204,6 +204,13 @@ class ModelStatusDTO(ApiModel):
     class_map: dict[int, str] = Field(default_factory=dict)
     validation_ok: bool = False
     validation_detail: str | None = None
+    # Serving-gate parameters (display only; the gate is applied server-side and
+    # stamped per-prediction as is_eligible). All three are null when no model is
+    # loaded. eligible_sessions uses the runtime session vocabulary ("ny", not the
+    # contract's raw "ny_rth"), matching the session field on predictions.
+    confidence_gate: float | None = None
+    eligible_class: str | None = None
+    eligible_sessions: list[str] | None = None
 
 
 class ModelBundleDTO(ApiModel):
@@ -459,6 +466,11 @@ def model_status_to_dto(status: ModelStatus) -> ModelStatusDTO:
         class_map=dict(status.class_map),
         validation_ok=status.validation_ok,
         validation_detail=status.validation_detail,
+        confidence_gate=status.confidence_gate,
+        eligible_class=status.eligible_class,
+        eligible_sessions=(
+            None if status.eligible_sessions is None else list(status.eligible_sessions)
+        ),
     )
 
 
