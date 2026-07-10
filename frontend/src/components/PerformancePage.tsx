@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { apiClient } from '../api/client';
 import type { PerformanceKeyRowDTO, PerformanceReportDTO } from '../api/types';
 import {
@@ -50,7 +50,14 @@ export function PerformancePage() {
 
   const bundleParam = bundleScope === 'active' && activeBundleId ? activeBundleId : undefined;
 
+  // Verify fix (major): filter changes can spawn overlapping requests (mount
+  // fires before activeModel resolves, then again after). Without sequencing,
+  // an older all-bundle response could land last and overwrite the newer
+  // scoped one. Only the latest request may write state.
+  const requestSeq = useRef(0);
+
   const refresh = useCallback(async () => {
+    const seq = ++requestSeq.current;
     setLoading(true);
     const result = await apiClient.performance({
       mode: mode === 'all' ? undefined : mode,
@@ -58,6 +65,7 @@ export function PerformancePage() {
       to: toDay || undefined,
       bundle: bundleParam,
     });
+    if (seq !== requestSeq.current) return; // superseded by a newer request
     setLoading(false);
     if (result.ok) {
       setReport(result.data);
@@ -544,6 +552,11 @@ export function PerformancePage() {
             <div className="perf-quality-row">
               <span>{report.anomalies.files_scanned} files</span>
               <span>{report.anomalies.lines_total} lines</span>
+              <QualityCount label="unreadable files" value={report.anomalies.unreadable_files} />
+              <QualityCount
+                label="decode-error files"
+                value={report.anomalies.decode_error_files}
+              />
               <QualityCount label="malformed" value={report.anomalies.malformed_lines} />
               <QualityCount label="unknown type" value={report.anomalies.unknown_type_rows} />
               <QualityCount label="missing ids" value={report.anomalies.rows_missing_ids} />

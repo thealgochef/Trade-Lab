@@ -189,6 +189,8 @@ export type PerformanceFunnelDTO = {
 export type PerformanceAnomaliesDTO = {
   note: string;
   files_scanned: number;
+  unreadable_files: number;
+  decode_error_files: number;
   lines_total: number;
   malformed_lines: number;
   unknown_type_rows: number;

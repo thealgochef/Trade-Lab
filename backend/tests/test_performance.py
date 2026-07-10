@@ -435,6 +435,53 @@ def test_oos_comparison_section(tmp_path: Path) -> None:
     assert journal_side["mfe_mae"]["mfe_pts"]["n"] == 2
 
 
+def test_undecodable_bytes_are_salvaged_and_counted(tmp_path: Path) -> None:
+    # Verify fix (major): a single non-UTF-8 byte previously raised
+    # UnicodeDecodeError out of the aggregator (a permanent 500 at the
+    # endpoint). Bad bytes must degrade to malformed lines + a flagged file,
+    # and healthy rows in the same file stay readable.
+    journal = tmp_path / "journal"
+    _write(journal, "2026-06-18.jsonl", [_prediction("p1"), _outcome("p1")])
+    with (journal / "2026-06-18.jsonl").open("ab") as handle:
+        handle.write(b"\xff\xfe garbage line\n")
+    report = aggregate_performance(journal)
+    assert report.anomalies["decode_error_files"] == 1
+    assert report.anomalies["malformed_lines"] == 1
+    assert report.headline["resolved_trades"] == 1  # healthy rows salvaged
+
+
+def test_unreadable_file_is_counted_not_silent(tmp_path: Path) -> None:
+    # Verify fix (major): an OSError-unreadable file previously vanished with
+    # only a server log line while files_scanned claimed it was read. A
+    # directory named *.jsonl matches the glob and raises OSError on read.
+    journal = tmp_path / "journal"
+    _write(journal, "2026-06-18.jsonl", [_prediction("p1"), _outcome("p1")])
+    (journal / "2026-06-19.jsonl").mkdir()
+    report = aggregate_performance(journal)
+    assert report.anomalies["files_scanned"] == 2
+    assert report.anomalies["unreadable_files"] == 1
+    assert report.headline["resolved_trades"] == 1
+
+
+def test_malformed_quality_gates_degrades_not_crashes(tmp_path: Path) -> None:
+    # Verify fix (major): a non-dict quality_gates.gates in evaluation.json
+    # previously raised AttributeError out of aggregate_performance, turning
+    # the WHOLE report into a 500. It must degrade the OOS section only.
+    journal = tmp_path / "journal"
+    bundle = _bundle_dir(tmp_path / "models")
+    _write(journal, "2026-06-18.jsonl", [_prediction("p1"), _outcome("p1")])
+    for bad_gates in (["oops"], None, "oops"):
+        (bundle / "evaluation.json").write_text(
+            json.dumps({"quality_gates": {"all_passed": False, "gates": bad_gates}}),
+            encoding="utf-8",
+        )
+        report = aggregate_performance(journal, bundle_dir=bundle)
+        assert report.headline["resolved_trades"] == 1
+        comparison = report.oos_comparison
+        assert comparison is not None
+        assert comparison["oos"]["quality_gates"] == {"all_passed": False, "gates": {}}
+
+
 def test_payload_shape(tmp_path: Path) -> None:
     journal = tmp_path / "journal"
     journal.mkdir()

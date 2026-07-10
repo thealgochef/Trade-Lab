@@ -154,6 +154,8 @@ class _RawJournal:
     outcomes: dict[str, dict[str, Any]] = field(default_factory=dict)
     drops: dict[str, dict[str, Any]] = field(default_factory=dict)
     files_scanned: int = 0
+    unreadable_files: int = 0
+    decode_error_files: int = 0
     lines_total: int = 0
     malformed_lines: int = 0
     unknown_type_rows: int = 0
@@ -188,10 +190,23 @@ def _read_journal(journal_dir: Path) -> _RawJournal:
     for file in sorted(journal_dir.glob("*.jsonl"), key=lambda p: p.name):
         raw.files_scanned += 1
         try:
-            text = file.read_text(encoding="utf-8")
+            data = file.read_bytes()
         except OSError:
+            # Verify fix (major): an unreadable file must be VISIBLE in the
+            # payload, not just a server log line — a traded day silently
+            # reporting as empty would corrupt the adjudication artifact.
+            raw.unreadable_files += 1
             logger.warning("performance: journal file is unreadable: %s", file.name)
             continue
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            # Verify fix (major): a single bad byte previously 500'd every
+            # request. Salvage what decodes; the corrupted line(s) then fail
+            # json.loads and land in malformed_lines, and the file is flagged.
+            raw.decode_error_files += 1
+            logger.warning("performance: journal file has undecodable bytes: %s", file.name)
+            text = data.decode("utf-8", errors="replace")
         for line in text.splitlines():
             if not line.strip():
                 continue
@@ -701,6 +716,8 @@ def aggregate_performance(
     anomalies = {
         "note": "whole-directory data quality, counted before filtering",
         "files_scanned": raw.files_scanned,
+        "unreadable_files": raw.unreadable_files,
+        "decode_error_files": raw.decode_error_files,
         "lines_total": raw.lines_total,
         "malformed_lines": raw.malformed_lines,
         "unknown_type_rows": raw.unknown_type_rows,
@@ -808,6 +825,9 @@ def _oos_comparison(
             }
         gates = evaluation.get("quality_gates")
         if isinstance(gates, dict):
+            # Verify fix (major): the gates container itself is untrusted too —
+            # a non-dict value must degrade this section, not 500 the report.
+            raw_gates = gates.get("gates")
             oos["quality_gates"] = {
                 "all_passed": gates.get("all_passed"),
                 "gates": {
@@ -816,7 +836,9 @@ def _oos_comparison(
                         "value": detail.get("value"),
                         "threshold": detail.get("threshold"),
                     }
-                    for name, detail in gates.get("gates", {}).items()
+                    for name, detail in (
+                        raw_gates.items() if isinstance(raw_gates, dict) else ()
+                    )
                     if isinstance(detail, dict)
                 },
             }
