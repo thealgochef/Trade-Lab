@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef } from 'react';
-import { CandlestickSeries, ColorType, CrosshairMode, createChart, type IChartApi, type ISeriesApi, type MouseEventParams } from 'lightweight-charts';
+import { CandlestickSeries, ColorType, CrosshairMode, createChart, type IChartApi, type ISeriesApi, type MouseEventParams, type TickMarkType, type Time } from 'lightweight-charts';
 import { ChartOverlayManager } from '../chart/overlayManager';
+import { axisIndexInvalidated, buildAxisTimeIndex, formatCrosshairCt, formatTickMarkCt } from '../chart/axisTime';
 import { sessionBands, type ChartBar, type LevelOverlay, type MarkerOverlay, type PositionLineOverlay } from '../chart/viewModels';
 import type { Timeframe } from '../domain/models';
 
@@ -47,6 +48,10 @@ export function TradingChart({ timeframe, bars, levels, markers, positionLines =
   // cursor sits still can reconcile a stale/removed label (no crosshair event fires
   // for a stationary cursor when setMarkers runs).
   const hoveredMarkerIdRef = useRef<string | null>(null);
+  // COCKPIT-FIX F4: chart-time -> real-open-epoch lookup for the axis/crosshair
+  // formatters. A ref (refreshed with the bars) because the formatters are
+  // installed once at createChart and must see the current bar set.
+  const axisTimeIndexRef = useRef<Map<number, number>>(new Map());
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -57,7 +62,15 @@ export function TradingChart({ timeframe, bars, levels, markers, positionLines =
       layout: { background: { type: ColorType.Solid, color: '#071017' }, textColor: '#9fb0c2' },
       grid: { vertLines: { color: '#122231' }, horzLines: { color: '#122231' } },
       rightPriceScale: { borderColor: '#203244', scaleMargins: { top: 0.12, bottom: 0.12 } },
-      timeScale: { borderColor: '#203244', timeVisible: true, secondsVisible: true },
+      // Display-only Central Time labels: ticks resolve to their bar's real
+      // wall-clock open; the synthetic time coordinate itself is untouched.
+      timeScale: {
+        borderColor: '#203244',
+        timeVisible: true,
+        secondsVisible: true,
+        tickMarkFormatter: (time: Time, tickMarkType: TickMarkType) => formatTickMarkCt(axisTimeIndexRef.current, time, tickMarkType),
+      },
+      localization: { timeFormatter: (time: Time) => formatCrosshairCt(axisTimeIndexRef.current, time) },
       crosshair: { mode: CrosshairMode.Normal },
     });
     const series = chart.addSeries(CandlestickSeries, {
@@ -117,8 +130,20 @@ export function TradingChart({ timeframe, bars, levels, markers, positionLines =
     const series = seriesRef.current;
     const chart = chartRef.current;
     if (!series || !chart) return;
+    // Refresh the axis-label lookup before the data reaches the series, so the
+    // tick layout triggered by setData/update always resolves against the bars
+    // it is laying out.
+    const previousAxisIndex = axisTimeIndexRef.current;
+    axisTimeIndexRef.current = buildAxisTimeIndex(bars);
     const previous = previousBarsRef.current;
     const timeScale = chart.timeScale();
+    // lightweight-charts memoizes formatted tick labels by time key and only
+    // flushes that cache via applyOptions — never on setData. When an existing
+    // key remaps to a different real open (timeframe switch: the synthetic
+    // coordinates collide across timeframes; replay repopulate), flush it or
+    // the axis keeps showing the previous mapping's wall clock. Pure appends —
+    // the live hot path — never trigger this.
+    if (axisIndexInvalidated(previousAxisIndex, axisTimeIndexRef.current)) timeScale.applyOptions({});
 
     // A "fresh" series generation: the first bars, a timeframe switch, or a repopulate after the
     // store cleared (warm-up / replay (re)start).
@@ -196,6 +221,7 @@ export function TradingChart({ timeframe, bars, levels, markers, positionLines =
         <span><i className="legend-line display" /> Display-only {legend.display}</span>
         <span><i className="legend-marker" /> Touch / observation</span>
       </div>
+      <span className="chart-axis-tz" data-testid="axis-tz-label">CT</span>
       {bars.length === 0 && (
         <div className="empty-overlay">
           <strong>{emptyTitle}</strong>

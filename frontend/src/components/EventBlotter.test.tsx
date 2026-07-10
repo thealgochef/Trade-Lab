@@ -171,8 +171,13 @@ describe('EventBlotter', () => {
   });
 
   it('flashes the newest row and keeps the render bounded at 80 rows', () => {
+    // Mixed categories keep the store above the 80-row render cap under the
+    // per-category retention bounds (50 predictions + 40 untyped = 90 retained);
+    // the untyped batch goes last so the newest row renders its plain message.
     for (let index = 0; index < 90; index += 1) {
-      addBlotterEvent({ timeUtc: '2026-05-21T14:03:00Z', category: 'system', severity: 'info', message: `row ${index}` });
+      addBlotterEvent(index < 50
+        ? { timeUtc: '2026-05-21T14:03:00Z', category: 'observation', severity: 'info', message: `row ${index}`, tape: { kind: 'prediction', predictionId: `pred-${index}`, predictedClass: 'up', probability: 0.7, eligible: true, direction: 'long', session: 'ny' } }
+        : { timeUtc: '2026-05-21T14:03:00Z', category: 'system', severity: 'info', message: `row ${index}` });
     }
 
     render(<EventBlotter />);

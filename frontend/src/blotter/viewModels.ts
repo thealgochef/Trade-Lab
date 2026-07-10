@@ -5,23 +5,32 @@ export type TapeFilter = 'all' | 'predictions' | 'executions' | 'drops';
 
 export const TAPE_FILTERS: TapeFilter[] = ['all', 'predictions', 'executions', 'drops'];
 
+export type TapeCategory = 'predictions' | 'executions' | 'drops' | 'untyped';
+
 /**
- * Chip semantics: predictions = prediction + outcome rows; executions =
- * position open/close rows; drops = drop rows. Untyped events (system, feed,
- * warnings, ...) surface under `all` only.
+ * Category semantics: predictions = prediction + outcome rows; executions =
+ * position open/close rows; drops = drop rows; untyped = everything without a
+ * tape payload (system, feed, warnings, ...). The store's per-category
+ * retention and the filter chips share this one classifier.
  */
-export function matchesTapeFilter(event: BlotterEvent, filter: TapeFilter): boolean {
-  if (filter === 'all') return true;
-  const kind = event.tape?.kind;
-  if (kind === undefined) return false;
-  switch (filter) {
-    case 'predictions':
-      return kind === 'prediction' || kind === 'outcome';
-    case 'executions':
-      return kind === 'position_open' || kind === 'position_close';
-    case 'drops':
-      return kind === 'drop';
+export function tapeCategory(event: Pick<BlotterEvent, 'tape'>): TapeCategory {
+  switch (event.tape?.kind) {
+    case 'prediction':
+    case 'outcome':
+      return 'predictions';
+    case 'position_open':
+    case 'position_close':
+      return 'executions';
+    case 'drop':
+      return 'drops';
+    default:
+      return 'untyped';
   }
+}
+
+// Untyped events surface under `all` only — 'untyped' never equals a chip value.
+export function matchesTapeFilter(event: BlotterEvent, filter: TapeFilter): boolean {
+  return filter === 'all' || tapeCategory(event) === filter;
 }
 
 export type RealizedPoints = { points: number; pointsConservative: number };

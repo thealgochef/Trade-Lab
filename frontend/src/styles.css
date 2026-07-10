@@ -10,6 +10,10 @@
   --green: #36d399;
   --amber: #f2b84b;
   --red: #ff6b6b;
+  /* COCKPIT-FIX F1: the shared viewport-relative height of the chart/sidebar
+     workspace — a function of the viewport only, never of panel content.
+     Uncapped above so very tall monitors keep filling the workspace row. */
+  --workspace-h: max(420px, 58vh);
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 * { box-sizing: border-box; }
@@ -28,13 +32,15 @@ button { font: inherit; }
 .status-pill span { display:block; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
 .status-pill strong { font-size: 13px; text-transform: uppercase; }
 .status-pill.green strong { color: var(--green); } .status-pill.red strong { color: var(--red); } .status-pill.amber strong { color: var(--amber); } .status-pill.blue strong { color: var(--blue); }
-.workspace-grid { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 12px; min-height: 0; }
+/* align-items:start stops the columns stretching to each other's height — the
+   sidebar's content can never drive the chart's height (COCKPIT-FIX F1). */
+.workspace-grid { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 12px; min-height: 0; align-items: start; }
 .panel { border-radius: 14px; min-width: 0; overflow: hidden; }
 .panel-header { height: 76px; display:flex; align-items:center; justify-content:space-between; gap:16px; padding: 16px 18px; border-bottom: 1px solid var(--line); background: rgba(255,255,255,.02); }
 .panel-header.compact { height: 58px; align-items: baseline; justify-content: flex-start; gap: 12px; }
 .panel-header h1 { font-size: 22px; } .panel-header h2 { font-size: 16px; }
 .chart-panel { display:grid; grid-template-rows: auto 1fr; min-height: 0; }
-.chart-shell { position: relative; min-height: 420px; height: 100%; }
+.chart-shell { position: relative; min-height: 420px; height: var(--workspace-h); }
 .chart-canvas { position:absolute; inset:0; }
 .chart-marker-tooltip { position:absolute; top:0; left:0; z-index:3; pointer-events:none; max-width:260px; padding:5px 9px; border:1px solid rgba(28,48,65,.92); border-radius:8px; background:rgba(5,10,15,.94); backdrop-filter:blur(8px); color:#e6eef6; font-size:11px; line-height:1.35; letter-spacing:.04em; white-space:nowrap; box-shadow:0 4px 16px rgba(0,0,0,.45); }
 .chart-legend { position:absolute; top:12px; left:14px; z-index:2; display:flex; flex-wrap:wrap; gap:10px; align-items:center; max-width:calc(100% - 28px); padding:7px 9px; border:1px solid rgba(28,48,65,.78); border-radius:10px; background:rgba(5,10,15,.72); backdrop-filter: blur(8px); color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
@@ -42,13 +48,23 @@ button { font: inherit; }
 .legend-line { width:18px; height:0; border-top:2px solid var(--green); display:inline-block; }
 .legend-line.display { border-top:1px dashed #708194; }
 .legend-marker { width:8px; height:8px; border-radius:50%; background:var(--amber); box-shadow:0 0 0 2px rgba(242,184,75,.16); display:inline-block; }
+.chart-axis-tz { position:absolute; right:8px; bottom:6px; z-index:2; pointer-events:none; padding:2px 6px; border:1px solid rgba(28,48,65,.78); border-radius:6px; background:rgba(5,10,15,.72); color:var(--muted); font-size:10px; letter-spacing:.08em; }
 .empty-overlay { position:absolute; inset: 20% auto auto 50%; transform: translateX(-50%); width:min(460px, calc(100% - 40px)); border:1px solid var(--line); border-radius:16px; padding:22px; text-align:center; background: rgba(5,10,15,.88); backdrop-filter: blur(10px); }
 .empty-overlay strong { display:block; font-size:20px; margin-bottom:8px; } .empty-overlay span, .empty-overlay small { display:block; color: var(--muted); margin-top:6px; }
 .segmented-control { display:flex; border:1px solid var(--line); border-radius:10px; overflow:hidden; }
 .segmented-control button { color:var(--muted); background:#071017; border:0; border-right:1px solid var(--line); padding:8px 13px; cursor:pointer; }
 .segmented-control button:last-child { border-right:0; } .segmented-control button.active { color:#061018; background:var(--blue); font-weight:700; }
-.intelligence-panel { overflow:auto; }
+/* The sidebar matches the chart panel's total height (workspace + 76px header)
+   and scrolls internally instead of growing the workspace row. */
+.intelligence-panel { max-height: calc(var(--workspace-h) + 76px); overflow-y: auto; }
 .intel-section { padding: 14px 16px; border-bottom: 1px solid var(--line); }
+/* Each section also bounds its own content, so one noisy section can never
+   bury the others below the fold (COCKPIT-FIX F1/F3). The 6px side padding
+   (offset by the negative margin) absorbs .level-row.nearest's -6px bleed the
+   way the section padding used to, keeping the scroll container overflow-free
+   horizontally. */
+.intel-section-body { max-height: 240px; overflow-y: auto; padding: 0 6px; margin: 0 -6px; }
+.intel-section-body.predictions { max-height: 340px; }
 .intel-section h3 { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .12em; margin-bottom: 10px; }
 .key-value, .level-row { display:grid; grid-template-columns: 1fr auto; gap:10px; align-items:center; padding:7px 0; font-size:13px; }
 .key-value span, .level-row span, .empty-text { color: var(--muted); }

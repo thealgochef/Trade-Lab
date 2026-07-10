@@ -69,7 +69,7 @@ export function IntelligencePanel() {
           </div>
         ))}
       </Section>
-      <Section title="Predictions">
+      <Section title="Predictions" bodyClass="predictions">
         {predictions.length === 0 ? <Empty text="No predictions yet." /> : predictions.slice(0, 8).map((prediction) => <PredictionRow key={prediction.id} prediction={prediction} modelStatus={modelStatus} />)}
       </Section>
       <Section title="Touches">
@@ -134,8 +134,15 @@ function PredictionRow({ prediction, modelStatus }: { prediction: Prediction; mo
   );
 }
 
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return <section className="intel-section"><h3>{title}</h3>{children}</section>;
+// Every section body scrolls internally past its max-height, so section
+// content (newest first from the stores) can never grow the sidebar open-ended.
+function Section({ title, children, bodyClass }: { title: string; children: React.ReactNode; bodyClass?: string }) {
+  return (
+    <section className="intel-section">
+      <h3>{title}</h3>
+      <div className={bodyClass ? `intel-section-body ${bodyClass}` : 'intel-section-body'}>{children}</div>
+    </section>
+  );
 }
 
 function KeyValue({ label, value }: { label: string; value: string }) {

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { cleanup, render, screen } from '@testing-library/react';
 import { IntelligencePanel } from './IntelligencePanel';
-import { intelligenceStore, marketStore, predictionStore, runtimeStore } from '../state/stores';
+import { addPrediction, intelligenceStore, marketStore, predictionStore, runtimeStore } from '../state/stores';
 import type { MarketBar, MarketLevel, ModelStatus, Observation, Outcome, Prediction } from '../domain/models';
 
 const prediction = (overrides: Partial<Prediction> = {}): Prediction => ({
@@ -131,6 +131,19 @@ describe('IntelligencePanel', () => {
     render(<IntelligencePanel />);
 
     expect(screen.getByText('Level origin').closest('.key-value')).toHaveTextContent('prior day');
+  });
+
+  it('renders the predictions pane inside an internal scroll container, newest first (COCKPIT-FIX F3)', () => {
+    addPrediction(prediction({ id: 'pred-old', predictedClass: 'hold' }));
+    addPrediction(prediction({ id: 'pred-new', predictedClass: 'down' }));
+    render(<IntelligencePanel />);
+
+    const pane = document.querySelector('.intel-section-body.predictions');
+    expect(pane).not.toBeNull();
+    const rows = [...(pane as HTMLElement).querySelectorAll('.intel-prediction')];
+    expect(rows).toHaveLength(2);
+    expect(rows[0].querySelector('strong')?.textContent).toBe('down');
+    expect(rows[1].querySelector('strong')?.textContent).toBe('hold');
   });
 
   it('renders the gate math with a fill bar and no reason for an eligible prediction', () => {

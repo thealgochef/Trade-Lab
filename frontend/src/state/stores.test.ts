@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { addBlotterEvent, addDropped, addOpenPosition, addOutcome, addPrediction, blotterStore, clearExecutions, clearPredictions, closeOpenPosition, connectionStore, executionStore, intelligenceStore, marketStore, predictionStore, runtimeStore, setModelStatus, setOpenPositions } from './stores';
-import type { ClosedExecution, DroppedPrediction, OpenPosition, Outcome, Prediction } from '../domain/models';
+import { tapeCategory } from '../blotter/viewModels';
+import type { ClosedExecution, DroppedPrediction, OpenPosition, Outcome, Prediction, TapeRow } from '../domain/models';
 
 const resetStores = () => {
   runtimeStore.reset();
@@ -54,6 +55,20 @@ const makeDropped = (predictionId: string): DroppedPrediction => ({
   entryPrice: null,
 });
 
+const tapeEvent = (message: string, tape?: TapeRow) => ({
+  timeUtc: '2026-05-21T14:00:00Z',
+  category: 'observation' as const,
+  severity: 'info' as const,
+  message,
+  tape,
+});
+
+const predictionTape = (predictionId: string): TapeRow => ({ kind: 'prediction', predictionId, predictedClass: 'continuation', probability: 0.7, eligible: true, direction: 'long', session: 'ny' });
+const outcomeTape = (predictionId: string): TapeRow => ({ kind: 'outcome', predictionId, resolutionType: 'target', correct: true, actualClass: 'continuation' });
+const dropTape = (predictionId: string): TapeRow => ({ kind: 'drop', predictionId, reason: 'flatten' });
+const openTape = (predictionId: string): TapeRow => ({ kind: 'position_open', predictionId, direction: 'long', entryPrice: 23000, entryPriceConservative: 23000.25, tpPrice: 23015, slPrice: 22970 });
+const closeTape = (predictionId: string): TapeRow => ({ kind: 'position_close', predictionId, direction: 'long', reason: 'tp_hit', points: 15, pointsConservative: 14.75, exitPrice: 23015 });
+
 describe('workstation stores', () => {
   afterEach(resetStores);
 
@@ -70,15 +85,55 @@ describe('workstation stores', () => {
     expect(blotterStore.getSnapshot().events).toEqual([]);
   });
 
-  it('bounds event blotter retention to the newest 200 events', () => {
-    for (let index = 0; index < 205; index += 1) {
-      addBlotterEvent({ timeUtc: `2026-05-21T14:${String(index).padStart(2, '0')}:00Z`, category: 'system', severity: 'info', message: `event-${index}` });
+  it('bounds untyped blotter retention to the newest 60 events', () => {
+    for (let index = 0; index < 65; index += 1) {
+      addBlotterEvent({ timeUtc: `2026-05-21T14:${String(index % 60).padStart(2, '0')}:00Z`, category: 'system', severity: 'info', message: `event-${index}` });
     }
 
     const events = blotterStore.getSnapshot().events;
-    expect(events).toHaveLength(200);
-    expect(events[0].message).toBe('event-204');
+    expect(events).toHaveLength(60);
+    expect(events[0].message).toBe('event-64');
     expect(events.at(-1)?.message).toBe('event-5');
+  });
+
+  it('keeps typed tape rows alive through a flood of 500 untyped events', () => {
+    addBlotterEvent(tapeEvent('pred created', predictionTape('pred-1')));
+    addBlotterEvent(tapeEvent('pred resolved', outcomeTape('pred-1')));
+    addBlotterEvent(tapeEvent('pred dropped', dropTape('pred-2')));
+    addBlotterEvent(tapeEvent('position opened', openTape('pred-3')));
+    addBlotterEvent(tapeEvent('position closed', closeTape('pred-3')));
+
+    for (let index = 0; index < 500; index += 1) {
+      addBlotterEvent({ timeUtc: '2026-05-21T15:00:00Z', category: 'system', severity: 'info', message: `chatter-${index}` });
+    }
+
+    const events = blotterStore.getSnapshot().events;
+    expect(events.filter((event) => tapeCategory(event) === 'untyped')).toHaveLength(60);
+    expect(events.map((event) => event.message)).toEqual(expect.arrayContaining([
+      'pred created', 'pred resolved', 'pred dropped', 'position opened', 'position closed',
+    ]));
+    expect(events.filter((event) => tapeCategory(event) === 'predictions')).toHaveLength(2);
+    expect(events.filter((event) => tapeCategory(event) === 'executions')).toHaveLength(2);
+    expect(events.filter((event) => tapeCategory(event) === 'drops')).toHaveLength(1);
+  });
+
+  it('caps each tape category independently at its own newest-first bound', () => {
+    for (let index = 0; index < 70; index += 1) addBlotterEvent(tapeEvent(`pred-${index}`, predictionTape(`pred-${index}`)));
+    for (let index = 0; index < 70; index += 1) addBlotterEvent(tapeEvent(`exec-${index}`, openTape(`pred-${index}`)));
+    for (let index = 0; index < 50; index += 1) addBlotterEvent(tapeEvent(`drop-${index}`, dropTape(`pred-${index}`)));
+
+    const events = blotterStore.getSnapshot().events;
+    const predictions = events.filter((event) => tapeCategory(event) === 'predictions');
+    const executions = events.filter((event) => tapeCategory(event) === 'executions');
+    const drops = events.filter((event) => tapeCategory(event) === 'drops');
+    expect(predictions).toHaveLength(60);
+    expect(predictions[0].message).toBe('pred-69');
+    expect(predictions.at(-1)?.message).toBe('pred-10');
+    expect(executions).toHaveLength(60);
+    expect(executions[0].message).toBe('exec-69');
+    expect(drops).toHaveLength(40);
+    expect(drops[0].message).toBe('drop-49');
+    expect(drops.at(-1)?.message).toBe('drop-10');
   });
 
   it('assigns unique IDs to repeated identical blotter events', () => {

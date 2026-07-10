@@ -1,10 +1,21 @@
 import { createStore, useStore } from './createStore';
+import { tapeCategory, type TapeCategory } from '../blotter/viewModels';
 import type { BlotterEvent, ClosedExecution, DroppedPrediction, LiveStatus, MarketBar, MarketLevel, MarketTouch, ModelBundle, ModelStatus, Observation, OpenPosition, Outcome, Prediction, ReplaySource, ReplayStatus, RuntimeSummary, Timeframe, Warning } from '../domain/models';
 
 const MAX_PREDICTIONS = 100;
 const MAX_OUTCOMES = 100;
 const MAX_DROPPED = 100;
 const MAX_CLOSED_EXECUTIONS = 100;
+
+// COCKPIT-FIX F2: the tape retains events per category, so untyped chatter
+// (heartbeats, bar closes, feed status, ...) can never evict typed rows —
+// each category keeps its own newest-first ring.
+const TAPE_RETENTION: Record<TapeCategory, number> = {
+  predictions: 60,
+  executions: 60,
+  drops: 40,
+  untyped: 60,
+};
 
 export type PredictionState = {
   predictions: Prediction[];
@@ -222,10 +233,21 @@ export const useBundles = <T = ModelBundle[]>(selector?: (bundles: ModelBundle[]
 
 let blotterEventCounter = 0;
 
+// Events arrive newest-first, so keeping the first N of each category keeps
+// the newest N of that category and preserves overall ordering.
+const enforceTapeRetention = (events: BlotterEvent[]): BlotterEvent[] => {
+  const remaining = { ...TAPE_RETENTION };
+  return events.filter((event) => {
+    const category = tapeCategory(event);
+    remaining[category] -= 1;
+    return remaining[category] >= 0;
+  });
+};
+
 export const addBlotterEvent = (event: Omit<BlotterEvent, 'id'> & { sequence?: number }) => {
   blotterEventCounter += 1;
   const sequencePart = event.sequence === undefined ? 'local' : `ws-${event.sequence}`;
   blotterStore.setState((current) => ({
-    events: [{ ...event, id: `${sequencePart}-${blotterEventCounter}-${event.timeUtc}-${event.category}-${event.message}` }, ...current.events].slice(0, 200),
+    events: enforceTapeRetention([{ ...event, id: `${sequencePart}-${blotterEventCounter}-${event.timeUtc}-${event.category}-${event.message}` }, ...current.events]),
   }));
 };

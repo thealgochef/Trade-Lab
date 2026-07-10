@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => ({
   getVisibleRange: vi.fn((): { from: number; to: number } | null => null),
   setVisibleRange: vi.fn(),
   fitContent: vi.fn(),
+  applyTimeScaleOptions: vi.fn(),
 }));
 
 vi.mock('lightweight-charts', () => ({
@@ -44,7 +45,7 @@ describe('TradingChart', () => {
     mocks.addSeries.mockReturnValue({ setData: mocks.setData, update: mocks.update, createPriceLine: mocks.createPriceLine, removePriceLine: mocks.removePriceLine, attachPrimitive: vi.fn(), detachPrimitive: vi.fn() });
     mocks.scrollPosition.mockReturnValue(0);
     mocks.getVisibleRange.mockReturnValue(null);
-    mocks.timeScale.mockReturnValue({ scrollPosition: mocks.scrollPosition, getVisibleRange: mocks.getVisibleRange, setVisibleRange: mocks.setVisibleRange, fitContent: mocks.fitContent });
+    mocks.timeScale.mockReturnValue({ scrollPosition: mocks.scrollPosition, getVisibleRange: mocks.getVisibleRange, setVisibleRange: mocks.setVisibleRange, fitContent: mocks.fitContent, applyOptions: mocks.applyTimeScaleOptions });
     mocks.createChart.mockReturnValue({ addSeries: mocks.addSeries, remove: mocks.remove, subscribeCrosshairMove: mocks.subscribeCrosshairMove, unsubscribeCrosshairMove: mocks.unsubscribeCrosshairMove, timeScale: mocks.timeScale });
     mocks.createSeriesMarkers.mockReturnValue({ setMarkers: mocks.setMarkers, remove: mocks.removeMarkers });
   });
@@ -333,5 +334,48 @@ describe('TradingChart', () => {
     expect(screen.getByText('Runtime snapshot idle')).toBeInTheDocument();
     expect(screen.getByText('Backend offline · WebSocket offline')).toBeInTheDocument();
     expect(screen.getByTestId('trading-chart-canvas')).toBeInTheDocument();
+  });
+
+  it('labels the time axis CT exactly once (COCKPIT-FIX F4)', () => {
+    renderChart();
+
+    const labels = screen.getAllByTestId('axis-tz-label');
+    expect(labels).toHaveLength(1);
+    expect(labels[0]).toHaveTextContent('CT');
+  });
+
+  it('installs Central Time axis formatters that resolve ticks through the live bar set (COCKPIT-FIX F4)', () => {
+    const bars = [chartBar('a', 1779321607, 100)]; // openTimeUtc 2026-05-21T14:00:00Z (CDT)
+    renderChart({ bars });
+
+    const options = mocks.createChart.mock.calls[0]?.[1] as {
+      timeScale: { tickMarkFormatter: (time: unknown, tickMarkType: number, locale: string) => string };
+      localization: { timeFormatter: (time: unknown) => string };
+    };
+    expect(options.timeScale.tickMarkFormatter(1779321607, 3, 'en-US')).toBe('9:00 am');
+    expect(options.timeScale.tickMarkFormatter(1779321607, 2, 'en-US')).toBe('May 21');
+    expect(options.localization.timeFormatter(1779321607)).toBe('May 21 · 9:00:00 am');
+    // A tick with no loaded bar renders empty rather than lying about the clock.
+    expect(options.timeScale.tickMarkFormatter(1779999999, 3, 'en-US')).toBe('');
+  });
+
+  it('flushes the axis tick-label cache when an existing time key remaps, but not on pure appends (COCKPIT-FIX F4)', () => {
+    // lightweight-charts memoizes tick labels by time key across setData, so a
+    // remap (timeframe switch reusing colliding synthetic keys) must force an
+    // applyOptions cache flush.
+    const first = [{ ...chartBar('a', 1000, 100), openTimeUtc: '2026-05-21T14:00:00Z' }];
+    const { rerender } = renderChart({ bars: first });
+    mocks.applyTimeScaleOptions.mockClear();
+
+    const appended = [...first, { ...chartBar('b', 1001, 101), openTimeUtc: '2026-05-21T14:00:10Z' }];
+    rerender(<TradingChart timeframe={147} bars={appended} levels={[]} markers={[]} emptyTitle="empty" emptySubtitle="offline" />);
+    expect(mocks.applyTimeScaleOptions).not.toHaveBeenCalled();
+
+    const remapped = [{ ...chartBar('a2', 1000, 100), openTimeUtc: '2026-05-21T18:00:00Z' }];
+    rerender(<TradingChart timeframe={147} bars={remapped} levels={[]} markers={[]} emptyTitle="empty" emptySubtitle="offline" />);
+    expect(mocks.applyTimeScaleOptions).toHaveBeenCalledWith({});
+
+    const options = mocks.createChart.mock.calls[0]?.[1] as { timeScale: { tickMarkFormatter: (time: unknown, tickMarkType: number, locale: string) => string } };
+    expect(options.timeScale.tickMarkFormatter(1000, 3, 'en-US')).toBe('1:00 pm'); // 18:00Z in CDT
   });
 });
