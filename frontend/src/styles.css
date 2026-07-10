@@ -178,6 +178,34 @@ button { font: inherit; }
 .perf-quality-row { display: flex; flex-wrap: wrap; gap: 8px 16px; color: var(--muted); font-size: 11px; }
 .perf-quality-row .quality-flag { color: var(--amber); }
 
+/* --- Trader strip + collapsed ops panels (COCKPIT P2) --- */
+.trader-strip { gap: 14px; }
+.strip-price-block { display: flex; align-items: center; gap: 16px; padding: 0 14px; border-right: 1px solid var(--line); }
+.strip-price { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: .01em; padding: 2px 8px; border-radius: 8px; white-space: nowrap; }
+.strip-price.up { color: var(--green); }
+.strip-price.down { color: var(--red); }
+@keyframes strip-flash-up { 0% { background: rgba(54,211,153,.35); } 100% { background: transparent; } }
+@keyframes strip-flash-down { 0% { background: rgba(255,107,107,.35); } 100% { background: transparent; } }
+.strip-price.flash-up { animation: strip-flash-up .6s ease-out; }
+.strip-price.flash-down { animation: strip-flash-down .6s ease-out; }
+.strip-metric span { display: block; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
+.strip-metric strong { font-size: 15px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.strip-metric strong.pos { color: var(--green); }
+.strip-metric strong.neg { color: var(--red); }
+.strip-countdowns { display: flex; gap: 12px; padding: 0 14px 0 0; border-right: 1px solid var(--line); }
+.strip-countdown span { display: block; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
+.strip-countdown strong { font-size: 14px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.strip-countdown.until strong { color: var(--blue); }
+.strip-countdown.amber strong { color: var(--amber); }
+.strip-countdown.red strong { color: var(--red); }
+.strip-pills { display: flex; gap: 8px; margin-left: auto; }
+.strip-pills .status-pill { min-width: 0; padding: 5px 8px; }
+.strip-pills .status-pill strong { font-size: 11px; }
+.panel-status-line { display: flex; align-items: center; gap: 12px; min-height: 28px; }
+.status-line-meta { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.expand-toggle { border: 1px solid var(--line); border-radius: 8px; background: #071017; color: var(--muted); padding: 4px 10px; cursor: pointer; margin-left: auto; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+.replay-heading .expand-toggle { margin-left: 0; }
+
 /* EXEC P3c: paper-execution panel (open-position cards + closed table). */
 .executions-panel { display: flex; flex-direction: column; }
 .exec-note { margin-left: auto; color: var(--muted); font-size: 11px; }

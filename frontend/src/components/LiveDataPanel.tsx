@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { apiClient } from '../api/client';
 import { normalizeLiveStatus } from '../domain/normalize';
 import { addBlotterEvent, liveStore, useLive, useRuntime } from '../state/stores';
@@ -8,6 +8,8 @@ const BUSY_STATES = new Set(['connecting', 'running']);
 export function LiveDataPanel() {
   const live = useLive();
   const apiOnline = useRuntime((state) => state.apiOnline);
+  // COCKPIT P2: once RUNNING the panel collapses to one status line (expandable).
+  const [expanded, setExpanded] = useState(false);
   const status = live.status;
   const canStart = apiOnline && status.subscriptionReady && !live.loading && !BUSY_STATES.has(status.state);
   const canStop = apiOnline && !live.loading && BUSY_STATES.has(status.state);
@@ -16,12 +18,34 @@ export function LiveDataPanel() {
     void refreshLiveStatus();
   }, []);
 
+  if (status.state === 'running' && !expanded) {
+    return (
+      <section className="panel live-panel collapsed" aria-label="Opt-in live market data controls">
+        <div className="panel-status-line">
+          <span className="eyebrow">Opt-in live data</span>
+          <div className={`replay-state ${status.state}`}>{status.state}</div>
+          <span className="status-line-meta">
+            {status.eventsProcessed.toLocaleString('en-US')} events · last {formatTime(status.lastEventUtc)}
+          </span>
+          <button className="expand-toggle" aria-expanded={false} onClick={() => setExpanded(true)}>
+            Expand
+          </button>
+        </div>
+      </section>
+    );
+  }
+
   return (
     <section className="panel live-panel" aria-label="Opt-in live market data controls">
       <div className="live-heading">
         <span className="eyebrow">Opt-in live data</span>
         <h2>Databento Market Data</h2>
         <div className={`replay-state ${status.state}`}>{status.state}</div>
+        {status.state === 'running' && (
+          <button className="expand-toggle" aria-expanded={true} onClick={() => setExpanded(false)}>
+            Collapse
+          </button>
+        )}
       </div>
       <div className="live-grid">
         <Metric label="Dataset" value={status.dataset} />

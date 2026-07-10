@@ -3,7 +3,7 @@ import { apiClient } from './api/client';
 import { normalizeLiveStatus, normalizeReplayStatus, normalizeRuntimeStatus } from './domain/normalize';
 import { realtimeClient } from './realtime/client';
 import { addBlotterEvent, liveStore, replayStore, runtimeStore } from './state/stores';
-import { TopStatusBar } from './components/TopStatusBar';
+import { TraderStrip } from './components/TraderStrip';
 import { ChartWorkspace } from './components/ChartWorkspace';
 import { ExecutionsPanel } from './components/ExecutionsPanel';
 import { IntelligencePanel } from './components/IntelligencePanel';
@@ -44,7 +44,7 @@ export function App() {
 
   return (
     <main className={view === 'workstation' ? 'workstation-shell' : 'workstation-shell performance-view'}>
-      <TopStatusBar />
+      <TraderStrip />
       <nav className="view-tabs" aria-label="Workspace view">
         <div className="segmented-control">
           <button className={view === 'workstation' ? 'active' : ''} onClick={() => setView('workstation')}>

@@ -67,10 +67,29 @@ describe('ReplayControls', () => {
     expect(blotterStore.getSnapshot().events[0].message).toContain('Replay start accepted');
   });
 
+  it('collapses to one status line once running and expands on demand', async () => {
+    mocks.replayStatus.mockResolvedValueOnce({ ok: true, data: replayStatus('running') });
+    render(<ReplayControls />);
+
+    // COCKPIT P2: RUNNING collapses the panel to a single status line.
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Expand' })).toBeInTheDocument());
+    expect(screen.queryByRole('heading', { name: 'Safe Market Replay' })).not.toBeInTheDocument();
+    expect(screen.getByText(/12 events/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Expand' }));
+    expect(screen.getByRole('heading', { name: 'Safe Market Replay' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Pause' })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse' }));
+    expect(screen.queryByRole('heading', { name: 'Safe Market Replay' })).not.toBeInTheDocument();
+  });
+
   it('enables pause resume and stop according to replay state', async () => {
     mocks.replayStatus.mockResolvedValueOnce({ ok: true, data: replayStatus('running') });
     render(<ReplayControls />);
 
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Expand' })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Expand' }));
     await waitFor(() => expect(screen.getByRole('button', { name: 'Pause' })).toBeEnabled());
     expect(screen.getByRole('button', { name: 'Start' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Resume' })).toBeDisabled();

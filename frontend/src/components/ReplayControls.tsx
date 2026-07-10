@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { apiClient } from '../api/client';
 import { normalizeReplaySource, normalizeReplayStatus } from '../domain/normalize';
 import { addBlotterEvent, replayStore, runtimeStore, useReplay, useRuntime } from '../state/stores';
@@ -8,6 +8,8 @@ const BUSY_STATES = new Set(['loading', 'ready', 'running']);
 export function ReplayControls() {
   const replay = useReplay();
   const apiOnline = useRuntime((state) => state.apiOnline);
+  // COCKPIT P2: once RUNNING the panel collapses to one status line (expandable).
+  const [expanded, setExpanded] = useState(false);
   const state = replay.status.state;
   const hasSelectedSource = replay.sources.some((source) => source.id === replay.selectedSourceId);
   const canStart = apiOnline && hasSelectedSource && !replay.loading && !BUSY_STATES.has(state);
@@ -19,6 +21,23 @@ export function ReplayControls() {
     void refreshReplayData();
   }, []);
 
+  if (state === 'running' && !expanded) {
+    return (
+      <section className="panel replay-panel collapsed" aria-label="Safe replay controls">
+        <div className="panel-status-line">
+          <span className="eyebrow">Safe replay</span>
+          <div className={`replay-state ${state}`}>{state}</div>
+          <span className="status-line-meta">
+            {replay.status.eventsProcessed.toLocaleString('en-US')} events · last {formatTime(replay.status.lastEventUtc)}
+          </span>
+          <button className="expand-toggle" aria-expanded={false} onClick={() => setExpanded(true)}>
+            Expand
+          </button>
+        </div>
+      </section>
+    );
+  }
+
   return (
     <section className="panel replay-panel" aria-label="Safe replay controls">
       <div className="replay-heading">
@@ -27,6 +46,11 @@ export function ReplayControls() {
           <h2>Safe Market Replay</h2>
         </div>
         <div className={`replay-state ${state}`}>{state}</div>
+        {state === 'running' && (
+          <button className="expand-toggle" aria-expanded={true} onClick={() => setExpanded(false)}>
+            Collapse
+          </button>
+        )}
       </div>
       <div className="replay-controls-grid">
         <label className="replay-source-select">

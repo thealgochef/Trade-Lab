@@ -92,8 +92,26 @@ describe('LiveDataPanel', () => {
     expect(liveStore.getSnapshot().status.state).toBe('running');
     expect(blotterStore.getSnapshot().events[0].message).toContain('Live start accepted');
 
+    // COCKPIT P2: RUNNING collapses the panel; expand to reach the controls.
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Expand' })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Expand' }));
     fireEvent.click(screen.getByRole('button', { name: 'Stop Live' }));
     await waitFor(() => expect(mocks.stopLive).toHaveBeenCalledOnce());
+  });
+
+  it('collapses to one status line once running and expands on demand', async () => {
+    mocks.liveStatus.mockResolvedValueOnce({ ok: true, data: liveStatus('running') });
+    render(<LiveDataPanel />);
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Expand' })).toBeInTheDocument());
+    expect(screen.queryByRole('heading', { name: 'Databento Market Data' })).not.toBeInTheDocument();
+    expect(screen.getByText(/7 events/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Expand' }));
+    expect(screen.getByRole('heading', { name: 'Databento Market Data' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse' }));
+    expect(screen.queryByRole('heading', { name: 'Databento Market Data' })).not.toBeInTheDocument();
   });
 
   it('disables stop unless feed is connecting or running', async () => {
