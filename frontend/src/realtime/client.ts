@@ -130,30 +130,100 @@ export class RealtimeClient {
         intelligenceStore.setState((current) => ({ ...current, observations: upsertById(current.observations, normalizeObservation(envelope.payload as ObservationDTO), 'id') }));
         addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'observation', severity: 'info', message: 'Observation updated', sequence: envelope.sequence });
         break;
-      case 'prediction.created':
-        addPrediction(normalizePrediction((envelope.payload as { prediction: PredictionDTO }).prediction));
-        addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'observation', severity: 'info', message: 'Prediction created', sequence: envelope.sequence });
+      case 'prediction.created': {
+        const prediction = normalizePrediction((envelope.payload as { prediction: PredictionDTO }).prediction);
+        addPrediction(prediction);
+        // COCKPIT P5: typed tape payload rides the blotter event.
+        addBlotterEvent({
+          timeUtc: envelope.server_time_utc,
+          category: 'observation',
+          severity: 'info',
+          message: 'Prediction created',
+          sequence: envelope.sequence,
+          tape: {
+            kind: 'prediction',
+            predictionId: prediction.id,
+            predictedClass: prediction.predictedClass,
+            probability: prediction.probabilities[prediction.predictedClass] ?? null,
+            eligible: prediction.eligible,
+            direction: prediction.direction,
+            session: prediction.session,
+          },
+        });
         break;
-      case 'prediction.resolved':
-        addOutcome(normalizeOutcome((envelope.payload as { outcome: OutcomeDTO }).outcome));
-        addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'observation', severity: 'info', message: 'Prediction resolved', sequence: envelope.sequence });
+      }
+      case 'prediction.resolved': {
+        const outcome = normalizeOutcome((envelope.payload as { outcome: OutcomeDTO }).outcome);
+        addOutcome(outcome);
+        addBlotterEvent({
+          timeUtc: envelope.server_time_utc,
+          category: 'observation',
+          severity: 'info',
+          message: 'Prediction resolved',
+          sequence: envelope.sequence,
+          tape: {
+            kind: 'outcome',
+            predictionId: outcome.predictionId,
+            resolutionType: outcome.resolutionType,
+            correct: outcome.correct,
+            actualClass: outcome.actualClass,
+          },
+        });
         break;
+      }
       case 'prediction.dropped': {
         const dropped = normalizeDropped((envelope.payload as { dropped: DroppedPredictionDTO }).dropped);
         addDropped(dropped);
-        addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'observation', severity: 'info', message: `Prediction dropped (${dropped.reason})`, sequence: envelope.sequence });
+        addBlotterEvent({
+          timeUtc: envelope.server_time_utc,
+          category: 'observation',
+          severity: 'info',
+          message: `Prediction dropped (${dropped.reason})`,
+          sequence: envelope.sequence,
+          tape: { kind: 'drop', predictionId: dropped.predictionId, reason: dropped.reason },
+        });
         break;
       }
       case 'position.opened': {
         const position = normalizeOpenPosition((envelope.payload as { position: OpenPositionDTO }).position);
         addOpenPosition(position);
-        addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'execution', severity: 'info', message: `Paper position opened (${position.direction} @ ${position.entryPrice.toFixed(2)})`, sequence: envelope.sequence });
+        addBlotterEvent({
+          timeUtc: envelope.server_time_utc,
+          category: 'execution',
+          severity: 'info',
+          message: `Paper position opened (${position.direction} @ ${position.entryPrice.toFixed(2)})`,
+          sequence: envelope.sequence,
+          tape: {
+            kind: 'position_open',
+            predictionId: position.predictionId,
+            direction: position.direction,
+            entryPrice: position.entryPrice,
+            entryPriceConservative: position.entryPriceConservative,
+            tpPrice: position.tpPrice,
+            slPrice: position.slPrice,
+          },
+        });
         break;
       }
       case 'position.closed': {
         const execution = normalizeClosedExecution((envelope.payload as { execution: ClosedExecutionDTO }).execution);
         closeOpenPosition(execution);
-        addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'execution', severity: 'info', message: `Paper position closed (${execution.reason}, ${execution.points >= 0 ? '+' : ''}${execution.points.toFixed(2)} pts)`, sequence: envelope.sequence });
+        addBlotterEvent({
+          timeUtc: envelope.server_time_utc,
+          category: 'execution',
+          severity: 'info',
+          message: `Paper position closed (${execution.reason}, ${execution.points >= 0 ? '+' : ''}${execution.points.toFixed(2)} pts)`,
+          sequence: envelope.sequence,
+          tape: {
+            kind: 'position_close',
+            predictionId: execution.predictionId,
+            direction: execution.direction,
+            reason: execution.reason,
+            points: execution.points,
+            pointsConservative: execution.pointsConservative,
+            exitPrice: execution.exitPrice,
+          },
+        });
         break;
       }
       case 'model.status':

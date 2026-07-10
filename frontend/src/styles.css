@@ -228,6 +228,22 @@ button { font: inherit; }
 .intel-badge.long { color: var(--green); border-color: rgba(54,211,153,.45); }
 .intel-badge.short { color: var(--red); border-color: rgba(255,107,107,.45); }
 
+/* --- Trade tape (COCKPIT P5) --- */
+.blotter-filters { margin-left: auto; }
+.tape-summary { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.tape-kind { border-radius: 999px; padding: 1px 8px; font-size: 10px; text-transform: uppercase; letter-spacing: .06em; border: 1px solid var(--line); color: var(--muted); }
+.tape-kind.prediction { color: var(--blue); border-color: rgba(78,161,255,.45); background: rgba(78,161,255,.08); }
+.tape-kind.outcome { color: var(--text); background: rgba(255,255,255,.04); }
+.tape-kind.drop { color: var(--amber); border-color: rgba(242,184,75,.45); background: rgba(242,184,75,.08); }
+.tape-kind.open { color: var(--green); border-color: rgba(54,211,153,.45); background: rgba(54,211,153,.08); }
+.tape-kind.close { color: var(--red); border-color: rgba(255,107,107,.45); background: rgba(255,107,107,.08); }
+.tape-meta { color: var(--muted); font-size: 11px; }
+.tape-points { font-variant-numeric: tabular-nums; font-weight: 600; font-size: 12px; }
+.tape-points.pos { color: var(--green); }
+.tape-points.neg { color: var(--red); }
+@keyframes tape-flash { 0% { background: rgba(78,161,255,.16); } 100% { background: transparent; } }
+.blotter-row.tape-newest { animation: tape-flash .8s ease-out; }
+
 /* EXEC P3c: paper-execution panel (open-position cards + closed table). */
 .executions-panel { display: flex; flex-direction: column; }
 .exec-note { margin-left: auto; color: var(--muted); font-size: 11px; }

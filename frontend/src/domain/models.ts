@@ -84,6 +84,18 @@ export type WarningMetadata = {
   total_dropped_messages?: number;
 };
 
+// COCKPIT P5: typed trade-tape payloads attached to blotter events at WS
+// ingestion, so the tape renders structured rows instead of re-parsing message
+// strings. predictionId enables render-time joins (realized points for outcome
+// rows come from the executions store when the tracker closed that setup).
+// Position rows carry BOTH P&L columns (optimistic / conservative bracket).
+export type TapeRow =
+  | { kind: 'prediction'; predictionId: string; predictedClass: string; probability: number | null; eligible: boolean; direction: string; session: string }
+  | { kind: 'outcome'; predictionId: string; resolutionType: string; correct: boolean; actualClass: string }
+  | { kind: 'drop'; predictionId: string; reason: string }
+  | { kind: 'position_open'; predictionId: string; direction: string; entryPrice: number; entryPriceConservative: number; tpPrice: number; slPrice: number }
+  | { kind: 'position_close'; predictionId: string; direction: string; reason: string; points: number; pointsConservative: number; exitPrice: number };
+
 export type BlotterEvent = {
   id: string;
   timeUtc: string;
@@ -93,6 +105,7 @@ export type BlotterEvent = {
   code?: string;
   source?: string | null;
   details?: WarningMetadata;
+  tape?: TapeRow;
 };
 
 export type LiveStatus = {
