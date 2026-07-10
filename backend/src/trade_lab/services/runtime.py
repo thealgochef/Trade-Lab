@@ -459,6 +459,25 @@ class ApplicationRuntime:
 
         return tuple(self._dropped)
 
+    def open_setup_views(self):
+        """EXEC P2: read-only snapshot of the honest resolver's open setups.
+
+        A pass-through to the SC accessor for OBSERVER consumers (the paper
+        execution tracker). Zero influence on the resolver by construction —
+        the accessor constructs frozen views and mutates nothing. Returns ``()``
+        when no resolver is active; read failures are swallowed (the observer
+        must never disturb the serving path it watches).
+        """
+
+        resolver = self._honest_resolver
+        if resolver is None:
+            return ()
+        try:
+            return resolver.open_setups()
+        except Exception:
+            logger.warning("open-setup view read failed", exc_info=False)
+            return ()
+
     def _append_dropped(self, dropped: DroppedPrediction) -> None:
         self._dropped.append(dropped)
         if len(self._dropped) > self._outcome_limit:
