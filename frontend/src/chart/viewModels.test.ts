@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { MAX_BARS_PER_TIMEFRAME, combineMarkers, createChartTimeResolver, normalizeBarsForTimeframe, normalizeExecutionMarkers, normalizeLevels, normalizeObservationMarkers, normalizeOutcomeMarkers, normalizePredictionMarkers, normalizeTouchMarkers } from './viewModels';
+import { MAX_BARS_PER_TIMEFRAME, classifySessionEt, combineMarkers, createChartTimeResolver, normalizeBarsForTimeframe, normalizeExecutionMarkers, normalizeLevels, normalizeObservationMarkers, normalizeOutcomeMarkers, normalizePositionLines, normalizePredictionMarkers, normalizeTouchMarkers, sessionBands } from './viewModels';
 import type { ClosedExecution, MarketBar, MarketLevel, MarketTouch, Observation, OpenPosition, Outcome, Prediction } from '../domain/models';
 
 const bar = (overrides: Partial<MarketBar>): MarketBar => ({
@@ -259,9 +259,10 @@ describe('chart view model normalization', () => {
     ...overrides,
   });
 
-  it('anchors prediction and outcome markers onto the touch bar with distinct styling', () => {
+  it('anchors the prediction to the touch bar and the outcome to the RESOLUTION bar (COCKPIT P4c)', () => {
     const bars = normalizeBarsForTimeframe([
       bar({ barIndex: 42, barId: '147t:2026-05-21:42', openTimeUtc: '2026-05-21T14:00:00Z', closeTimeUtc: '2026-05-21T14:00:20Z' }),
+      bar({ barIndex: 43, barId: '147t:2026-05-21:43', openTimeUtc: '2026-05-21T14:04:00Z', closeTimeUtc: '2026-05-21T14:06:00Z' }),
     ], 147);
     const resolve = createChartTimeResolver(bars);
 
@@ -269,9 +270,12 @@ describe('chart view model normalization', () => {
     expect(predMarkers).toHaveLength(1);
     expect(predMarkers[0]).toMatchObject({ id: 'prediction:pred-1', time: 1779321642, position: 'aboveBar', shape: 'arrowDown', color: '#36d399' });
 
+    // outcome.timeUtc (14:05:00) falls in the SECOND bar — the marker anchors
+    // there, not on the touch bar, while the touch/prediction markers stay put.
     const outMarkers = normalizeOutcomeMarkers([prediction({ outcome: outcome() })], resolve);
     expect(outMarkers).toHaveLength(1);
-    expect(outMarkers[0]).toMatchObject({ id: 'outcome:outcome-1', time: 1779321642, position: 'belowBar', shape: 'arrowUp', color: '#36d399' });
+    expect(outMarkers[0]).toMatchObject({ id: 'outcome:outcome-1', time: 1779321643, position: 'belowBar', shape: 'arrowUp', color: '#36d399' });
+    expect(outMarkers[0].time).not.toBe(predMarkers[0].time);
   });
 
   it('styles ineligible predictions and incorrect outcomes distinctly', () => {
@@ -331,8 +335,8 @@ describe('chart view model normalization', () => {
       bar({ barIndex: 0, barId: '147t:2026-05-21:0', openTimeUtc: '2026-05-21T18:00:00Z', closeTimeUtc: '2026-05-21T18:05:00Z' }),
       bar({ barIndex: 1, barId: '147t:2026-05-21:1', openTimeUtc: '2026-05-21T18:10:00Z', closeTimeUtc: '2026-05-21T18:15:00Z' }),
     ], 147);
-    const offWindow = prediction({ id: 'p-old', timeUtc: '2026-05-21T08:10:00Z', eligible: false, outcome: outcome({ id: 'o-old', predictionId: 'p-old' }) });
-    const inWindow = prediction({ id: 'p-now', timeUtc: '2026-05-21T18:11:00Z', eligible: false, outcome: outcome({ id: 'o-now', predictionId: 'p-now' }) });
+    const offWindow = prediction({ id: 'p-old', timeUtc: '2026-05-21T08:10:00Z', eligible: false, outcome: outcome({ id: 'o-old', predictionId: 'p-old', timeUtc: '2026-05-21T08:15:00Z' }) });
+    const inWindow = prediction({ id: 'p-now', timeUtc: '2026-05-21T18:11:00Z', eligible: false, outcome: outcome({ id: 'o-now', predictionId: 'p-now', timeUtc: '2026-05-21T18:11:30Z' }) });
 
     const markers = combineMarkers([], [], [offWindow, inWindow], bars);
 
@@ -428,5 +432,57 @@ describe('paper-execution markers (EXEC P3b)', () => {
     expect(ids).not.toContain('exec-entry:pred-stale');
     expect(ids).toContain('exec-entry:pred-open');
     expect(ids).toContain('exec-exit:pred-closed');
+  });
+});
+
+describe('TP/SL position lines (COCKPIT P4a)', () => {
+  it('builds one TP and one SL line per open position with distinct styles', () => {
+    const lines = normalizePositionLines([openPosition(), openPosition({ predictionId: 'pred-2', direction: 'short', tpPrice: 22950, slPrice: 23010 })]);
+
+    expect(lines.map((line) => line.id)).toEqual(['tp:pred-open', 'sl:pred-open', 'tp:pred-2', 'sl:pred-2']);
+    expect(lines[0]).toMatchObject({ price: 23015, title: 'TP long', color: '#36d399', lineWidth: 1, lineStyle: 3 });
+    expect(lines[1]).toMatchObject({ price: 22970, title: 'SL long', color: '#ff6b6b', lineWidth: 1, lineStyle: 3 });
+    expect(lines[2]).toMatchObject({ price: 22950, title: 'TP short' });
+  });
+
+  it('returns no lines when no position is open (close removes them via sync)', () => {
+    expect(normalizePositionLines([])).toEqual([]);
+  });
+});
+
+describe('session shading bands (COCKPIT P4b)', () => {
+  it('classifies ET sessions per the SC v3 scheme, DST-correct', () => {
+    // 2026-05-21 is EDT (UTC-4): 13:30Z = 09:30 ET → ny; 23:30Z = 19:30 ET → asia.
+    expect(classifySessionEt(Date.parse('2026-05-21T13:30:00Z'))).toBe('ny');
+    expect(classifySessionEt(Date.parse('2026-05-21T23:30:00Z'))).toBe('asia');
+    // Asia crosses midnight ET: 06:00Z = 02:00 ET is still asia; 06:50Z = 02:50 ET is a gap.
+    expect(classifySessionEt(Date.parse('2026-05-21T06:00:00Z'))).toBe('asia');
+    expect(classifySessionEt(Date.parse('2026-05-21T06:50:00Z'))).toBeNull();
+    expect(classifySessionEt(Date.parse('2026-05-21T08:00:00Z'))).toBe('london'); // 04:00 ET
+    expect(classifySessionEt(Date.parse('2026-05-21T12:30:00Z'))).toBeNull(); // 08:30 ET gap
+    expect(classifySessionEt(Date.parse('2026-05-21T22:00:00Z'))).toBeNull(); // 18:00 ET gap
+    // 2026-01-15 is EST (UTC-5): 14:30Z = 09:30 ET → ny.
+    expect(classifySessionEt(Date.parse('2026-01-15T14:30:00Z'))).toBe('ny');
+    expect(classifySessionEt(Date.parse('2026-01-15T13:30:00Z'))).toBeNull(); // 08:30 ET gap under EST
+  });
+
+  it('merges contiguous same-session bars and breaks bands on gaps', () => {
+    const bars = normalizeBarsForTimeframe([
+      bar({ barIndex: 0, barId: 'b0', openTimeUtc: '2026-05-21T13:30:00Z' }), // ny
+      bar({ barIndex: 1, barId: 'b1', openTimeUtc: '2026-05-21T14:00:00Z' }), // ny
+      bar({ barIndex: 2, barId: 'b2', openTimeUtc: '2026-05-21T21:30:00Z' }), // 17:30 ET gap
+      bar({ barIndex: 3, barId: 'b3', openTimeUtc: '2026-05-21T23:30:00Z' }), // asia
+      bar({ barIndex: 4, barId: 'b4', openTimeUtc: '2026-05-22T01:00:00Z', tradingDay: '2026-05-22' }), // asia (21:00 ET prev-eve → still asia window)
+    ], 147);
+
+    const bands = sessionBands(bars);
+
+    expect(bands).toHaveLength(2);
+    expect(bands[0]).toMatchObject({ session: 'ny', from: bars[0].time, to: bars[1].time });
+    expect(bands[1]).toMatchObject({ session: 'asia', from: bars[3].time, to: bars[4].time });
+  });
+
+  it('returns no bands without bars', () => {
+    expect(sessionBands([])).toEqual([]);
   });
 });

@@ -41,7 +41,7 @@ describe('TradingChart', () => {
     mocks.addSeries.mockReset();
     mocks.createChart.mockReset();
     mocks.createSeriesMarkers.mockReset();
-    mocks.addSeries.mockReturnValue({ setData: mocks.setData, update: mocks.update, createPriceLine: mocks.createPriceLine, removePriceLine: mocks.removePriceLine });
+    mocks.addSeries.mockReturnValue({ setData: mocks.setData, update: mocks.update, createPriceLine: mocks.createPriceLine, removePriceLine: mocks.removePriceLine, attachPrimitive: vi.fn(), detachPrimitive: vi.fn() });
     mocks.scrollPosition.mockReturnValue(0);
     mocks.getVisibleRange.mockReturnValue(null);
     mocks.timeScale.mockReturnValue({ scrollPosition: mocks.scrollPosition, getVisibleRange: mocks.getVisibleRange, setVisibleRange: mocks.setVisibleRange, fitContent: mocks.fitContent });

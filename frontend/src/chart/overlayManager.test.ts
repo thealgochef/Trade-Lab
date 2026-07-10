@@ -18,6 +18,8 @@ vi.mock('lightweight-charts', () => ({
 const createSeries = () => ({
   createPriceLine: vi.fn((options: unknown) => ({ options, id: crypto.randomUUID() })),
   removePriceLine: vi.fn(),
+  attachPrimitive: vi.fn(),
+  detachPrimitive: vi.fn(),
 });
 
 describe('ChartOverlayManager', () => {
@@ -60,6 +62,31 @@ describe('ChartOverlayManager', () => {
     expect(firstPass).toEqual(secondPass);
     expect(firstPass[0]).toMatchObject({ lineWidth: 2, lineStyle: 0 });
     expect(firstPass[3]).toMatchObject({ lineWidth: 1, lineStyle: 2, eligible: false });
+  });
+
+  it('keeps TP/SL lines on their own layer, removes them on close, and attaches the session primitive', () => {
+    const series = createSeries();
+    const manager = new ChartOverlayManager(series as never);
+    expect(series.attachPrimitive).toHaveBeenCalledOnce();
+
+    const level: LevelOverlay = { id: 'pdh', price: 19000, title: 'PDH EL', color: '#d7e3ee', lineWidth: 2, lineStyle: 0, eligible: true };
+    manager.syncLevels([level]);
+    manager.syncPositionLines([
+      { id: 'tp:pred-1', price: 23015, title: 'TP long', color: '#36d399', lineWidth: 1, lineStyle: 3 },
+      { id: 'sl:pred-1', price: 22970, title: 'SL long', color: '#ff6b6b', lineWidth: 1, lineStyle: 3 },
+    ]);
+    expect(series.createPriceLine).toHaveBeenCalledTimes(3);
+
+    // Position close: its lines vanish; the level line stays untouched.
+    const tpLine = series.createPriceLine.mock.results[1].value;
+    const slLine = series.createPriceLine.mock.results[2].value;
+    manager.syncPositionLines([]);
+    expect(series.removePriceLine).toHaveBeenCalledWith(tpLine);
+    expect(series.removePriceLine).toHaveBeenCalledWith(slLine);
+    expect(series.removePriceLine).not.toHaveBeenCalledWith(series.createPriceLine.mock.results[0].value);
+
+    manager.destroy();
+    expect(series.detachPrimitive).toHaveBeenCalledOnce();
   });
 
   it('replaces marker sets without accumulating duplicates and keeps inline text with an enlarged glyph', () => {

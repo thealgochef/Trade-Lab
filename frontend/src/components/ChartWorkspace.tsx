@@ -1,5 +1,5 @@
 import { useMemo } from 'react';
-import { combineMarkers, normalizeBarsForTimeframe, normalizeLevels } from '../chart/viewModels';
+import { combineMarkers, normalizeBarsForTimeframe, normalizeLevels, normalizePositionLines } from '../chart/viewModels';
 import { TradingChart } from './TradingChart';
 import { marketStore, useConnection, useExecutions, useIntelligence, useMarket, usePredictions, useRuntime } from '../state/stores';
 import type { Timeframe } from '../domain/models';
@@ -20,11 +20,16 @@ export function ChartWorkspace() {
   const closedExecutions = useExecutions((state) => state.closed);
   const feedReady = useRuntime((state) => state.feedReady);
   const apiOnline = useRuntime((state) => state.apiOnline);
+  const supportedTimeframes = useRuntime((state) => state.supportedTimeframes);
   const wsStatus = useConnection((state) => state.wsStatus);
 
   const bars = useMemo(() => normalizeBarsForTimeframe([...currentBars, ...recentClosedBars], selectedTimeframe), [currentBars, recentClosedBars, selectedTimeframe]);
   const levelOverlays = useMemo(() => normalizeLevels(levels), [levels]);
   const markerOverlays = useMemo(() => combineMarkers(touches, observations, predictions, bars, openPositions, closedExecutions), [touches, observations, predictions, bars, openPositions, closedExecutions]);
+  const positionLines = useMemo(() => normalizePositionLines(openPositions), [openPositions]);
+  // COCKPIT P4d: the decision timeframe is the smallest served timeframe — the
+  // same min(...) rule the backend uses for ServingCapabilities (app.py:278).
+  const decisionTimeframe = supportedTimeframes.length > 0 ? Math.min(...supportedTimeframes) : null;
 
   return (
     <section className="panel chart-panel">
@@ -36,7 +41,7 @@ export function ChartWorkspace() {
         <div className="segmented-control" aria-label="Tick timeframe">
           {TIMEFRAMES.map((timeframe) => (
             <button key={timeframe} className={selectedTimeframe === timeframe ? 'active' : ''} onClick={() => marketStore.setState({ selectedTimeframe: timeframe })}>
-              {timeframe}t
+              {timeframe}t{timeframe === decisionTimeframe ? ' · decision' : ''}
             </button>
           ))}
         </div>
@@ -46,6 +51,7 @@ export function ChartWorkspace() {
         bars={bars}
         levels={levelOverlays}
         markers={markerOverlays}
+        positionLines={positionLines}
         emptyTitle={feedReady ? `Awaiting ${selectedTimeframe}t tick bars` : 'Runtime snapshot idle'}
         emptySubtitle={`Backend ${apiOnline ? 'reachable' : 'offline'} · WebSocket ${wsStatus}`}
       />

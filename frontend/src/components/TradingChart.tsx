@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef } from 'react';
 import { CandlestickSeries, ColorType, CrosshairMode, createChart, type IChartApi, type ISeriesApi, type MouseEventParams } from 'lightweight-charts';
 import { ChartOverlayManager } from '../chart/overlayManager';
-import type { ChartBar, LevelOverlay, MarkerOverlay } from '../chart/viewModels';
+import { sessionBands, type ChartBar, type LevelOverlay, type MarkerOverlay, type PositionLineOverlay } from '../chart/viewModels';
 import type { Timeframe } from '../domain/models';
 
 // Treat the viewport as "parked at the live edge" while its right edge sits within this many
@@ -19,11 +19,15 @@ type TradingChartProps = {
   bars: ChartBar[];
   levels: LevelOverlay[];
   markers: MarkerOverlay[];
+  // COCKPIT P4a: TP/SL barrier lines for open paper positions.
+  positionLines?: PositionLineOverlay[];
   emptyTitle: string;
   emptySubtitle: string;
 };
 
-export function TradingChart({ timeframe, bars, levels, markers, emptyTitle, emptySubtitle }: TradingChartProps) {
+const NO_POSITION_LINES: PositionLineOverlay[] = [];
+
+export function TradingChart({ timeframe, bars, levels, markers, positionLines = NO_POSITION_LINES, emptyTitle, emptySubtitle }: TradingChartProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
@@ -155,6 +159,11 @@ export function TradingChart({ timeframe, bars, levels, markers, emptyTitle, emp
   }, [timeframe, bars]);
 
   useEffect(() => overlaysRef.current?.syncLevels(levels), [levels]);
+  useEffect(() => overlaysRef.current?.syncPositionLines(positionLines), [positionLines]);
+  // COCKPIT P4b: session shading bands recompute with the bar set (ET
+  // classification is cached per UTC hour, so this is arithmetic per bar).
+  const bands = useMemo(() => sessionBands(bars), [bars]);
+  useEffect(() => overlaysRef.current?.syncSessionBands(bands), [bands]);
   useEffect(() => {
     overlaysRef.current?.syncMarkers(markers);
     const labels = new Map<string, string>();

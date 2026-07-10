@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, render } from '@testing-library/react';
+import { act, cleanup, render, screen } from '@testing-library/react';
 import { ChartWorkspace } from './ChartWorkspace';
 import { RealtimeClient } from '../realtime/client';
-import { blotterStore, connectionStore, intelligenceStore, marketStore, predictionStore, runtimeStore } from '../state/stores';
+import { addOpenPosition, blotterStore, connectionStore, executionStore, intelligenceStore, marketStore, predictionStore, runtimeStore } from '../state/stores';
 import type { BarDTO, DisplayLevelDTO, Envelope, FeedStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, TouchDTO } from '../realtime/types';
 import type { TradingChart } from './TradingChart';
 
@@ -34,6 +34,7 @@ const resetStores = () => {
   intelligenceStore.reset();
   blotterStore.reset();
   predictionStore.reset();
+  executionStore.reset();
 };
 
 const bar = (timeframe = 147, complete = false, overrides: Partial<BarDTO> = {}): BarDTO => ({
@@ -223,6 +224,42 @@ describe('ChartWorkspace realtime chart dataflow', () => {
     const ids = lastChartProps().markers.map((marker) => marker.id);
     expect(ids).toContain('prediction:pred-1');
     expect(ids).toContain('outcome:outcome-1');
+  });
+
+  it('badges the decision timeframe tab and passes TP/SL lines for open positions (COCKPIT P4a/P4d)', () => {
+    render(<ChartWorkspace />);
+
+    // Decision timeframe = min(supportedTimeframes) — the backend's own rule.
+    expect(screen.getByRole('button', { name: '147t · decision' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '987t' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '2000t' })).toBeInTheDocument();
+
+    act(() =>
+      addOpenPosition({
+        predictionId: 'pred-1',
+        touchId: 'touch-1',
+        direction: 'long',
+        contracts: 1,
+        entryTsUtc: '2026-05-21T14:00:05Z',
+        entryPrice: 23000,
+        entryPriceConservative: 23000.25,
+        tpPrice: 23015,
+        slPrice: 22970,
+        session: 'ny',
+        levelKind: 'pdl',
+        bundleId: 'bundle-a',
+        mode: 'replay',
+        pointValue: 20,
+        lastPrice: null,
+        unrealizedPoints: null,
+        unrealizedPointsConservative: null,
+      }),
+    );
+
+    expect(lastChartProps().positionLines?.map((line) => line.id)).toEqual(['tp:pred-1', 'sl:pred-1']);
+
+    act(() => executionStore.setState({ openPositions: [], closed: [] }));
+    expect(lastChartProps().positionLines).toEqual([]);
   });
 
   it('does not change chart bars or overlays on heartbeat and feed-status messages', () => {

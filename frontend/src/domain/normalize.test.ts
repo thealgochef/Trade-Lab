@@ -174,6 +174,9 @@ describe('inference DTO normalization', () => {
       class_map: { '0': 'continuation', '1': 'reversal' },
       validation_ok: true,
       validation_detail: 'ok',
+      confidence_gate: 0.7,
+      eligible_class: 'reversal',
+      eligible_sessions: ['ny'],
     };
 
     expect(normalizeModelStatus(dto)).toEqual({
@@ -186,6 +189,20 @@ describe('inference DTO normalization', () => {
       classMap: { '0': 'continuation', '1': 'reversal' },
       validationOk: true,
       validationDetail: 'ok',
+      confidenceGate: 0.7,
+      eligibleClass: 'reversal',
+      eligibleSessions: ['ny'],
+    });
+
+    // An older backend that omits the gate fields normalizes them to null.
+    const legacy = { ...dto };
+    delete legacy.confidence_gate;
+    delete legacy.eligible_class;
+    delete legacy.eligible_sessions;
+    expect(normalizeModelStatus(legacy)).toMatchObject({
+      confidenceGate: null,
+      eligibleClass: null,
+      eligibleSessions: null,
     });
   });
 

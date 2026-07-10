@@ -1,5 +1,6 @@
 import type { CandlestickData, SeriesMarker, Time, UTCTimestamp } from 'lightweight-charts';
 import type { ClosedExecution, MarketBar, MarketLevel, MarketTouch, Observation, OpenPosition, Prediction, Timeframe } from '../domain/models';
+import { etMinutesOfDay } from '../strip/viewModels';
 
 export const PRICE_TICK_SIZE = 0.25;
 // Sized to hold 2 full trading days (plus the current partial) per timeframe — the live
@@ -190,8 +191,11 @@ export const normalizePredictionMarkers = (predictions: Prediction[], resolve: (
     });
 };
 
-// Outcome markers reuse the touch-bar anchor (resolved from the originating
-// prediction) so the resolved state lands on the same candle as its prediction.
+// Outcome markers anchor to the RESOLUTION bar (outcome.timeUtc = resolved_ts),
+// not the touch bar — COCKPIT P4c re-anchor per VIZ_RECON §3. The touch and
+// prediction markers stay on the touch bar, so the setup and its resolution
+// read as two distinct instants; a resolution ts is never older than its touch,
+// so this can only gain resolvability under the drop-if-older-than-bars[0] rule.
 export const normalizeOutcomeMarkers = (predictions: Prediction[], resolve: (iso: string) => UTCTimestamp | null): MarkerOverlay[] => {
   const deduped = new Map<string, Prediction>();
   for (const prediction of predictions) if (prediction.outcome) deduped.set(prediction.outcome.id, prediction);
@@ -200,7 +204,7 @@ export const normalizeOutcomeMarkers = (predictions: Prediction[], resolve: (iso
     .flatMap((prediction) => {
       const outcome = prediction.outcome;
       if (!outcome) return [];
-      const time = resolve(prediction.timeUtc);
+      const time = resolve(outcome.timeUtc);
       if (time === null) return [];
       return [{
         id: `outcome:${outcome.id}`,
@@ -263,6 +267,84 @@ export const normalizeExecutionMarkers = (
     } satisfies MarkerOverlay);
   }
   return markers;
+};
+
+// COCKPIT P4a: TP/SL barrier lines for open paper positions. Large-dashed and
+// 1px so they read differently from level lines (eligible = solid 2px,
+// display-only = dashed grey). Removed by the overlay sync when the position
+// closes (its id disappears from the set).
+export type PositionLineOverlay = {
+  id: string;
+  price: number;
+  title: string;
+  color: string;
+  lineWidth: 1 | 2;
+  lineStyle: 0 | 1 | 2 | 3 | 4;
+};
+
+export const normalizePositionLines = (openPositions: OpenPosition[]): PositionLineOverlay[] =>
+  openPositions.flatMap((position) => [
+    {
+      id: `tp:${position.predictionId}`,
+      price: position.tpPrice,
+      title: `TP ${position.direction}`,
+      color: '#36d399',
+      lineWidth: 1 as const,
+      lineStyle: 3 as const,
+    },
+    {
+      id: `sl:${position.predictionId}`,
+      price: position.slPrice,
+      title: `SL ${position.direction}`,
+      color: '#ff6b6b',
+      lineWidth: 1 as const,
+      lineStyle: 3 as const,
+    },
+  ]);
+
+// COCKPIT P4b: session shading bands. Sessions are classified from each bar's
+// open wall-clock instant in America/New_York (SC engine-v3 scheme: asia
+// 19:00–02:45 crossing midnight, london 03:00–08:00, ny 09:00–17:00 ET; the
+// 18:00–19:00 / 02:45–03:00 / 08:00–09:00 / 17:00–18:00 gaps are unsessioned)
+// and contiguous same-session bars merge into one band on the synthetic chart
+// time axis.
+export type SessionBandName = 'asia' | 'london' | 'ny';
+
+export type SessionBand = {
+  session: SessionBandName;
+  from: UTCTimestamp;
+  to: UTCTimestamp;
+};
+
+export const classifySessionEt = (epochMs: number): SessionBandName | null => {
+  const minutes = etMinutesOfDay(epochMs);
+  if (minutes >= 19 * 60 || minutes < 2 * 60 + 45) return 'asia';
+  if (minutes >= 3 * 60 && minutes < 8 * 60) return 'london';
+  if (minutes >= 9 * 60 && minutes < 17 * 60) return 'ny';
+  return null;
+};
+
+export const sessionBands = (bars: ChartBar[]): SessionBand[] => {
+  const bands: SessionBand[] = [];
+  let current: { session: SessionBandName; from: UTCTimestamp; to: UTCTimestamp } | null = null;
+  for (const bar of bars) {
+    const at = Date.parse(bar.openTimeUtc);
+    if (!Number.isFinite(at)) continue;
+    const session = classifySessionEt(at);
+    if (session === null) {
+      if (current) bands.push(current);
+      current = null;
+      continue;
+    }
+    if (current && current.session === session) {
+      current.to = bar.time as UTCTimestamp;
+    } else {
+      if (current) bands.push(current);
+      current = { session, from: bar.time as UTCTimestamp, to: bar.time as UTCTimestamp };
+    }
+  }
+  if (current) bands.push(current);
+  return bands;
 };
 
 export const combineMarkers = (touches: MarketTouch[], observations: Observation[], predictions: Prediction[], bars: ChartBar[], openPositions: OpenPosition[] = [], closedExecutions: ClosedExecution[] = []): MarkerOverlay[] => {

@@ -158,6 +158,25 @@ export function etWallTimeToEpochMs(target: Omit<EtParts, 'second'> & { second?:
   return guess;
 }
 
+// Per-UTC-hour offset cache: the ET offset is constant within any UTC hour (US
+// DST transitions land on exact UTC hour boundaries), so one Intl lookup per
+// distinct hour makes bulk per-bar classification cheap (COCKPIT P4b).
+const ET_OFFSET_CACHE = new Map<number, number>();
+
+/** ET wall-clock minutes-of-day (0..1439) for an epoch instant, DST-correct. */
+export function etMinutesOfDay(epochMs: number): number {
+  const hourKey = Math.floor(epochMs / 3_600_000);
+  let offsetMs = ET_OFFSET_CACHE.get(hourKey);
+  if (offsetMs === undefined) {
+    const hourStart = hourKey * 3_600_000;
+    offsetMs = partsAsUtcMs(etParts(hourStart)) - hourStart;
+    if (ET_OFFSET_CACHE.size > 20_000) ET_OFFSET_CACHE.clear();
+    ET_OFFSET_CACHE.set(hourKey, offsetMs);
+  }
+  const shifted = new Date(epochMs + offsetMs);
+  return shifted.getUTCHours() * 60 + shifted.getUTCMinutes();
+}
+
 export type Countdown = {
   mode: 'until' | 'since';
   seconds: number;
