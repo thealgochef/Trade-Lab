@@ -131,7 +131,10 @@ def test_payload_shape_and_no_path_leakage(tmp_path: Path) -> None:
         "anomalies",
         "pricing",
         "oos_comparison",
+        "executions",
     }
+    # EXEC P3d: no executions directory yet -> the section is dark, not zeroed.
+    assert payload["executions"] is None
     assert payload["applied_filters"] == {
         "mode": "all",
         "from": None,
@@ -186,6 +189,73 @@ def test_torn_tail_line_is_counted_not_fatal(tmp_path: Path) -> None:
     payload = response.json()
     assert payload["headline"]["resolved_trades"] == 1
     assert payload["anomalies"]["malformed_lines"] == 1
+
+
+def test_executions_summary_rides_the_report(tmp_path: Path) -> None:
+    # EXEC P3d: the executions dir sits beside the journal dir; close rows are
+    # filtered like the journal and summed in both columns.
+    client, journal = _client(tmp_path)
+    _append(journal, [_prediction("p1"), _outcome("p1")])
+    executions = journal.parent / "executions"
+    executions.mkdir(parents=True)
+    rows = [
+        {
+            "type": "open",
+            "mode": "live",
+            "bundle_id": BUNDLE,
+            "ts_utc": "2026-06-18T08:05:00+00:00",
+            "prediction_id": "p1",
+        },
+        {
+            "type": "close",
+            "mode": "live",
+            "bundle_id": BUNDLE,
+            "ts_utc": "2026-06-18T08:10:00+00:00",
+            "prediction_id": "p1",
+            "reason": "tp_hit",
+            "session": "ny",
+            "points": 15.0,
+            "points_conservative": 14.75,
+            "dollars": 300.0,
+            "dollars_conservative": 295.0,
+        },
+        {
+            "type": "close",
+            "mode": "replay",
+            "bundle_id": BUNDLE,
+            "ts_utc": "2026-06-18T09:10:00+00:00",
+            "prediction_id": "p2",
+            "reason": "sl_hit",
+            "session": "ny",
+            "points": -30.0,
+            "points_conservative": -30.5,
+            "dollars": -600.0,
+            "dollars_conservative": -610.0,
+        },
+        "not json {",
+    ]
+    with (executions / "2026-06-18.jsonl").open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write((row if isinstance(row, str) else json.dumps(row)) + "\n")
+
+    payload = client.get("/api/v1/performance").json()
+    executions_section = payload["executions"]
+    assert executions_section["files_scanned"] == 1
+    assert executions_section["malformed_lines"] == 1
+    assert executions_section["opens_total"] == 1
+    assert executions_section["closes_total"] == 2
+    realized = executions_section["realized"]
+    assert realized["count"] == 2
+    assert realized["points"] == -15.0
+    assert realized["points_conservative"] == -15.75
+    assert realized["wins"] == 1 and realized["losses"] == 1
+    assert realized["by_reason"]["tp_hit"]["count"] == 1
+
+    live_only = client.get("/api/v1/performance", params={"mode": "live"}).json()
+    live_realized = live_only["executions"]["realized"]
+    assert live_realized["count"] == 1
+    assert live_realized["points"] == 15.0
+    assert live_only["executions"]["closes_outside_filters"] == 1
 
 
 def test_400_on_bad_filters(tmp_path: Path) -> None:

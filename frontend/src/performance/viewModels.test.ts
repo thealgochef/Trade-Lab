@@ -5,12 +5,13 @@
 // Monday's key), so weeks here are Mon..Fri trading weeks, never calendar weeks.
 
 import { describe, expect, it } from 'vitest';
-import type { PerformanceDayDTO, PerformanceHeadlineDTO } from '../api/types';
+import type { PerformanceDayDTO, PerformanceExecutionsDTO, PerformanceHeadlineDTO } from '../api/types';
 import {
   DEFAULT_DOLLARS_PER_POINT,
   SIMULATED_DOLLARS_LABEL,
   buildCumulativeCurve,
   buildDailyBars,
+  buildExecutionSummary,
   buildMonthCalendar,
   buildStatCards,
   calendarCellColor,
@@ -240,5 +241,71 @@ describe('trading-day calendar math', () => {
       day('2026-07-01', 1),
     ]);
     expect(months).toEqual(['2026-05', '2026-06', '2026-07']);
+  });
+});
+
+const executionsDto = (over: Partial<PerformanceExecutionsDTO> = {}): PerformanceExecutionsDTO => ({
+  note: 'paper executions',
+  files_scanned: 1,
+  unreadable_files: 0,
+  decode_error_files: 0,
+  lines_total: 3,
+  malformed_lines: 0,
+  unknown_type_rows: 0,
+  undated_close_rows: 0,
+  opens_total: 2,
+  closes_total: 2,
+  resets_total: 1,
+  reset_cleared_positions: 1,
+  closes_outside_filters: 0,
+  closes_missing_pnl: 0,
+  realized: {
+    count: 2,
+    points: -15,
+    points_conservative: -15.75,
+    dollars: -300,
+    dollars_conservative: -315,
+    wins: 1,
+    losses: 1,
+    by_reason: {
+      tp_hit: { count: 1, points: 15, points_conservative: 14.75 },
+      sl_hit: { count: 1, points: -30, points_conservative: -30.5 },
+    },
+  },
+  ...over,
+});
+
+describe('paper-execution summary card (EXEC P3d)', () => {
+  it('stays dark without execution files and shows once files exist', () => {
+    expect(buildExecutionSummary(null, { showDollars: false, dollarsPerPoint: 20 }).show).toBe(false);
+    expect(buildExecutionSummary(undefined, { showDollars: false, dollarsPerPoint: 20 }).show).toBe(false);
+    expect(
+      buildExecutionSummary(executionsDto({ files_scanned: 0 }), { showDollars: false, dollarsPerPoint: 20 }).show,
+    ).toBe(false);
+    expect(buildExecutionSummary(executionsDto(), { showDollars: false, dollarsPerPoint: 20 }).show).toBe(true);
+  });
+
+  it('formats realized points in BOTH columns, with the dollars toggle', () => {
+    const points = buildExecutionSummary(executionsDto(), { showDollars: false, dollarsPerPoint: 20 });
+    expect(points.realizedLabel).toBe('-15.0 pts');
+    expect(points.conservativeLabel).toBe('-15.8 pts');
+    expect(points.countLabel).toContain('2 closed · 1W/1L');
+    expect(points.countLabel).toContain('1 resets (1 cleared)');
+
+    const dollars = buildExecutionSummary(executionsDto(), { showDollars: true, dollarsPerPoint: 20 });
+    expect(dollars.realizedLabel).toBe('-$300');
+    expect(dollars.conservativeLabel).toBe('-$315');
+  });
+
+  it('lists close reasons and surfaces non-zero anomaly buckets only', () => {
+    const summary = buildExecutionSummary(
+      executionsDto({ malformed_lines: 2, closes_missing_pnl: 1 }),
+      { showDollars: false, dollarsPerPoint: 20 },
+    );
+    expect(summary.reasons).toEqual([
+      { reason: 'sl hit', count: 1, points: '-30.0', pointsConservative: '-30.5' },
+      { reason: 'tp hit', count: 1, points: '+15.0', pointsConservative: '+14.8' },
+    ]);
+    expect(summary.anomalyNotes).toEqual(['malformed lines: 2', 'closes missing P&L: 1']);
   });
 });

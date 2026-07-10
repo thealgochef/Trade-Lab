@@ -16,6 +16,7 @@ from trade_lab.domain.feed import FeedConnectionState, FeedStatus
 from trade_lab.domain.levels import DisplayLevel, TouchEvent
 from trade_lab.domain.observations import Observation
 from trade_lab.domain.outcomes import DroppedPrediction, Outcome
+from trade_lab.services.execution import ClosedExecution, OpenPosition
 from trade_lab.services.inference.inference_engine import Prediction
 from trade_lab.services.model_registry import ModelBundle
 from trade_lab.services.replay import ReplayStatus
@@ -35,6 +36,8 @@ MessageType = Literal[
     "prediction.created",
     "prediction.resolved",
     "prediction.dropped",
+    "position.opened",
+    "position.closed",
     "model.status",
     "model.reset",
 ]
@@ -139,6 +142,56 @@ class DroppedPredictionDTO(ApiModel):
     entry_price: float | None = None
 
 
+class OpenPositionDTO(ApiModel):
+    """One tracked paper position (EXEC P3a). Both entry columns + barriers.
+
+    ``unrealized_points``/``unrealized_points_conservative`` are marked against
+    ``last_price`` (the tracker's last-seen trade print at serialization time);
+    all three are ``None`` when no print has been observed yet.
+    """
+
+    prediction_id: str
+    touch_id: str
+    direction: str
+    contracts: int
+    entry_ts_utc: datetime
+    entry_price: float
+    entry_price_conservative: float
+    tp_price: float
+    sl_price: float
+    session: str
+    level_kind: str
+    bundle_id: str
+    mode: str
+    point_value: float
+    last_price: float | None = None
+    unrealized_points: float | None = None
+    unrealized_points_conservative: float | None = None
+
+
+class ClosedExecutionDTO(ApiModel):
+    """One closed paper execution (EXEC P3a): both columns realized."""
+
+    prediction_id: str
+    touch_id: str
+    direction: str
+    contracts: int
+    entry_ts_utc: datetime
+    exit_ts_utc: datetime | None
+    reason: str
+    entry_price: float
+    entry_price_conservative: float
+    exit_price: float
+    exit_price_conservative: float
+    points: float
+    points_conservative: float
+    dollars: float
+    dollars_conservative: float
+    point_value: float
+    session: str
+    level_kind: str
+
+
 class ModelStatusDTO(ApiModel):
     """Active model status for the UI. Path-free and secret-free by construction."""
 
@@ -198,6 +251,9 @@ class SnapshotPayload(ApiModel):
     predictions: list[PredictionDTO] = Field(default_factory=list)
     outcomes: list[OutcomeDTO] = Field(default_factory=list)
     dropped: list[DroppedPredictionDTO] = Field(default_factory=list)
+    # EXEC P3a: the paper-execution open-position block, with live unrealized
+    # P&L (both columns) against the tracker's last-seen trade print.
+    open_positions: list[OpenPositionDTO] = Field(default_factory=list)
     model_status: ModelStatusDTO
     session: str | None = None
     trading_day: date | None = None
@@ -340,6 +396,58 @@ def dropped_to_dto(dropped: DroppedPrediction) -> DroppedPredictionDTO:
     )
 
 
+def open_position_to_dto(
+    position: OpenPosition, last_trade_price_ticks: int | None
+) -> OpenPositionDTO:
+    last_price = (
+        None if last_trade_price_ticks is None else last_trade_price_ticks * position.tick_size
+    )
+    return OpenPositionDTO(
+        prediction_id=position.prediction_id,
+        touch_id=position.touch_id,
+        direction=position.direction,
+        contracts=position.contracts,
+        entry_ts_utc=position.entry_ts_utc,
+        entry_price=position.entry_price,
+        entry_price_conservative=position.entry_price_conservative,
+        tp_price=position.tp_price,
+        sl_price=position.sl_price,
+        session=position.session,
+        level_kind=position.level_kind,
+        bundle_id=position.bundle_id,
+        mode=position.mode,
+        point_value=position.point_value,
+        last_price=last_price,
+        unrealized_points=position.unrealized_points(last_trade_price_ticks),
+        unrealized_points_conservative=position.unrealized_points_conservative(
+            last_trade_price_ticks
+        ),
+    )
+
+
+def closed_execution_to_dto(execution: ClosedExecution) -> ClosedExecutionDTO:
+    return ClosedExecutionDTO(
+        prediction_id=execution.prediction_id,
+        touch_id=execution.touch_id,
+        direction=execution.direction,
+        contracts=execution.contracts,
+        entry_ts_utc=execution.entry_ts_utc,
+        exit_ts_utc=execution.exit_ts_utc,
+        reason=execution.reason,
+        entry_price=execution.entry_price,
+        entry_price_conservative=execution.entry_price_conservative,
+        exit_price=execution.exit_price,
+        exit_price_conservative=execution.exit_price_conservative,
+        points=execution.points,
+        points_conservative=execution.points_conservative,
+        dollars=execution.dollars,
+        dollars_conservative=execution.dollars_conservative,
+        point_value=execution.point_value,
+        session=execution.session,
+        level_kind=execution.level_kind,
+    )
+
+
 def model_status_to_dto(status: ModelStatus) -> ModelStatusDTO:
     return ModelStatusDTO(
         loaded=status.loaded,
@@ -452,6 +560,18 @@ def outcome_payload(outcome: Outcome) -> dict[str, Any]:
 
 def dropped_payload(dropped: DroppedPrediction) -> dict[str, Any]:
     return {"dropped": dropped_to_dto(dropped).model_dump(mode="json")}
+
+
+def position_opened_payload(
+    position: OpenPosition, last_trade_price_ticks: int | None
+) -> dict[str, Any]:
+    return {
+        "position": open_position_to_dto(position, last_trade_price_ticks).model_dump(mode="json")
+    }
+
+
+def position_closed_payload(execution: ClosedExecution) -> dict[str, Any]:
+    return {"execution": closed_execution_to_dto(execution).model_dump(mode="json")}
 
 
 def make_envelope(

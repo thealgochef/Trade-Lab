@@ -15,7 +15,7 @@
 * { box-sizing: border-box; }
 body { margin: 0; background: radial-gradient(circle at top left, #102033 0, var(--bg) 45%); color: var(--text); }
 button { font: inherit; }
-.workstation-shell { min-height: 100vh; display: grid; grid-template-rows: auto auto auto auto 1fr 210px; gap: 12px; padding: 12px; }
+.workstation-shell { min-height: 100vh; display: grid; grid-template-rows: auto auto auto auto 1fr auto 210px; gap: 12px; padding: 12px; }
 .workstation-shell.performance-view { grid-template-rows: auto auto 1fr; }
 .view-tabs { display: flex; }
 .control-row { display:grid; grid-template-columns:minmax(0, 1.25fr) minmax(360px, .75fr); gap:12px; }
@@ -178,4 +178,19 @@ button { font: inherit; }
 .perf-quality-row { display: flex; flex-wrap: wrap; gap: 8px 16px; color: var(--muted); font-size: 11px; }
 .perf-quality-row .quality-flag { color: var(--amber); }
 
-@media (max-width: 1050px) { .workstation-shell { grid-template-rows:auto auto auto auto auto 220px; } .control-row, .workspace-grid { grid-template-columns: 1fr; } .intelligence-panel { max-height: 420px; } .replay-controls-grid, .live-grid, .model-controls-grid, .model-bundle-meta { grid-template-columns:1fr 1fr; } .perf-cards { grid-template-columns: repeat(2, 1fr); } .perf-charts, .perf-tables { grid-template-columns: 1fr; } }
+/* EXEC P3c: paper-execution panel (open-position cards + closed table). */
+.executions-panel { display: flex; flex-direction: column; }
+.exec-note { margin-left: auto; color: var(--muted); font-size: 11px; }
+.exec-body { display: grid; grid-template-columns: minmax(280px, .9fr) minmax(0, 1.6fr); gap: 16px; padding: 12px 18px; }
+.exec-body h3 { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin-bottom: 6px; }
+.exec-card { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; display: flex; flex-direction: column; gap: 6px; }
+.exec-card-head { display: flex; gap: 10px; align-items: center; font-size: 13px; }
+.exec-unrealized { font-weight: 700; font-variant-numeric: tabular-nums; }
+.exec-unrealized.pos, .pnl-pos { color: var(--green); }
+.exec-unrealized.neg, .pnl-neg { color: var(--red); }
+.exec-meta { color: var(--muted); font-size: 11px; }
+.exec-closed { min-width: 0; overflow-x: auto; }
+.perf-exec-panel { padding: 14px 16px; border-radius: 14px; }
+.perf-exec-columns { display: flex; flex-wrap: wrap; gap: 8px 20px; font-size: 12px; font-variant-numeric: tabular-nums; }
+
+@media (max-width: 1050px) { .workstation-shell { grid-template-rows:auto auto auto auto auto auto 220px; } .control-row, .workspace-grid, .exec-body { grid-template-columns: 1fr; } .intelligence-panel { max-height: 420px; } .replay-controls-grid, .live-grid, .model-controls-grid, .model-bundle-meta { grid-template-columns:1fr 1fr; } .perf-cards { grid-template-columns: repeat(2, 1fr); } .perf-charts, .perf-tables { grid-template-columns: 1fr; } }

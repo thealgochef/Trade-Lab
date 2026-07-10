@@ -5,6 +5,7 @@ import {
   DEFAULT_DOLLARS_PER_POINT,
   buildCumulativeCurve,
   buildDailyBars,
+  buildExecutionSummary,
   buildMonthCalendar,
   buildStatCards,
   calendarCellColor,
@@ -110,6 +111,14 @@ export function PerformancePage() {
     [report],
   );
   const bars = useMemo(() => (report ? buildDailyBars(report.series, 640, 220) : null), [report]);
+  const executionSummary = useMemo(
+    () =>
+      buildExecutionSummary(report?.executions, {
+        showDollars,
+        dollarsPerPoint: report?.headline.point_value ?? DEFAULT_DOLLARS_PER_POINT,
+      }),
+    [report, showDollars],
+  );
 
   const hasRows = report !== null && (report.series.length > 0 || report.headline.predictions > 0);
 
@@ -542,6 +551,54 @@ export function PerformancePage() {
                       ),
                     )}
                   </div>
+                </div>
+              )}
+            </section>
+          )}
+
+          {executionSummary.show && (
+            <section className="panel perf-exec-panel" aria-label="Paper executions summary">
+              <div className="perf-section-head">
+                <h3>Paper executions (realized, both columns)</h3>
+                <span>
+                  observer-derived fills · optimistic = exact anchor/barriers · conservative =
+                  1-tick-adverse entry + sl exit
+                </span>
+              </div>
+              <div className="perf-exec-columns">
+                <span>
+                  optimistic <strong>{executionSummary.realizedLabel}</strong>
+                </span>
+                <span>
+                  conservative <strong>{executionSummary.conservativeLabel}</strong>
+                </span>
+                <span>{executionSummary.countLabel}</span>
+              </div>
+              {executionSummary.reasons.length > 0 && (
+                <table className="perf-table">
+                  <thead>
+                    <tr>
+                      <th>Close reason</th>
+                      <th>Count</th>
+                      <th>Pts</th>
+                      <th>Pts (cons)</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {executionSummary.reasons.map((row) => (
+                      <tr key={row.reason}>
+                        <td>{row.reason}</td>
+                        <td>{row.count}</td>
+                        <td>{row.points}</td>
+                        <td>{row.pointsConservative}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+              {executionSummary.anomalyNotes.length > 0 && (
+                <div className="perf-note" role="status">
+                  {executionSummary.anomalyNotes.join(' · ')}
                 </div>
               )}
             </section>

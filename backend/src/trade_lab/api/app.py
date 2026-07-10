@@ -24,6 +24,12 @@ from trade_lab.api.dto import (
 )
 from trade_lab.config import Settings, load_settings
 from trade_lab.services.broadcaster import WebSocketBroadcaster
+from trade_lab.services.execution import (
+    ExecutionJournal,
+    ExecutionPolicy,
+    PaperExecutionTracker,
+    executions_root_for,
+)
 from trade_lab.services.inference.features import DEFAULT_FEATURE_REGISTRY
 from trade_lab.services.inference.inference_engine import InferenceEngine
 from trade_lab.services.journal import PredictionJournal
@@ -283,6 +289,32 @@ def create_app(
     broadcaster = broadcaster or WebSocketBroadcaster(runtime)
     app.state.runtime = runtime
     app.state.broadcaster = broadcaster
+
+    # EXEC P2/P3a: the paper-execution tracker — an observer of the observer.
+    # It consumes the broadcast RuntimeUpdate stream plus two READ-ONLY
+    # providers (the resolver's open-setup snapshot and the active contract's
+    # execution economics) and writes only its own executions journal beside
+    # the prediction journal. Zero influence on the serving path.
+    def _execution_policy() -> ExecutionPolicy | None:
+        active = inference_engine.active()
+        if active is None:
+            return None
+        contract = active.contract
+        return ExecutionPolicy(
+            tick_size=contract.tick_size,
+            tp_points=contract.label_policy.tp_points,
+            sl_points=contract.label_policy.sl_points,
+            point_value=contract.point_value,
+        )
+
+    executions_root = executions_root_for(settings.journal_path)
+    execution_tracker = PaperExecutionTracker(
+        open_setups=runtime.open_setup_views,
+        policy=_execution_policy,
+        journal=ExecutionJournal(executions_root),
+    )
+    broadcaster.set_execution_tracker(execution_tracker)
+    app.state.execution_tracker = execution_tracker
     replay = replay or HistoricalReplayService(runtime)
     if not replay.has_update_callback:
         replay.set_update_callback(broadcaster.broadcast_update)
@@ -548,6 +580,8 @@ def create_app(
                 filters=filters,
                 models_root=settings.models_path,
                 bundle_dir=bundle_dir,
+                # EXEC P3d: the paper-execution summary rides the same report.
+                executions_dir=executions_root,
             )
         except InvalidPerformanceFilter as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

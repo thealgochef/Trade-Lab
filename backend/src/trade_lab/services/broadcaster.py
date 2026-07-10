@@ -21,7 +21,10 @@ from trade_lab.api.dto import (
     make_envelope,
     model_status_to_dto,
     observation_to_dto,
+    open_position_to_dto,
     outcome_payload,
+    position_closed_payload,
+    position_opened_payload,
     prediction_payload,
     snapshot_payload_from_runtime,
     touch_to_dto,
@@ -29,6 +32,7 @@ from trade_lab.api.dto import (
 )
 from trade_lab.api.serialization import dumps_bytes
 from trade_lab.domain.data_quality import DataQualityCode, DataQualityWarning
+from trade_lab.services.execution import PaperExecutionTracker
 from trade_lab.services.runtime import ApplicationRuntime, ModelStatus, RuntimeUpdate
 
 
@@ -46,9 +50,25 @@ class WebSocketBroadcaster:
         # Track the active model id so a model.status delta is emitted only when the
         # active model actually changes (activate/deactivate), not on every update.
         self._last_model_id = runtime.model_status().model_id
+        # EXEC P3a: the paper-execution tracker observes every broadcast update
+        # (the single choke point every UI-bound RuntimeUpdate flows through —
+        # replay/live callbacks AND the activation-endpoint broadcasts), so it
+        # sees exactly what the UI sees, clients connected or not.
+        self._execution_tracker: PaperExecutionTracker | None = None
+
+    def set_execution_tracker(self, tracker: PaperExecutionTracker | None) -> None:
+        self._execution_tracker = tracker
 
     def snapshot_payload(self) -> SnapshotPayload:
-        return snapshot_payload_from_runtime(self.runtime.snapshot())
+        payload = snapshot_payload_from_runtime(self.runtime.snapshot())
+        tracker = self._execution_tracker
+        if tracker is not None:
+            last_ticks = tracker.last_trade_price_ticks
+            payload.open_positions = [
+                open_position_to_dto(position, last_ticks)
+                for position in tracker.open_positions()
+            ]
+        return payload
 
     def envelope_bytes(self, message_type: MessageType, payload: Any) -> bytes:
         return dumps_bytes(make_envelope(message_type, next(self._sequence), payload))
@@ -128,6 +148,25 @@ class WebSocketBroadcaster:
             messages.append(self.envelope_bytes("prediction.resolved", outcome_payload(outcome)))
         for dropped in update.dropped:
             messages.append(self.envelope_bytes("prediction.dropped", dropped_payload(dropped)))
+        # EXEC P3a: advance the paper-execution tracker on this update (observe()
+        # never raises) and append its typed deltas AFTER the prediction frames
+        # they derive from. The observation runs here — once per broadcast — so
+        # the executions journal is written whether or not any client is
+        # connected.
+        tracker = self._execution_tracker
+        if tracker is not None:
+            opened, closed = tracker.observe(update)
+            for position in opened:
+                messages.append(
+                    self.envelope_bytes(
+                        "position.opened",
+                        position_opened_payload(position, tracker.last_trade_price_ticks),
+                    )
+                )
+            for execution in closed:
+                messages.append(
+                    self.envelope_bytes("position.closed", position_closed_payload(execution))
+                )
         model_status_message = self._model_status_message_if_changed()
         if model_status_message is not None:
             messages.append(model_status_message)

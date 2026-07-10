@@ -1,6 +1,6 @@
 import type { LiveStatusDTO, ModelBundleDTO, ReplaySourceDTO, ReplayStatusDTO, RuntimeStatusDTO } from '../api/types';
-import type { BarDTO, DataQualityWarningDTO, DisplayLevelDTO, DroppedPredictionDTO, ModelStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, TouchDTO } from '../realtime/types';
-import type { DroppedPrediction, LiveStatus, MarketBar, MarketLevel, MarketTouch, ModelBundle, ModelStatus, Observation, Outcome, Prediction, ReplaySource, ReplayStatus, RuntimeSummary, Timeframe, Warning, WarningMetadata } from './models';
+import type { BarDTO, ClosedExecutionDTO, DataQualityWarningDTO, DisplayLevelDTO, DroppedPredictionDTO, ModelStatusDTO, ObservationDTO, OpenPositionDTO, OutcomeDTO, PredictionDTO, TouchDTO } from '../realtime/types';
+import type { ClosedExecution, DroppedPrediction, LiveStatus, MarketBar, MarketLevel, MarketTouch, ModelBundle, ModelStatus, Observation, OpenPosition, Outcome, Prediction, ReplaySource, ReplayStatus, RuntimeSummary, Timeframe, Warning, WarningMetadata } from './models';
 
 // API DTOs stay at the transport boundary; components consume these narrower
 // workstation models so future backend contract changes do not leak everywhere.
@@ -153,6 +153,47 @@ export const normalizeDropped = (dto: DroppedPredictionDTO): DroppedPrediction =
   reason: dto.reason,
   decisionTsUtc: dto.decision_ts_utc,
   entryPrice: dto.entry_price ?? null,
+});
+
+export const normalizeOpenPosition = (dto: OpenPositionDTO): OpenPosition => ({
+  predictionId: dto.prediction_id,
+  touchId: dto.touch_id,
+  direction: dto.direction,
+  contracts: dto.contracts,
+  entryTsUtc: dto.entry_ts_utc,
+  entryPrice: dto.entry_price,
+  entryPriceConservative: dto.entry_price_conservative,
+  tpPrice: dto.tp_price,
+  slPrice: dto.sl_price,
+  session: dto.session,
+  levelKind: dto.level_kind,
+  bundleId: dto.bundle_id,
+  mode: dto.mode,
+  pointValue: dto.point_value,
+  lastPrice: dto.last_price ?? null,
+  unrealizedPoints: dto.unrealized_points ?? null,
+  unrealizedPointsConservative: dto.unrealized_points_conservative ?? null,
+});
+
+export const normalizeClosedExecution = (dto: ClosedExecutionDTO): ClosedExecution => ({
+  predictionId: dto.prediction_id,
+  touchId: dto.touch_id,
+  direction: dto.direction,
+  contracts: dto.contracts,
+  entryTsUtc: dto.entry_ts_utc,
+  exitTsUtc: dto.exit_ts_utc ?? null,
+  reason: dto.reason,
+  entryPrice: dto.entry_price,
+  entryPriceConservative: dto.entry_price_conservative,
+  exitPrice: dto.exit_price,
+  exitPriceConservative: dto.exit_price_conservative,
+  points: dto.points,
+  pointsConservative: dto.points_conservative,
+  dollars: dto.dollars,
+  dollarsConservative: dto.dollars_conservative,
+  pointValue: dto.point_value,
+  session: dto.session,
+  levelKind: dto.level_kind,
 });
 
 export const normalizeModelStatus = (dto: ModelStatusDTO): ModelStatus => ({

@@ -1,5 +1,5 @@
 import type { CandlestickData, SeriesMarker, Time, UTCTimestamp } from 'lightweight-charts';
-import type { MarketBar, MarketLevel, MarketTouch, Observation, Prediction, Timeframe } from '../domain/models';
+import type { ClosedExecution, MarketBar, MarketLevel, MarketTouch, Observation, OpenPosition, Prediction, Timeframe } from '../domain/models';
 
 export const PRICE_TICK_SIZE = 0.25;
 // Sized to hold 2 full trading days (plus the current partial) per timeframe — the live
@@ -213,7 +213,59 @@ export const normalizeOutcomeMarkers = (predictions: Prediction[], resolve: (iso
     });
 };
 
-export const combineMarkers = (touches: MarketTouch[], observations: Observation[], predictions: Prediction[], bars: ChartBar[]): MarkerOverlay[] => {
+// Paper-execution markers (EXEC P3b) are PRICE-anchored (lightweight-charts v5
+// SeriesMarkerPrice) — they sit at the actual fill price rather than hugging a
+// bar edge, which keeps them visually distinct from every bar-anchored
+// touch/observation/prediction/outcome glyph. Entry = pale circle at the honest
+// fill; exit = square at the exit fill, green/red by realized optimistic points.
+const EXECUTION_ENTRY_COLOR = '#e8f1f8';
+
+export const normalizeExecutionMarkers = (
+  openPositions: OpenPosition[],
+  closed: ClosedExecution[],
+  resolve: (iso: string) => UTCTimestamp | null,
+): MarkerOverlay[] => {
+  const markers: MarkerOverlay[] = [];
+  const entrySeen = new Set<string>();
+  const pushEntry = (predictionId: string, direction: string, entryTsUtc: string, entryPrice: number, open: boolean) => {
+    if (entrySeen.has(predictionId)) return;
+    entrySeen.add(predictionId);
+    const time = resolve(entryTsUtc);
+    if (time === null) return;
+    markers.push({
+      id: `exec-entry:${predictionId}`,
+      time,
+      position: 'atPriceMiddle',
+      price: entryPrice,
+      shape: 'circle',
+      color: EXECUTION_ENTRY_COLOR,
+      text: `${open ? 'open ' : ''}${direction} @ ${entryPrice.toFixed(2)}`,
+    } satisfies MarkerOverlay);
+  };
+  const sortedOpen = [...openPositions].sort((a, b) => new Date(a.entryTsUtc).getTime() - new Date(b.entryTsUtc).getTime());
+  const sortedClosed = [...closed].sort((a, b) => new Date(a.entryTsUtc).getTime() - new Date(b.entryTsUtc).getTime());
+  // Closed executions first so a just-closed position keeps one entry marker
+  // even if a stale open card briefly coexists in the stores.
+  for (const execution of sortedClosed) pushEntry(execution.predictionId, execution.direction, execution.entryTsUtc, execution.entryPrice, false);
+  for (const position of sortedOpen) pushEntry(position.predictionId, position.direction, position.entryTsUtc, position.entryPrice, true);
+  for (const execution of sortedClosed) {
+    const time = resolve(execution.exitTsUtc ?? execution.entryTsUtc);
+    if (time === null) continue;
+    const win = execution.points > 0;
+    markers.push({
+      id: `exec-exit:${execution.predictionId}`,
+      time,
+      position: 'atPriceMiddle',
+      price: execution.exitPrice,
+      shape: 'square',
+      color: win ? '#36d399' : '#ff6b6b',
+      text: `exit ${win ? '+' : ''}${execution.points.toFixed(2)} pts (${execution.reason.replaceAll('_', ' ')})`,
+    } satisfies MarkerOverlay);
+  }
+  return markers;
+};
+
+export const combineMarkers = (touches: MarketTouch[], observations: Observation[], predictions: Prediction[], bars: ChartBar[], openPositions: OpenPosition[] = [], closedExecutions: ClosedExecution[] = []): MarkerOverlay[] => {
   const resolve = createChartTimeResolver(bars);
   const deduped = new Map<string, MarkerOverlay>();
   for (const marker of [
@@ -221,6 +273,7 @@ export const combineMarkers = (touches: MarketTouch[], observations: Observation
     ...normalizeObservationMarkers(observations, resolve),
     ...normalizePredictionMarkers(predictions, resolve),
     ...normalizeOutcomeMarkers(predictions, resolve),
+    ...normalizeExecutionMarkers(openPositions, closedExecutions, resolve),
   ]) deduped.set(marker.id, marker);
   return [...deduped.values()].sort((a, b) => Number(a.time) - Number(b.time));
 };

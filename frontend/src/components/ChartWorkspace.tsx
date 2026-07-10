@@ -1,7 +1,7 @@
 import { useMemo } from 'react';
 import { combineMarkers, normalizeBarsForTimeframe, normalizeLevels } from '../chart/viewModels';
 import { TradingChart } from './TradingChart';
-import { marketStore, useConnection, useIntelligence, useMarket, usePredictions, useRuntime } from '../state/stores';
+import { marketStore, useConnection, useExecutions, useIntelligence, useMarket, usePredictions, useRuntime } from '../state/stores';
 import type { Timeframe } from '../domain/models';
 
 const TIMEFRAMES: Timeframe[] = [147, 987, 2000];
@@ -16,13 +16,15 @@ export function ChartWorkspace() {
   const touches = useIntelligence((state) => state.touches);
   const observations = useIntelligence((state) => state.observations);
   const predictions = usePredictions();
+  const openPositions = useExecutions((state) => state.openPositions);
+  const closedExecutions = useExecutions((state) => state.closed);
   const feedReady = useRuntime((state) => state.feedReady);
   const apiOnline = useRuntime((state) => state.apiOnline);
   const wsStatus = useConnection((state) => state.wsStatus);
 
   const bars = useMemo(() => normalizeBarsForTimeframe([...currentBars, ...recentClosedBars], selectedTimeframe), [currentBars, recentClosedBars, selectedTimeframe]);
   const levelOverlays = useMemo(() => normalizeLevels(levels), [levels]);
-  const markerOverlays = useMemo(() => combineMarkers(touches, observations, predictions, bars), [touches, observations, predictions, bars]);
+  const markerOverlays = useMemo(() => combineMarkers(touches, observations, predictions, bars, openPositions, closedExecutions), [touches, observations, predictions, bars, openPositions, closedExecutions]);
 
   return (
     <section className="panel chart-panel">

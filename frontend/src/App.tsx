@@ -5,6 +5,7 @@ import { realtimeClient } from './realtime/client';
 import { addBlotterEvent, liveStore, replayStore, runtimeStore } from './state/stores';
 import { TopStatusBar } from './components/TopStatusBar';
 import { ChartWorkspace } from './components/ChartWorkspace';
+import { ExecutionsPanel } from './components/ExecutionsPanel';
 import { IntelligencePanel } from './components/IntelligencePanel';
 import { EventBlotter } from './components/EventBlotter';
 import { ReplayControls } from './components/ReplayControls';
@@ -67,6 +68,7 @@ export function App() {
             <ChartWorkspace />
             <IntelligencePanel />
           </section>
+          <ExecutionsPanel />
           <EventBlotter />
         </>
       ) : (

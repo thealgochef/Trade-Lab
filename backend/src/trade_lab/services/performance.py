@@ -107,6 +107,7 @@ class PerformanceReport:
     anomalies: dict[str, Any]
     pricing: dict[str, Any]
     oos_comparison: dict[str, Any] | None
+    executions: dict[str, Any] | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -118,6 +119,7 @@ class PerformanceReport:
             "anomalies": self.anomalies,
             "pricing": self.pricing,
             "oos_comparison": self.oos_comparison,
+            "executions": self.executions,
         }
 
 
@@ -375,14 +377,17 @@ def aggregate_performance(
     filters: PerformanceFilters | None = None,
     models_root: Path | None = None,
     bundle_dir: Path | None = None,
+    executions_dir: Path | None = None,
 ) -> PerformanceReport:
     """Aggregate the journal directory into a :class:`PerformanceReport`.
 
     ``models_root`` enables per-row pricing from each row's own ``bundle_id``
     contract; ``bundle_dir`` supplies the fallback ("active") contract AND
-    enables the OOS comparison section. Raises :class:`JournalDirectoryNotFound`
-    when the directory is absent and :class:`InvalidPerformanceFilter` on
-    out-of-domain filter values.
+    enables the OOS comparison section; ``executions_dir`` enables the EXEC P3d
+    paper-execution summary (``None`` section when unset or the directory does
+    not exist yet). Raises :class:`JournalDirectoryNotFound` when the journal
+    directory is absent and :class:`InvalidPerformanceFilter` on out-of-domain
+    filter values.
     """
 
     filters = filters or PerformanceFilters()
@@ -773,6 +778,12 @@ def aggregate_performance(
         "eligibility": filters.eligibility,
     }
 
+    executions = (
+        aggregate_executions(executions_dir, filters=filters)
+        if executions_dir is not None
+        else None
+    )
+
     return PerformanceReport(
         applied_filters=applied_filters,
         headline=headline,
@@ -782,7 +793,181 @@ def aggregate_performance(
         anomalies=anomalies,
         pricing=pricing_section,
         oos_comparison=oos_comparison,
+        executions=executions,
     )
+
+
+# ---------------------------------------------------------------------------
+# Paper-execution summary (EXEC P3d)
+# ---------------------------------------------------------------------------
+
+
+def aggregate_executions(
+    executions_dir: Path, *, filters: PerformanceFilters | None = None
+) -> dict[str, Any] | None:
+    """Summarize the paper-execution journal — ONE function, counted buckets.
+
+    Returns ``None`` when the directory does not exist (the surface stays dark
+    until the tracker writes its first file). Reads every ``*.jsonl`` with the
+    same discipline as the prediction-journal reader: unreadable files and
+    decode errors are counted and salvaged, malformed lines counted, unknown
+    row types counted — nothing silently dropped.
+
+    Realized P&L comes from ``close`` rows, filtered by mode/bundle/session and
+    the trading-day window (a close row is dated by its own ``ts_utc`` — the
+    realization instant; undated close rows are counted, not guessed). The
+    eligibility filter needs no row check: v1 tracks eligible predictions only,
+    so ``eligibility="ineligible"`` scopes the realized block to zero. Close
+    rows missing numeric points land in ``closes_missing_pnl`` and are excluded
+    from the sums — never treated as zero.
+    """
+
+    filters = filters or PerformanceFilters()
+    filters.validate()
+    try:
+        if not executions_dir.is_dir():
+            return None
+    except OSError:
+        return None
+
+    summary: dict[str, Any] = {
+        "note": (
+            "paper executions (observer-derived fills; optimistic = exact "
+            "anchor/barriers, conservative = 1-tick-adverse entry + 1-tick-adverse "
+            "sl exit); close rows filtered like the journal, dated by their exit ts"
+        ),
+        "files_scanned": 0,
+        "unreadable_files": 0,
+        "decode_error_files": 0,
+        "lines_total": 0,
+        "malformed_lines": 0,
+        "unknown_type_rows": 0,
+        "undated_close_rows": 0,
+        "opens_total": 0,
+        "closes_total": 0,
+        "resets_total": 0,
+        "reset_cleared_positions": 0,
+        "closes_outside_filters": 0,
+        "closes_missing_pnl": 0,
+    }
+
+    def _in_window(day: date) -> bool:
+        if filters.from_day is not None and day < filters.from_day:
+            return False
+        return not (filters.to_day is not None and day > filters.to_day)
+
+    realized_count = 0
+    points = 0.0
+    points_conservative = 0.0
+    dollars = 0.0
+    dollars_conservative = 0.0
+    wins = 0
+    losses = 0
+    by_reason: dict[str, dict[str, Any]] = {}
+
+    for file in sorted(executions_dir.glob("*.jsonl"), key=lambda p: p.name):
+        summary["files_scanned"] += 1
+        try:
+            data = file.read_bytes()
+        except OSError:
+            summary["unreadable_files"] += 1
+            logger.warning("performance: executions file is unreadable: %s", file.name)
+            continue
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            summary["decode_error_files"] += 1
+            logger.warning(
+                "performance: executions file has undecodable bytes: %s", file.name
+            )
+            text = data.decode("utf-8", errors="replace")
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            summary["lines_total"] += 1
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                summary["malformed_lines"] += 1
+                continue
+            if not isinstance(row, dict):
+                summary["malformed_lines"] += 1
+                continue
+            row_type = row.get("type")
+            if row_type == "open":
+                summary["opens_total"] += 1
+                continue
+            if row_type == "reset":
+                summary["resets_total"] += 1
+                cleared = row.get("cleared")
+                if isinstance(cleared, int):
+                    summary["reset_cleared_positions"] += cleared
+                continue
+            if row_type != "close":
+                summary["unknown_type_rows"] += 1
+                continue
+
+            summary["closes_total"] += 1
+            if filters.eligibility == "ineligible":
+                # v1 tracks eligible predictions only — nothing can match.
+                summary["closes_outside_filters"] += 1
+                continue
+            if filters.mode != "all" and row.get("mode") != filters.mode:
+                summary["closes_outside_filters"] += 1
+                continue
+            if filters.bundle_id is not None and row.get("bundle_id") != filters.bundle_id:
+                summary["closes_outside_filters"] += 1
+                continue
+            if filters.session is not None and row.get("session") != filters.session:
+                summary["closes_outside_filters"] += 1
+                continue
+            if filters.from_day is not None or filters.to_day is not None:
+                ts = _parse_ts(row.get("ts_utc"))
+                if ts is None:
+                    summary["undated_close_rows"] += 1
+                    continue
+                if not _in_window(trading_day_for(ts)):
+                    summary["closes_outside_filters"] += 1
+                    continue
+            row_points = row.get("points")
+            row_points_cons = row.get("points_conservative")
+            if not isinstance(row_points, int | float) or not isinstance(
+                row_points_cons, int | float
+            ):
+                summary["closes_missing_pnl"] += 1
+                continue
+            realized_count += 1
+            points += float(row_points)
+            points_conservative += float(row_points_cons)
+            row_dollars = row.get("dollars")
+            row_dollars_cons = row.get("dollars_conservative")
+            if isinstance(row_dollars, int | float):
+                dollars += float(row_dollars)
+            if isinstance(row_dollars_cons, int | float):
+                dollars_conservative += float(row_dollars_cons)
+            if float(row_points) > 0:
+                wins += 1
+            else:
+                losses += 1
+            reason = row.get("reason") if isinstance(row.get("reason"), str) else "unknown"
+            bucket = by_reason.setdefault(
+                reason, {"count": 0, "points": 0.0, "points_conservative": 0.0}
+            )
+            bucket["count"] += 1
+            bucket["points"] += float(row_points)
+            bucket["points_conservative"] += float(row_points_cons)
+
+    summary["realized"] = {
+        "count": realized_count,
+        "points": points,
+        "points_conservative": points_conservative,
+        "dollars": dollars,
+        "dollars_conservative": dollars_conservative,
+        "wins": wins,
+        "losses": losses,
+        "by_reason": by_reason,
+    }
+    return summary
 
 
 # ---------------------------------------------------------------------------

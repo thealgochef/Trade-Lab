@@ -80,7 +80,7 @@ export type WarningMetadata = {
 export type BlotterEvent = {
   id: string;
   timeUtc: string;
-  category: 'system' | 'feed' | 'warning' | 'market' | 'level' | 'touch' | 'observation' | 'replay' | 'live';
+  category: 'system' | 'feed' | 'warning' | 'market' | 'level' | 'touch' | 'observation' | 'execution' | 'replay' | 'live';
   severity: 'info' | 'warning' | 'error';
   message: string;
   code?: string;
@@ -154,6 +154,50 @@ export type DroppedPrediction = {
   reason: string;
   decisionTsUtc: string;
   entryPrice: number | null;
+};
+
+// EXEC P3: paper-execution positions derived by the backend observer tracker.
+// Both P&L columns ride every position: optimistic (exact anchor/barriers) and
+// conservative (1-tick-adverse entry; 1-tick-adverse sl exit).
+export type OpenPosition = {
+  predictionId: string;
+  touchId: string;
+  direction: string;
+  contracts: number;
+  entryTsUtc: string;
+  entryPrice: number;
+  entryPriceConservative: number;
+  tpPrice: number;
+  slPrice: number;
+  session: string;
+  levelKind: string;
+  bundleId: string;
+  mode: string;
+  pointValue: number;
+  lastPrice: number | null;
+  unrealizedPoints: number | null;
+  unrealizedPointsConservative: number | null;
+};
+
+export type ClosedExecution = {
+  predictionId: string;
+  touchId: string;
+  direction: string;
+  contracts: number;
+  entryTsUtc: string;
+  exitTsUtc: string | null;
+  reason: string;
+  entryPrice: number;
+  entryPriceConservative: number;
+  exitPrice: number;
+  exitPriceConservative: number;
+  points: number;
+  pointsConservative: number;
+  dollars: number;
+  dollarsConservative: number;
+  pointValue: number;
+  session: string;
+  levelKind: string;
 };
 
 export type ModelStatus = {

@@ -1,9 +1,9 @@
 import { config } from '../config';
 import { MAX_BARS_PER_TIMEFRAME, barKey, isSupportedTimeframe } from '../chart/viewModels';
-import { addBlotterEvent, addDropped, addOutcome, addPrediction, clearPredictions, connectionStore, intelligenceStore, liveStore, marketStore, predictionStore, replayStore, runtimeStore, setModelStatus } from '../state/stores';
-import { normalizeBar, normalizeDropped, normalizeLevel, normalizeModelStatus, normalizeObservation, normalizeOutcome, normalizePrediction, normalizeTouch, normalizeWarning } from '../domain/normalize';
+import { addBlotterEvent, addDropped, addOpenPosition, addOutcome, addPrediction, clearExecutions, clearPredictions, closeOpenPosition, connectionStore, intelligenceStore, liveStore, marketStore, predictionStore, replayStore, runtimeStore, setModelStatus, setOpenPositions } from '../state/stores';
+import { normalizeBar, normalizeClosedExecution, normalizeDropped, normalizeLevel, normalizeModelStatus, normalizeObservation, normalizeOpenPosition, normalizeOutcome, normalizePrediction, normalizeTouch, normalizeWarning } from '../domain/normalize';
 import type { MarketBar } from '../domain/models';
-import type { BarDTO, DataQualityWarningDTO, DisplayLevelDTO, DroppedPredictionDTO, Envelope, FeedStatusDTO, ModelStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, SnapshotPayloadDTO, TouchDTO } from './types';
+import type { BarDTO, ClosedExecutionDTO, DataQualityWarningDTO, DisplayLevelDTO, DroppedPredictionDTO, Envelope, FeedStatusDTO, ModelStatusDTO, ObservationDTO, OpenPositionDTO, OutcomeDTO, PredictionDTO, SnapshotPayloadDTO, TouchDTO } from './types';
 
 type WebSocketFactory = (url: string) => WebSocket;
 
@@ -144,6 +144,18 @@ export class RealtimeClient {
         addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'observation', severity: 'info', message: `Prediction dropped (${dropped.reason})`, sequence: envelope.sequence });
         break;
       }
+      case 'position.opened': {
+        const position = normalizeOpenPosition((envelope.payload as { position: OpenPositionDTO }).position);
+        addOpenPosition(position);
+        addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'execution', severity: 'info', message: `Paper position opened (${position.direction} @ ${position.entryPrice.toFixed(2)})`, sequence: envelope.sequence });
+        break;
+      }
+      case 'position.closed': {
+        const execution = normalizeClosedExecution((envelope.payload as { execution: ClosedExecutionDTO }).execution);
+        closeOpenPosition(execution);
+        addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'execution', severity: 'info', message: `Paper position closed (${execution.reason}, ${execution.points >= 0 ? '+' : ''}${execution.points.toFixed(2)} pts)`, sequence: envelope.sequence });
+        break;
+      }
       case 'model.status':
         setModelStatus(normalizeModelStatus(envelope.payload as ModelStatusDTO));
         addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'system', severity: 'info', message: 'Model status updated', sequence: envelope.sequence });
@@ -159,6 +171,9 @@ export class RealtimeClient {
           intelligenceStore.setState({ levels: [], touches: [], observations: [] });
         }
         clearPredictions();
+        // EXEC P3: the backend tracker clears its positions on every reset
+        // reason (activation included); mirror it so no phantom cards linger.
+        clearExecutions();
         addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'system', severity: 'info', message: `Model reset (${reason})`, sequence: envelope.sequence });
         break;
       }
@@ -198,6 +213,10 @@ export class RealtimeClient {
       dropped,
       modelStatus: payload.model_status ? normalizeModelStatus(payload.model_status) : current.modelStatus,
     }));
+    // EXEC P3: the snapshot's open-position block replaces the open set; the
+    // closed table is delta-fed only (durable history lives in the executions
+    // journal, surfaced on the Performance page).
+    setOpenPositions((payload.open_positions ?? []).map(normalizeOpenPosition));
     runtimeStore.setState((current) => ({ ...current, session: payload.session ?? null, tradingDay: payload.trading_day ?? null }));
     this.applyFeedStatus(payload.feed_status);
   }

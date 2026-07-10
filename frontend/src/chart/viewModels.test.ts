@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { MAX_BARS_PER_TIMEFRAME, combineMarkers, createChartTimeResolver, normalizeBarsForTimeframe, normalizeLevels, normalizeObservationMarkers, normalizeOutcomeMarkers, normalizePredictionMarkers, normalizeTouchMarkers } from './viewModels';
-import type { MarketBar, MarketLevel, MarketTouch, Observation, Outcome, Prediction } from '../domain/models';
+import { MAX_BARS_PER_TIMEFRAME, combineMarkers, createChartTimeResolver, normalizeBarsForTimeframe, normalizeExecutionMarkers, normalizeLevels, normalizeObservationMarkers, normalizeOutcomeMarkers, normalizePredictionMarkers, normalizeTouchMarkers } from './viewModels';
+import type { ClosedExecution, MarketBar, MarketLevel, MarketTouch, Observation, OpenPosition, Outcome, Prediction } from '../domain/models';
 
 const bar = (overrides: Partial<MarketBar>): MarketBar => ({
   timeframe: 147,
@@ -341,5 +341,92 @@ describe('chart view model normalization', () => {
     expect(markers.map((marker) => marker.id).sort()).toEqual(['outcome:o-now', 'prediction:p-now']);
     expect(markers.every((marker) => marker.time === bars[1].time)).toBe(true);
     expect(markers.some((marker) => marker.time === bars[0].time)).toBe(false);
+  });
+});
+
+const openPosition = (overrides: Partial<OpenPosition> = {}): OpenPosition => ({
+  predictionId: 'pred-open',
+  touchId: 'touch-1',
+  direction: 'long',
+  contracts: 1,
+  entryTsUtc: '2026-05-21T14:00:05Z',
+  entryPrice: 23000,
+  entryPriceConservative: 23000.25,
+  tpPrice: 23015,
+  slPrice: 22970,
+  session: 'ny',
+  levelKind: 'pdl',
+  bundleId: 'bundle-a',
+  mode: 'replay',
+  pointValue: 20,
+  lastPrice: null,
+  unrealizedPoints: null,
+  unrealizedPointsConservative: null,
+  ...overrides,
+});
+
+const closedExecution = (overrides: Partial<ClosedExecution> = {}): ClosedExecution => ({
+  predictionId: 'pred-closed',
+  touchId: 'touch-2',
+  direction: 'long',
+  contracts: 1,
+  entryTsUtc: '2026-05-21T14:00:05Z',
+  exitTsUtc: '2026-05-21T14:01:05Z',
+  reason: 'tp_hit',
+  entryPrice: 23000,
+  entryPriceConservative: 23000.25,
+  exitPrice: 23015,
+  exitPriceConservative: 23015,
+  points: 15,
+  pointsConservative: 14.75,
+  dollars: 300,
+  dollarsConservative: 295,
+  pointValue: 20,
+  session: 'ny',
+  levelKind: 'pdl',
+  ...overrides,
+});
+
+describe('paper-execution markers (EXEC P3b)', () => {
+  const execBars = () => normalizeBarsForTimeframe([
+    bar({ barIndex: 0, barId: '147t:2026-05-21:0', openTimeUtc: '2026-05-21T14:00:00Z', closeTimeUtc: '2026-05-21T14:00:10Z' }),
+    bar({ barIndex: 1, barId: '147t:2026-05-21:1', openTimeUtc: '2026-05-21T14:01:00Z', closeTimeUtc: '2026-05-21T14:01:10Z' }),
+  ], 147);
+
+  it('anchors entry and exit markers at the FILL PRICES (price-anchored, not bar-hugging)', () => {
+    const bars = execBars();
+    const resolve = createChartTimeResolver(bars);
+    const markers = normalizeExecutionMarkers([openPosition()], [closedExecution()], resolve);
+
+    const entryOpen = markers.find((marker) => marker.id === 'exec-entry:pred-open');
+    const entryClosed = markers.find((marker) => marker.id === 'exec-entry:pred-closed');
+    const exit = markers.find((marker) => marker.id === 'exec-exit:pred-closed');
+    expect(entryOpen).toMatchObject({ position: 'atPriceMiddle', price: 23000, shape: 'circle', time: bars[0].time });
+    expect(entryOpen?.text).toContain('open long @ 23000.00');
+    expect(entryClosed).toMatchObject({ position: 'atPriceMiddle', price: 23000, shape: 'circle' });
+    expect(exit).toMatchObject({ position: 'atPriceMiddle', price: 23015, shape: 'square', time: bars[1].time, color: '#36d399' });
+    expect(exit?.text).toContain('+15.00 pts (tp hit)');
+  });
+
+  it('colors losing exits red and keeps one entry marker per prediction id', () => {
+    const bars = execBars();
+    const resolve = createChartTimeResolver(bars);
+    const loser = closedExecution({ predictionId: 'pred-open', reason: 'sl_hit', exitPrice: 22970, points: -30, pointsConservative: -30.5 });
+    // The same prediction appears both as a (stale) open card and as closed:
+    // exactly one entry marker survives.
+    const markers = normalizeExecutionMarkers([openPosition()], [loser], resolve);
+    expect(markers.filter((marker) => marker.id.startsWith('exec-entry:')).length).toBe(1);
+    const exit = markers.find((marker) => marker.id === 'exec-exit:pred-open');
+    expect(exit).toMatchObject({ color: '#ff6b6b', price: 22970 });
+  });
+
+  it('drops execution markers whose timestamps predate the loaded bars and rides combineMarkers', () => {
+    const bars = execBars();
+    const stale = openPosition({ predictionId: 'pred-stale', entryTsUtc: '2026-05-21T08:00:00Z' });
+    const markers = combineMarkers([], [], [], bars, [stale, openPosition()], [closedExecution()]);
+    const ids = markers.map((marker) => marker.id);
+    expect(ids).not.toContain('exec-entry:pred-stale');
+    expect(ids).toContain('exec-entry:pred-open');
+    expect(ids).toContain('exec-exit:pred-closed');
   });
 });

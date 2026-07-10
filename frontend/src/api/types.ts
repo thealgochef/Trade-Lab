@@ -251,6 +251,36 @@ export type PerformanceOOSComparisonDTO = {
   };
 };
 
+// EXEC P3d: paper-execution summary — realized P&L in BOTH columns (optimistic
+// exact anchor/barriers; conservative 1-tick-adverse entry + sl exit), plus the
+// counted read/anomaly buckets from the executions journal directory.
+export type PerformanceExecutionsDTO = {
+  note: string;
+  files_scanned: number;
+  unreadable_files: number;
+  decode_error_files: number;
+  lines_total: number;
+  malformed_lines: number;
+  unknown_type_rows: number;
+  undated_close_rows: number;
+  opens_total: number;
+  closes_total: number;
+  resets_total: number;
+  reset_cleared_positions: number;
+  closes_outside_filters: number;
+  closes_missing_pnl: number;
+  realized: {
+    count: number;
+    points: number;
+    points_conservative: number;
+    dollars: number;
+    dollars_conservative: number;
+    wins: number;
+    losses: number;
+    by_reason: Record<string, { count: number; points: number; points_conservative: number }>;
+  };
+};
+
 export type PerformanceReportDTO = {
   applied_filters: {
     mode: string;
@@ -271,6 +301,7 @@ export type PerformanceReportDTO = {
     fallback_contract: { tp_points: number; sl_points: number; point_value: number | null } | null;
   };
   oos_comparison: PerformanceOOSComparisonDTO | null;
+  executions: PerformanceExecutionsDTO | null;
 };
 
 export type PerformanceQuery = {

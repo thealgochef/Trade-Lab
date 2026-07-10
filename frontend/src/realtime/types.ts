@@ -11,6 +11,8 @@ export type MessageType =
   | 'prediction.created'
   | 'prediction.resolved'
   | 'prediction.dropped'
+  | 'position.opened'
+  | 'position.closed'
   | 'model.status'
   | 'model.reset';
 
@@ -130,6 +132,47 @@ export type DroppedPredictionDTO = {
   entry_price: number | null;
 };
 
+export type OpenPositionDTO = {
+  prediction_id: string;
+  touch_id: string;
+  direction: string;
+  contracts: number;
+  entry_ts_utc: string;
+  entry_price: number;
+  entry_price_conservative: number;
+  tp_price: number;
+  sl_price: number;
+  session: string;
+  level_kind: string;
+  bundle_id: string;
+  mode: string;
+  point_value: number;
+  last_price: number | null;
+  unrealized_points: number | null;
+  unrealized_points_conservative: number | null;
+};
+
+export type ClosedExecutionDTO = {
+  prediction_id: string;
+  touch_id: string;
+  direction: string;
+  contracts: number;
+  entry_ts_utc: string;
+  exit_ts_utc: string | null;
+  reason: string;
+  entry_price: number;
+  entry_price_conservative: number;
+  exit_price: number;
+  exit_price_conservative: number;
+  points: number;
+  points_conservative: number;
+  dollars: number;
+  dollars_conservative: number;
+  point_value: number;
+  session: string;
+  level_kind: string;
+};
+
 export type ModelStatusDTO = {
   loaded: boolean;
   model_id: string | null;
@@ -152,6 +195,7 @@ export type SnapshotPayloadDTO = {
   predictions: PredictionDTO[];
   outcomes: OutcomeDTO[];
   dropped?: DroppedPredictionDTO[];
+  open_positions?: OpenPositionDTO[];
   model_status: ModelStatusDTO;
   session: string | null;
   trading_day: string | null;

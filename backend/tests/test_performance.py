@@ -495,7 +495,10 @@ def test_payload_shape(tmp_path: Path) -> None:
         "anomalies",
         "pricing",
         "oos_comparison",
+        "executions",
     }
+    # No executions_dir supplied -> the EXEC P3d section stays None.
+    assert payload["executions"] is None
     assert set(payload["applied_filters"]) == {
         "mode",
         "from",

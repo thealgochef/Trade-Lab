@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { RealtimeClient } from './client';
-import { blotterStore, connectionStore, intelligenceStore, liveStore, marketStore, predictionStore, replayStore, runtimeStore } from '../state/stores';
-import type { BarDTO, DataQualityWarningDTO, DroppedPredictionDTO, Envelope, FeedStatusDTO, ModelStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, SnapshotPayloadDTO, TouchDTO } from './types';
+import { blotterStore, connectionStore, executionStore, intelligenceStore, liveStore, marketStore, predictionStore, replayStore, runtimeStore } from '../state/stores';
+import type { BarDTO, ClosedExecutionDTO, DataQualityWarningDTO, DroppedPredictionDTO, Envelope, FeedStatusDTO, ModelStatusDTO, ObservationDTO, OpenPositionDTO, OutcomeDTO, PredictionDTO, SnapshotPayloadDTO, TouchDTO } from './types';
 import { MAX_BARS_PER_TIMEFRAME } from '../chart/viewModels';
 import { normalizeBar, normalizeWarning } from '../domain/normalize';
 
@@ -39,6 +39,7 @@ const resetStores = () => {
   replayStore.reset();
   liveStore.reset();
   predictionStore.reset();
+  executionStore.reset();
 };
 
 const feedStatus = (state = 'connected'): FeedStatusDTO => ({
@@ -155,6 +156,49 @@ const droppedDto = (overrides: Partial<DroppedPredictionDTO> = {}): DroppedPredi
   reason: 'flatten',
   decision_ts_utc: '2026-05-21T20:41:00Z',
   entry_price: null,
+  ...overrides,
+});
+
+const openPositionDto = (overrides: Partial<OpenPositionDTO> = {}): OpenPositionDTO => ({
+  prediction_id: 'pred-1',
+  touch_id: 'touch-1',
+  direction: 'long',
+  contracts: 1,
+  entry_ts_utc: '2026-05-21T14:02:00Z',
+  entry_price: 23000,
+  entry_price_conservative: 23000.25,
+  tp_price: 23015,
+  sl_price: 22970,
+  session: 'ny',
+  level_kind: 'pdh',
+  bundle_id: 'model-a',
+  mode: 'live',
+  point_value: 20,
+  last_price: 23000,
+  unrealized_points: 0,
+  unrealized_points_conservative: -0.25,
+  ...overrides,
+});
+
+const closedExecutionDto = (overrides: Partial<ClosedExecutionDTO> = {}): ClosedExecutionDTO => ({
+  prediction_id: 'pred-1',
+  touch_id: 'touch-1',
+  direction: 'long',
+  contracts: 1,
+  entry_ts_utc: '2026-05-21T14:02:00Z',
+  exit_ts_utc: '2026-05-21T14:12:00Z',
+  reason: 'tp_hit',
+  entry_price: 23000,
+  entry_price_conservative: 23000.25,
+  exit_price: 23015,
+  exit_price_conservative: 23015,
+  points: 15,
+  points_conservative: 14.75,
+  dollars: 300,
+  dollars_conservative: 295,
+  point_value: 20,
+  session: 'ny',
+  level_kind: 'pdh',
   ...overrides,
 });
 
@@ -317,6 +361,47 @@ describe('RealtimeClient', () => {
     expect(predictionStore.getSnapshot().predictions).toHaveLength(0);
     expect(predictionStore.getSnapshot().outcomes).toHaveLength(0);
     expect(predictionStore.getSnapshot().dropped).toHaveLength(0);
+  });
+
+  it('routes position.opened/closed into the execution store with blotter events', () => {
+    client.start();
+
+    sockets[0].message(envelope('position.opened', { position: openPositionDto() }));
+    expect(executionStore.getSnapshot().openPositions[0]).toMatchObject({ predictionId: 'pred-1', direction: 'long', entryPrice: 23000, entryPriceConservative: 23000.25, tpPrice: 23015, slPrice: 22970 });
+    expect(blotterStore.getSnapshot().events.some((event) => event.category === 'execution' && event.message === 'Paper position opened (long @ 23000.00)')).toBe(true);
+
+    sockets[0].message(envelope('position.closed', { execution: closedExecutionDto() }));
+    expect(executionStore.getSnapshot().openPositions).toHaveLength(0);
+    expect(executionStore.getSnapshot().closed[0]).toMatchObject({ predictionId: 'pred-1', reason: 'tp_hit', points: 15, pointsConservative: 14.75 });
+    expect(blotterStore.getSnapshot().events.some((event) => event.category === 'execution' && event.message === 'Paper position closed (tp_hit, +15.00 pts)')).toBe(true);
+  });
+
+  it('seeds open positions from the snapshot block and clears executions on model.reset', () => {
+    client.start();
+    sockets[0].message(envelope('position.closed', { execution: closedExecutionDto({ prediction_id: 'pred-old' }) }));
+
+    const snapshot: SnapshotPayloadDTO = {
+      current_bars: [],
+      recent_closed_bars: [],
+      display_levels: [],
+      active_observations: [],
+      feed_status: feedStatus('connected'),
+      warnings: [],
+      predictions: [],
+      outcomes: [],
+      open_positions: [openPositionDto({ prediction_id: 'pred-snap' })],
+      model_status: modelStatus(),
+      session: 'ny',
+      trading_day: '2026-05-21',
+    };
+    sockets[0].message(envelope('system.snapshot', snapshot));
+    expect(executionStore.getSnapshot().openPositions).toHaveLength(1);
+    expect(executionStore.getSnapshot().openPositions[0].predictionId).toBe('pred-snap');
+    // The closed table is delta-fed; the snapshot does not rewrite it.
+    expect(executionStore.getSnapshot().closed).toHaveLength(1);
+
+    sockets[0].message(envelope('model.reset', { reason: 'replay_reset' }));
+    expect(executionStore.getSnapshot()).toEqual({ openPositions: [], closed: [] });
   });
 
   it('converts provider warning metadata into blotter code, source, and safe details only', () => {

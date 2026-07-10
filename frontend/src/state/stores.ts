@@ -1,9 +1,10 @@
 import { createStore, useStore } from './createStore';
-import type { BlotterEvent, DroppedPrediction, LiveStatus, MarketBar, MarketLevel, MarketTouch, ModelBundle, ModelStatus, Observation, Outcome, Prediction, ReplaySource, ReplayStatus, RuntimeSummary, Timeframe, Warning } from '../domain/models';
+import type { BlotterEvent, ClosedExecution, DroppedPrediction, LiveStatus, MarketBar, MarketLevel, MarketTouch, ModelBundle, ModelStatus, Observation, OpenPosition, Outcome, Prediction, ReplaySource, ReplayStatus, RuntimeSummary, Timeframe, Warning } from '../domain/models';
 
 const MAX_PREDICTIONS = 100;
 const MAX_OUTCOMES = 100;
 const MAX_DROPPED = 100;
+const MAX_CLOSED_EXECUTIONS = 100;
 
 export type PredictionState = {
   predictions: Prediction[];
@@ -116,6 +117,46 @@ export const predictionStore = createStore<PredictionState>({
   bundles: [],
 });
 
+// EXEC P3: paper-execution state. Open positions mirror the backend tracker
+// (upsert by prediction id; the snapshot replaces the set); closed executions
+// are a newest-first bounded ring fed by position.closed frames only — the
+// snapshot does not carry them, so a reconnect starts the table fresh while
+// the executions journal keeps durable history for the Performance page.
+export type ExecutionState = {
+  openPositions: OpenPosition[];
+  closed: ClosedExecution[];
+};
+
+export const executionStore = createStore<ExecutionState>({
+  openPositions: [],
+  closed: [],
+});
+
+export const addOpenPosition = (position: OpenPosition) => {
+  executionStore.setState((current) => ({
+    ...current,
+    openPositions: [position, ...current.openPositions.filter((entry) => entry.predictionId !== position.predictionId)],
+  }));
+};
+
+export const closeOpenPosition = (execution: ClosedExecution) => {
+  executionStore.setState((current) => ({
+    openPositions: current.openPositions.filter((entry) => entry.predictionId !== execution.predictionId),
+    closed: [execution, ...current.closed.filter((entry) => entry.predictionId !== execution.predictionId)].slice(0, MAX_CLOSED_EXECUTIONS),
+  }));
+};
+
+export const setOpenPositions = (openPositions: OpenPosition[]) => {
+  executionStore.setState((current) => ({ ...current, openPositions }));
+};
+
+// Mirrors the backend tracker's reset semantics: cleared positions vanish (no
+// phantom carry, no synthetic closes) and the session-scoped closed table
+// clears with the prediction panes.
+export const clearExecutions = () => {
+  executionStore.setState({ openPositions: [], closed: [] });
+};
+
 // Newest-first, bounded prediction history; the matching prediction is annotated
 // with its outcome (or drop) by prediction_id when one arrives so the UI can
 // render the resolved/dropped state without a second lookup.
@@ -173,6 +214,7 @@ export const useLive = <T = ReturnType<typeof liveStore.getSnapshot>>(selector?:
 export const usePredictions = <T = Prediction[]>(selector?: (predictions: Prediction[]) => T) => useStore(predictionStore, (state) => (selector ? selector(state.predictions) : (state.predictions as T)));
 export const useOutcomes = <T = Outcome[]>(selector?: (outcomes: Outcome[]) => T) => useStore(predictionStore, (state) => (selector ? selector(state.outcomes) : (state.outcomes as T)));
 export const useDropped = <T = DroppedPrediction[]>(selector?: (dropped: DroppedPrediction[]) => T) => useStore(predictionStore, (state) => (selector ? selector(state.dropped) : (state.dropped as T)));
+export const useExecutions = <T = ExecutionState>(selector?: (state: ExecutionState) => T) => useStore(executionStore, selector ?? ((state) => state as T));
 export const useModelStatus = <T = ModelStatus | null>(selector?: (modelStatus: ModelStatus | null) => T) => useStore(predictionStore, (state) => (selector ? selector(state.modelStatus) : (state.modelStatus as T)));
 export const useBundles = <T = ModelBundle[]>(selector?: (bundles: ModelBundle[]) => T) => useStore(predictionStore, (state) => (selector ? selector(state.bundles) : (state.bundles as T)));
 

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { addBlotterEvent, addDropped, addOutcome, addPrediction, blotterStore, clearPredictions, connectionStore, intelligenceStore, marketStore, predictionStore, runtimeStore, setModelStatus } from './stores';
-import type { DroppedPrediction, Outcome, Prediction } from '../domain/models';
+import { addBlotterEvent, addDropped, addOpenPosition, addOutcome, addPrediction, blotterStore, clearExecutions, clearPredictions, closeOpenPosition, connectionStore, executionStore, intelligenceStore, marketStore, predictionStore, runtimeStore, setModelStatus, setOpenPositions } from './stores';
+import type { ClosedExecution, DroppedPrediction, OpenPosition, Outcome, Prediction } from '../domain/models';
 
 const resetStores = () => {
   runtimeStore.reset();
@@ -9,6 +9,7 @@ const resetStores = () => {
   intelligenceStore.reset();
   blotterStore.reset();
   predictionStore.reset();
+  executionStore.reset();
 };
 
 const makePrediction = (id: string): Prediction => ({
@@ -175,6 +176,61 @@ describe('workstation stores', () => {
     expect(predictionStore.getSnapshot().outcomes).toEqual([]);
     expect(predictionStore.getSnapshot().dropped).toEqual([]);
     expect(predictionStore.getSnapshot().modelStatus).toMatchObject({ loaded: true, modelId: 'model-a' });
+  });
+
+  it('tracks paper executions: upsert opens, close moves to the bounded table, reset clears', () => {
+    const position: OpenPosition = {
+      predictionId: 'pred-1',
+      touchId: 'touch-1',
+      direction: 'long',
+      contracts: 1,
+      entryTsUtc: '2026-05-21T14:00:05Z',
+      entryPrice: 23000,
+      entryPriceConservative: 23000.25,
+      tpPrice: 23015,
+      slPrice: 22970,
+      session: 'ny',
+      levelKind: 'pdl',
+      bundleId: 'bundle-a',
+      mode: 'replay',
+      pointValue: 20,
+      lastPrice: null,
+      unrealizedPoints: null,
+      unrealizedPointsConservative: null,
+    };
+    addOpenPosition(position);
+    addOpenPosition({ ...position, entryPrice: 23001 }); // upsert by prediction id
+    expect(executionStore.getSnapshot().openPositions).toHaveLength(1);
+    expect(executionStore.getSnapshot().openPositions[0].entryPrice).toBe(23001);
+
+    const execution: ClosedExecution = {
+      predictionId: 'pred-1',
+      touchId: 'touch-1',
+      direction: 'long',
+      contracts: 1,
+      entryTsUtc: '2026-05-21T14:00:05Z',
+      exitTsUtc: '2026-05-21T14:10:00Z',
+      reason: 'tp_hit',
+      entryPrice: 23000,
+      entryPriceConservative: 23000.25,
+      exitPrice: 23015,
+      exitPriceConservative: 23015,
+      points: 15,
+      pointsConservative: 14.75,
+      dollars: 300,
+      dollarsConservative: 295,
+      pointValue: 20,
+      session: 'ny',
+      levelKind: 'pdl',
+    };
+    closeOpenPosition(execution);
+    expect(executionStore.getSnapshot().openPositions).toEqual([]);
+    expect(executionStore.getSnapshot().closed).toHaveLength(1);
+
+    setOpenPositions([position]);
+    expect(executionStore.getSnapshot().openPositions).toHaveLength(1);
+    clearExecutions();
+    expect(executionStore.getSnapshot()).toEqual({ openPositions: [], closed: [] });
   });
 
   it('stores backend offline state without requiring chart or intelligence data', () => {

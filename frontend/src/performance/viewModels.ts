@@ -10,6 +10,7 @@
 import type {
   MeanStatDTO,
   PerformanceDayDTO,
+  PerformanceExecutionsDTO,
   PerformanceHeadlineDTO,
   RatioDTO,
 } from '../api/types';
@@ -127,6 +128,63 @@ export function buildStatCards(
       tone: 'neutral',
     },
   ];
+}
+
+// --- paper-execution summary card (EXEC P3d) ---------------------------------
+
+export type ExecutionSummaryVM = {
+  show: boolean;
+  realizedLabel: string;
+  conservativeLabel: string;
+  countLabel: string;
+  reasons: { reason: string; count: number; points: string; pointsConservative: string }[];
+  anomalyNotes: string[];
+};
+
+// The card renders only when execution FILES exist — an executions directory
+// the tracker has never written to keeps the surface dark, and a summary with
+// zero closes still shows (honest "no realized executions yet" state).
+export function buildExecutionSummary(
+  executions: PerformanceExecutionsDTO | null | undefined,
+  options: { showDollars: boolean; dollarsPerPoint: number },
+): ExecutionSummaryVM {
+  if (!executions || executions.files_scanned === 0) {
+    return { show: false, realizedLabel: '—', conservativeLabel: '—', countLabel: '', reasons: [], anomalyNotes: [] };
+  }
+  const realized = executions.realized;
+  const realizedLabel = options.showDollars
+    ? formatMoney(realized.points, options.dollarsPerPoint)
+    : `${formatPoints(realized.points)} pts`;
+  const conservativeLabel = options.showDollars
+    ? formatMoney(realized.points_conservative, options.dollarsPerPoint)
+    : `${formatPoints(realized.points_conservative)} pts`;
+  const reasons = Object.entries(realized.by_reason)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([reason, bucket]) => ({
+      reason: reason.replaceAll('_', ' '),
+      count: bucket.count,
+      points: formatPoints(bucket.points),
+      pointsConservative: formatPoints(bucket.points_conservative),
+    }));
+  const anomalyNotes: string[] = [];
+  const flag = (label: string, value: number) => {
+    if (value > 0) anomalyNotes.push(`${label}: ${value}`);
+  };
+  flag('unreadable files', executions.unreadable_files);
+  flag('decode-error files', executions.decode_error_files);
+  flag('malformed lines', executions.malformed_lines);
+  flag('unknown rows', executions.unknown_type_rows);
+  flag('undated closes', executions.undated_close_rows);
+  flag('closes missing P&L', executions.closes_missing_pnl);
+  flag('outside filters', executions.closes_outside_filters);
+  return {
+    show: true,
+    realizedLabel,
+    conservativeLabel,
+    countLabel: `${realized.count} closed · ${realized.wins}W/${realized.losses}L · ${executions.opens_total} opens · ${executions.resets_total} resets (${executions.reset_cleared_positions} cleared)`,
+    reasons,
+    anomalyNotes,
+  };
 }
 
 // --- charts (SVG geometry) ----------------------------------------------------
