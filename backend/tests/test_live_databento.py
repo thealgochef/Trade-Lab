@@ -1015,6 +1015,115 @@ def test_warm_start_throttle_suppresses_replay_deltas_until_caught_up() -> None:
     assert len(snapshot_calls) >= 1
 
 
+def test_warm_throttle_never_suppresses_serving_deltas() -> None:
+    # EXEC verify fix (major): an update carrying prediction/outcome/drop deltas
+    # is forwarded even while the frontier lags (warm catch-up tail OR a
+    # mid-session >30s stall relapse). The paper-execution tracker observes ONLY
+    # broadcast updates and an outcome rides exactly one update — suppression
+    # would leave a paper position open forever with no close journal row, and a
+    # catch-up-tail prediction would never open. Market-only updates keep the
+    # existing throttle behaviour (snapshots, no per-event stream).
+    from datetime import date, timedelta
+    from types import MappingProxyType
+
+    from trade_lab.domain.candles import Candle
+    from trade_lab.domain.outcomes import DroppedPrediction, Outcome, ResolutionType
+    from trade_lab.services.inference.inference_engine import Prediction
+    from trade_lab.services.runtime import RuntimeUpdate
+
+    runtime = _runtime()
+    now = datetime(2026, 6, 16, 16, 0, 0, tzinfo=UTC)
+    update_calls: list[RuntimeUpdate] = []
+    snapshot_calls: list[bool] = []
+
+    async def on_update(update: RuntimeUpdate) -> None:
+        update_calls.append(update)
+
+    async def on_snapshot() -> None:
+        snapshot_calls.append(True)
+
+    live = LiveMarketDataService(
+        runtime,
+        _live_config(),
+        lambda _config: None,
+        on_update=on_update,
+        throttle_warm_start=True,
+        now_provider=lambda: now,
+    )
+    live.set_snapshot_callback(on_snapshot)
+    live._market_update_lag = 3600.0  # frontier deep behind wall clock
+    live._live_streaming = False
+
+    event_ts = now - timedelta(hours=1)
+    bar = Candle(
+        timeframe_ticks=2,
+        trading_day=date(2026, 6, 16),
+        bar_index=0,
+        bar_id="2t:2026-06-16:0",
+        open_ts_utc=event_ts,
+        close_ts_utc=event_ts,
+        open_ticks=68_000,
+        high_ticks=68_002,
+        low_ticks=67_998,
+        close_ticks=68_001,
+        volume=2,
+        trade_count=2,
+        is_complete=False,
+        is_partial=True,
+    )
+    prediction = Prediction(
+        prediction_id="pred-1",
+        touch_id="touch-1",
+        observation_id="obs-1",
+        event_ts_utc=event_ts,
+        predicted_class="tradeable_reversal",
+        probabilities=MappingProxyType({"tradeable_reversal": 1.0}),
+        feature_values=MappingProxyType({}),
+        level_kind="pdl",
+        level_price_ticks=68_000,
+        direction="long",
+        session="ny",
+        is_eligible=True,
+        model_id="m-1",
+        contract_id="m-1",
+        nan_count=0,
+    )
+    outcome = Outcome(
+        outcome_id="out-1",
+        prediction_id="pred-1",
+        touch_id="touch-1",
+        resolution_type=ResolutionType.TP_HIT,
+        actual_class="tradeable_reversal",
+        predicted_class="tradeable_reversal",
+        correct=True,
+        max_mfe_pts=16.0,
+        max_mae_pts=1.0,
+        bars_to_resolution=0,
+        resolved_ts_utc=event_ts,
+        entry_price=17_000.0,
+    )
+    drop = DroppedPrediction("pred-2", "touch-2", "no_resolution", event_ts, entry_price=17_000.0)
+
+    async def run() -> None:
+        # Market-only update while lagging: suppressed (snapshot path).
+        await live._emit_market(RuntimeUpdate(current_bars=(bar,)))
+        assert update_calls == []
+        # Prediction / outcome / drop updates while lagging: ALWAYS forwarded.
+        await live._emit_market(RuntimeUpdate(current_bars=(bar,), predictions=(prediction,)))
+        await live._emit_market(RuntimeUpdate(outcomes=(outcome,)))
+        await live._emit_market(RuntimeUpdate(dropped=(drop,)))
+
+    asyncio.run(run())
+
+    assert len(update_calls) == 3
+    assert update_calls[0].predictions == (prediction,)
+    assert update_calls[1].outcomes == (outcome,)
+    assert update_calls[2].dropped == (drop,)
+    # The exemption forwards the delta without flipping streaming mode on.
+    assert live._live_streaming is False
+    assert len(snapshot_calls) >= 1
+
+
 def test_warm_start_throttle_off_streams_every_event() -> None:
     # Default (throttle off): behaviour is unchanged — every market delta streams,
     # regardless of how far its timestamp lags wall clock.

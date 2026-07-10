@@ -619,6 +619,16 @@ class LiveMarketDataService:
         wall clock is NOT streamed; a throttled full snapshot carries catch-up progress
         instead, and per-event streaming resumes (after one flush) once the frontier
         reaches real time. Feed-status / warning items (no event ts) always forward.
+
+        EXEC verify fix (major): updates carrying SERVING deltas (predictions,
+        outcomes, drops, resets) are NEVER suppressed. The paper-execution tracker
+        observes only broadcast updates (the broadcaster choke point) and an
+        outcome rides exactly one update — a suppressed resolution would leave a
+        paper position open forever with no close row, and a catch-up-tail
+        prediction (live-originated touch past the warm anchor, frontier still
+        lagging) would never open. These deltas are a handful per session, so
+        forwarding their full updates cannot flood the browser the way the
+        per-bar stream does; the UI also stops silently losing those frames.
         """
 
         if not self._throttle_warm_start:
@@ -637,7 +647,7 @@ class LiveMarketDataService:
             # Caught up: push the whole built-up day once, then stream per event.
             self._live_streaming = True
             await self._broadcast_snapshot()
-        if self._live_streaming:
+        if self._live_streaming or _carries_serving_deltas(update):
             await self._on_update(update)
         else:
             await self._maybe_emit_warm_snapshot()
@@ -656,6 +666,22 @@ class LiveMarketDataService:
         ):
             return
         await self._broadcast_snapshot()
+
+
+def _carries_serving_deltas(update: RuntimeUpdate) -> bool:
+    """True when the update carries prediction/outcome/drop/reset deltas.
+
+    These are throttle-exempt (see ``_emit_market``): each rides exactly one
+    RuntimeUpdate and downstream consumers (the paper-execution tracker, the
+    prediction panes/blotter) have no snapshot-replay recovery path for them.
+    """
+
+    return bool(
+        update.predictions
+        or update.outcomes
+        or update.dropped
+        or update.model_reset_reason is not None
+    )
 
 
 def _map_core_live_state(state: CoreLiveState, *, fallback: LiveState) -> LiveState:

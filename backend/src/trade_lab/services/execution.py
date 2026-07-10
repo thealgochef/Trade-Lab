@@ -40,10 +40,13 @@ RESET semantics: a runtime reset (replay start / live start / model
 activation, observed via ``RuntimeUpdate.model_reset_reason``) clears open
 positions with a ``reset`` event row — no phantom carry, no synthetic closes.
 
-LIVE-PHASE ONLY BY CONSTRUCTION: the live warm gate (WARM-FIX P3) suppresses
-prediction production for warm-replayed touches, so no eligible prediction —
-and therefore no position — can exist during the live warm-start drain; live
-positions are live-phase only. Replay positions ride the replay clock.
+LIVE-ORIGINATED ONLY BY CONSTRUCTION: the live warm gate (WARM-FIX P3,
+anchor-based) suppresses prediction production for warm-REPLAYED touches, so
+no position can ever originate from replayed history; a live-originated touch
+during the catch-up tail CAN predict, and its update reaches the tracker
+because serving deltas are exempt from the live broadcast throttle
+(``live.py::_emit_market``, EXEC verify fix). Replay positions ride the
+replay clock.
 
 All prices are tracked internally in integer TICKS (the view/bar grid) and
 surfaced in points via the policy ``tick_size``, so column arithmetic is exact.

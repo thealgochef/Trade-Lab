@@ -120,8 +120,10 @@ export const predictionStore = createStore<PredictionState>({
 // EXEC P3: paper-execution state. Open positions mirror the backend tracker
 // (upsert by prediction id; the snapshot replaces the set); closed executions
 // are a newest-first bounded ring fed by position.closed frames only — the
-// snapshot does not carry them, so a reconnect starts the table fresh while
-// the executions journal keeps durable history for the Performance page.
+// snapshot does not carry them, so the table clears on a delivered
+// model.reset frame or a page reload (a reset missed while disconnected
+// leaves prior rows in place — reported verify minor); the executions
+// journal keeps durable history for the Performance page.
 export type ExecutionState = {
   openPositions: OpenPosition[];
   closed: ClosedExecution[];
