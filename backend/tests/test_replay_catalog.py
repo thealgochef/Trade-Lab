@@ -225,6 +225,41 @@ def test_discovery_finds_supported_fixtures_with_opaque_ids_and_ignores_unsuppor
     _assert_no_temp_path(payload, tmp_path)
 
 
+def test_ingested_mbp1_day_folder_with_level00_columns_is_discoverable(
+    tmp_path: Path,
+) -> None:
+    # INGEST close-verify fix: the batch-ingested store days are
+    # NQ/<date>/mbp1.parquet with the SC store fingerprint — depth-suffixed
+    # level-00 TOB names (bid_px_00/ask_px_00), NOT bid_price/bid_px. The
+    # mbp-1 live-column gate must accept them or the whole mbp1 era is
+    # invisible to replay.
+    _write_table(
+        tmp_path / "NQ" / "2026-02-23" / "mbp1.parquet",
+        [
+            {
+                "ts_event": 1_772_064_000_000_000_000,
+                "action": "T",
+                "price": "17000.00",
+                "size": 1,
+                "bid_px_00": "16999.75",
+                "ask_px_00": "17000.25",
+                "bid_sz_00": 3,
+                "ask_sz_00": 4,
+            }
+        ],
+    )
+
+    payload = TestClient(
+        create_app(Settings(_env_file=None, data_path=tmp_path, front_month_symbol="NQ.c.0"))
+    ).get("/api/v1/replay/sources").json()
+
+    historical = [source for source in payload["sources"] if source["kind"] == "historical"]
+    assert [(source["source_id"], source["schema"]) for source in historical] == [
+        ("historical:nq:2026-02-23:mbp-1", "mbp-1"),
+    ]
+    assert historical[0]["session_label"] == "2026-02-23"
+
+
 def test_unsupported_deeper_book_file_name_containing_trades_is_not_advertised(
     tmp_path: Path,
 ) -> None:

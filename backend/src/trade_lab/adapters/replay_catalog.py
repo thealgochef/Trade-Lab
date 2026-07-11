@@ -450,8 +450,11 @@ def _has_required_live_columns(schema: str, names: set[str]) -> bool:
         has_ask = any(n in names for n in ("ask_price", "ask_px", "ask", "ask_px_00"))
         return has_trade_projection or ("ts_event" in names and has_bid and has_ask)
     if schema in {"mbp-1", "bbo"}:
-        has_bid = any(n in names for n in ("bid_price", "bid_px", "bid"))
-        has_ask = any(n in names for n in ("ask_price", "ask_px", "ask"))
+        # INGEST close-verify fix: the batch-ingested mbp1.parquet store days
+        # carry the depth-suffixed level-00 names (bid_px_00/ask_px_00, the SC
+        # reader's TOB aliases) — same alias set the mbp-10 arm accepts.
+        has_bid = any(n in names for n in ("bid_price", "bid_px", "bid", "bid_px_00"))
+        has_ask = any(n in names for n in ("ask_price", "ask_px", "ask", "ask_px_00"))
         return "ts_event" in names and has_bid and has_ask
     return False
 
