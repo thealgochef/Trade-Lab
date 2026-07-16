@@ -16,12 +16,17 @@ subscription wiring, API-key/SDK status, and fake-SDK pipeline validation. Repla
 live feeds share the same `process_market_event()` path so historical behavior
 stays live-compatible.
 
-Run the dev API on backend port `8001` with:
+Install, then run the dev API on backend port `8001`:
 
 ```powershell
 cd <repo>\backend
+python -m pip install -e ".[dev]"   # ".[dev,live]" also installs the Databento SDK
 python -m trade_lab.api
 ```
+
+The server logs to stderr at `TRADE_LAB_LOG_LEVEL` (default INFO; `DEBUG` also
+raises the `databento` logger, printing the full live session handshake). The UI
+is a separate process — see the repo-root `README.md` for the full run guide.
 
 Contract endpoints:
 
@@ -79,9 +84,13 @@ Live Databento notes:
 
 - No auto-connect occurs at import/app startup; this prevents surprise paid data
   sessions and keeps tests offline.
-- When run from this `backend/` directory, local development settings load from
-  gitignored `backend/.env` and use the `TRADE_LAB_` prefix. Shell/process
-  environment variables still override `.env` values.
+- Local development settings load from gitignored `backend/.env` (resolved from the
+  installed package location, so any working directory works) and use the
+  `TRADE_LAB_` prefix. Shell/process environment variables still override `.env`
+  values, and settings are read once at startup — restart after editing.
+- The optional Databento SDK is declared as the `live` extra with floor
+  `databento>=0.79`: earlier releases issue the live subscribe/start from the
+  calling thread, which can silently wedge the feed.
 - Supply credentials only through backend configuration
   (`TRADE_LAB_DATABENTO_API_KEY` in the process environment or gitignored
   `backend/.env`); browser UI never accepts keys because bundled frontend code
