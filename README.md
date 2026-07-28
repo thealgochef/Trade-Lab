@@ -201,8 +201,8 @@ npm run build
 
 - Core implementation complete through Phase 5C, plus the inference/journal seam
   and the live warm-start hardening.
-- Latest backend verification: `466 passed, 1 skipped`; ruff clean.
-- Latest frontend verification: typecheck clean; `154 passed` across 16 files.
+- Backend verification: `python -m pytest -q` from `backend/` — full suite green; counts tracked by CI, not this README.
+- Frontend verification: `npm run typecheck && npm test` from `frontend/`.
 - Live market data has been exercised against the real gateway during an open
   session (warm start ~2 min, `warming` → `live` flip, live events flowing,
   clean stop), market-data only with no model active. The full operator

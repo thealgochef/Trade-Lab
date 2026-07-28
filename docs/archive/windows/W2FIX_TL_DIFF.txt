@@ -1,0 +1,282 @@
+diff --git a/backend/src/trade_lab/adapters/databento.py b/backend/src/trade_lab/adapters/databento.py
+index a444ff9..2d5cc58 100644
+--- a/backend/src/trade_lab/adapters/databento.py
++++ b/backend/src/trade_lab/adapters/databento.py
+@@ -308,6 +308,20 @@ class DatabentoMarketDataFeed:
+             )
+             return None
+ 
++    def _log_warm_start_seam_gap(self) -> None:
++        # W2-FIX F2: the Historical slice's end is clamped to the dataset's
++        # available end, which lags real time by minutes — the bars between that
++        # clamp and the live subscribe are never seen. Make the gap visible.
++        slice_end = getattr(self._historical_source, "last_stream_end", None)
++        if slice_end is None:
++            return
++        gap_seconds = (self._now() - slice_end).total_seconds()
++        logger.warning(
++            "warm-start fallback slice ends %.1f s before live subscribe "
++            "(historical availability lag)",
++            gap_seconds,
++        )
++
+     async def stop(self) -> None:
+         self._started = False
+         loop = self._loop
+@@ -337,6 +351,7 @@ class DatabentoMarketDataFeed:
+                 yield item
+             if not self._started:
+                 return
++            self._log_warm_start_seam_gap()
+             # Spec order: fetch -> feed -> subscribe live from now. A subscribe
+             # failure here propagates and surfaces as a live-feed failure.
+             self._connect(replay_start=None)
+@@ -681,10 +696,12 @@ def _side(message: Any) -> TradeSide:
+     # and 'A' (ask aggressor = SELL) — the canonical mapping Strategy-Core's W1
+     # parquet shim ratified. 'A' previously fell through to UNKNOWN here, starving
+     # side-aware order-flow features of every sell print on the live path.
++    # Databento emits single-letter codes only; the words "ask"/"bid" are not
++    # provider values and contradicted the letter canon, so they map to UNKNOWN.
+     value = (_optional_str(message, "side", "aggressor_side") or "unknown").lower()
+-    if value in {"buy", "b", "ask"}:
++    if value in {"buy", "b"}:
+         return TradeSide.BUY
+-    if value in {"sell", "s", "a", "bid"}:
++    if value in {"sell", "s", "a"}:
+         return TradeSide.SELL
+     return TradeSide.UNKNOWN
+ 
+diff --git a/backend/src/trade_lab/adapters/databento_historical.py b/backend/src/trade_lab/adapters/databento_historical.py
+index 8c4a327..09977fd 100644
+--- a/backend/src/trade_lab/adapters/databento_historical.py
++++ b/backend/src/trade_lab/adapters/databento_historical.py
+@@ -52,6 +52,10 @@ class DatabentoHistoricalSource:
+         self._stype_in = stype_in
+         self._record_fetcher = record_fetcher
+         self._ohlcv_fetcher = ohlcv_fetcher
++        # The effective (availability-clamped) end of the last record-stream
++        # fetch — the live adapter logs the seam gap between it and the live
++        # subscribe instant (W2-FIX F2).
++        self.last_stream_end: datetime | None = None
+ 
+     @property
+     def available(self) -> bool:
+@@ -67,11 +71,13 @@ class DatabentoHistoricalSource:
+         """Per-schema DBN record streams over ``[start, end)`` for warm start."""
+ 
+         if self._record_fetcher is not None:
++            self.last_stream_end = end
+             return tuple((schema, self._record_fetcher(schema, start, end)) for schema in schemas)
+         client = self._client()
+         # Historical data lags real time by minutes; an unclamped end (≈ now)
+         # triggers a 422 data_end_after_available_end error.
+         end = self._clamp_end_to_available(client, end, schemas[0])
++        self.last_stream_end = end
+         if end <= start:
+             return tuple((schema, ()) for schema in schemas)
+         return tuple(
+diff --git a/backend/src/trade_lab/services/model_registry.py b/backend/src/trade_lab/services/model_registry.py
+index 028eb1b..f8ac686 100644
+--- a/backend/src/trade_lab/services/model_registry.py
++++ b/backend/src/trade_lab/services/model_registry.py
+@@ -540,10 +540,11 @@ class ModelRegistry:
+     def _verify_checksum(directory: Path, model_file: Path) -> None:
+         checksum_file = directory / CHECKSUM_FILE
+         if not checksum_file.is_file():
+-            # E3 ledger (b): an absent sidecar no longer skips SILENTLY — the gap
+-            # is surfaced (path-free) so an unverified binary is a visible fact.
+-            logger.warning(
+-                "model bundle has no %s sidecar; binary integrity not verified",
++            # W2-FIX F3 (D-P-01): pre-W2 bundles carry no sidecar and stay
++            # activatable — the gap is recorded at debug only, not warning.
++            logger.debug(
++                "model bundle %s has no %s sidecar; binary integrity not verified",
++                directory.name,
+                 CHECKSUM_FILE,
+             )
+             return
+@@ -559,7 +560,11 @@ class ModelRegistry:
+         except OSError as exc:
+             raise ModelValidationError("model file is unreadable") from exc
+         if digest.hexdigest().lower() != declared:
+-            raise ModelValidationError("model file checksum does not match the sidecar .sha256")
++            # Name the bundle (directory.name == model_id) but never a path.
++            raise ModelValidationError(
++                f"model file checksum does not match the sidecar .sha256 "
++                f"for bundle {directory.name!r}"
++            )
+ 
+     @staticmethod
+     def _load_catboost(model_file: Path) -> CatBoostClassifier:
+diff --git a/backend/tests/test_inference_api.py b/backend/tests/test_inference_api.py
+index 531e5eb..ab9522f 100644
+--- a/backend/tests/test_inference_api.py
++++ b/backend/tests/test_inference_api.py
+@@ -9,6 +9,7 @@ it. No model/prediction payload may leak a filesystem path or secret.
+ 
+ from __future__ import annotations
+ 
++import hashlib
+ import json
+ from datetime import UTC, datetime, timedelta
+ from pathlib import Path
+@@ -256,6 +257,52 @@ def test_activate_invalid_bundle_is_409_with_safe_message(tmp_path: Path) -> Non
+     _assert_no_temp_path(response.json(), tmp_path)
+ 
+ 
++def test_tampered_model_with_stale_sidecar_is_409_and_prior_stays_active(
++    tmp_path: Path,
++) -> None:
++    # W2-FIX F3: a model.cbm modified AFTER its sha256 sidecar was written must
++    # 409 at activation (the checksum gate fires before any model bytes are
++    # loaded) and leave the prior model serving. The detail names the bundle
++    # but never a path.
++    _write_bundle(tmp_path, "good-model", _train_model(_CONTRACT_FEATURES))
++    tampered_dir = _write_bundle(tmp_path, "tampered-model", _train_model(_CONTRACT_FEATURES))
++    model_path = tampered_dir / "model.cbm"
++    (tampered_dir / "model.cbm.sha256").write_text(
++        hashlib.sha256(model_path.read_bytes()).hexdigest(), encoding="utf-8"
++    )
++    tampered = bytearray(model_path.read_bytes())
++    tampered[-1] ^= 0xFF  # flip one byte: the sidecar is now stale
++    model_path.write_bytes(bytes(tampered))
++    client = TestClient(create_app(_settings(tmp_path)))
++
++    assert (
++        client.post("/api/v1/models/activate", json={"model_id": "good-model"}).status_code == 200
++    )
++
++    response = client.post("/api/v1/models/activate", json={"model_id": "tampered-model"})
++
++    assert response.status_code == 409
++    detail = response.json()["detail"]
++    assert "checksum" in detail
++    assert "tampered-model" in detail  # names the bundle (path-free)
++    _assert_no_secret_text(response.json())
++    _assert_no_temp_path(response.json(), tmp_path)
++
++    active = client.get("/api/v1/models/active").json()
++    assert active["loaded"] is True
++    assert active["model_id"] == "good-model"
++
++
++def test_bundle_without_sha256_sidecar_activates_normally(tmp_path: Path) -> None:
++    # W2-FIX F3 (D-P-01): pre-W2 bundles carry no sidecar and stay activatable.
++    client = _good_bundle_app(tmp_path)  # _write_bundle writes no sidecar
++
++    response = client.post("/api/v1/models/activate", json={"model_id": "good-model"})
++
++    assert response.status_code == 200
++    assert client.get("/api/v1/models/active").json()["model_id"] == "good-model"
++
++
+ # --------------------------------------------------------------------------- #
+ # POST /models/deactivate
+ # --------------------------------------------------------------------------- #
+diff --git a/backend/tests/test_live_databento.py b/backend/tests/test_live_databento.py
+index 410c7cf..4cb5a38 100644
+--- a/backend/tests/test_live_databento.py
++++ b/backend/tests/test_live_databento.py
+@@ -1339,6 +1339,10 @@ def test_databento_side_a_maps_to_sell_aggressor() -> None:
+         "A": "sell",
+         "B": "buy",
+         "N": "unknown",
++        # W2-FIX F1: Databento emits single-letter codes only — the word
++        # tolerances ("ask"→BUY contradicted 'A'=sell) are gone.
++        "ask": "unknown",
++        "bid": "unknown",
+     }
+     for code, expected in sides.items():
+         event = normalize_provider_message(
+diff --git a/backend/tests/test_live_warm_start.py b/backend/tests/test_live_warm_start.py
+index 7ebcf1d..0e44f6c 100644
+--- a/backend/tests/test_live_warm_start.py
++++ b/backend/tests/test_live_warm_start.py
+@@ -153,11 +153,13 @@ def _historical_records(
+     )
+ 
+ 
+-def test_rejected_replay_start_falls_back_to_historical_records_then_live() -> None:
+-    asyncio.run(_run_fallback_warm_start())
++def test_rejected_replay_start_falls_back_to_historical_records_then_live(
++    caplog: pytest.LogCaptureFixture,
++) -> None:
++    asyncio.run(_run_fallback_warm_start(caplog))
+ 
+ 
+-async def _run_fallback_warm_start() -> None:
++async def _run_fallback_warm_start(caplog: pytest.LogCaptureFixture) -> None:
+     sdk = _FakeSdk(reject_replay_start=True)
+     fetch_calls: list[tuple[str, datetime, datetime]] = []
+     feed = _feed(sdk, intraday_replay=True, historical_source=_historical_records(fetch_calls))
+@@ -178,12 +180,13 @@ async def _run_fallback_warm_start() -> None:
+             events.append(item)
+ 
+     task = asyncio.create_task(consume())
+-    for _ in range(300):
+-        if len(sdk.clients) == 2:
+-            break
+-        await asyncio.sleep(0.01)
+-    await feed.stop()
+-    await task
++    with caplog.at_level("WARNING"):
++        for _ in range(300):
++            if len(sdk.clients) == 2:
++                break
++            await asyncio.sleep(0.01)
++        await feed.stop()
++        await task
+ 
+     # ts_event-merged order: trade, quote, trade — through the SAME normalize path.
+     assert isinstance(events[1], TradeEvent)
+@@ -197,6 +200,18 @@ async def _run_fallback_warm_start() -> None:
+     live_client = sdk.clients[1]
+     assert all(sub.get("start") is None for sub in live_client.subscriptions)
+     assert live_client.started is True
++    # W2-FIX F2: the seam between the fallback slice's (clamped) end and the
++    # live subscribe instant is logged. With the injected fetcher and a fixed
++    # clock the slice end equals now, so the gap is 0.0 s.
++    seam_logs = [
++        record.message
++        for record in caplog.records
++        if "warm-start fallback slice ends" in record.message
++    ]
++    assert seam_logs == [
++        "warm-start fallback slice ends 0.0 s before live subscribe "
++        "(historical availability lag)"
++    ]
+ 
+ 
+ def _ohlcv_source(calls: list[tuple[datetime, datetime]]) -> DatabentoHistoricalSource:
+diff --git a/backend/tests/test_platform_version_binding.py b/backend/tests/test_platform_version_binding.py
+index 6197f03..ecbec54 100644
+--- a/backend/tests/test_platform_version_binding.py
++++ b/backend/tests/test_platform_version_binding.py
+@@ -212,18 +212,21 @@ def test_metadata_mismatch_rejected_at_activation(tmp_path: Path) -> None:
+         ModelRegistry(tmp_path).activate("bundle-x")
+ 
+ 
+-def test_missing_checksum_sidecar_warns_at_activation(
++def test_missing_checksum_sidecar_logs_debug_at_activation(
+     tmp_path: Path, caplog: pytest.LogCaptureFixture
+ ) -> None:
+-    # E3 ledger (b): an absent sidecar surfaces a warning instead of a silent
+-    # skip. The stub binary then fails the CatBoost load — asserting AFTER the
+-    # checksum step proves the warning fired on the real activation path.
++    # W2-FIX F3 (D-P-01): an absent sidecar is recorded at DEBUG only — pre-W2
++    # bundles carry no sidecar and must stay activatable without alarm noise.
++    # The stub binary then fails the CatBoost load — asserting AFTER the
++    # checksum step proves the log fired on the real activation path.
+     payload = _load_real_payload()
+     _write_bundle_dir(tmp_path, "bundle-x", payload)  # no model.cbm.sha256 written
+ 
+     with (
+-        caplog.at_level(logging.WARNING),
++        caplog.at_level(logging.DEBUG),
+         pytest.raises(ModelValidationError, match="loadable CatBoost"),
+     ):
+         ModelRegistry(tmp_path).activate("bundle-x")
+-    assert any("no model.cbm.sha256 sidecar" in r.getMessage() for r in caplog.records)
++    sidecar_records = [r for r in caplog.records if "no model.cbm.sha256 sidecar" in r.getMessage()]
++    assert sidecar_records, "absent-sidecar log line did not fire"
++    assert all(r.levelno == logging.DEBUG for r in sidecar_records)

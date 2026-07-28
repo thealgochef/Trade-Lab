@@ -1,0 +1,1243 @@
+commit 73aa7df0df4b53f6e6e27a88b86827c01e8aacd8
+Author: algochef <gonzalezlg020@gmail.com>
+Date:   Wed Jun 10 01:14:16 2026 -0500
+
+    D2: delete the dormant shadow engines, keep live types; strengthen the acceptance guard; httpx2 -> dev extra
+    
+    domain/candles.py: CandleEngine + _MutableCandle + CandleUpdate DELETED (zero
+    production consumers; test-only since the SC migration); KEPT Candle,
+    CandleCloseReason, make_bar_id (live importers: runtime/service/seed/dto/
+    outcome_tracker). domain/levels.py: SessionLevelEngine + _SessionRange +
+    _DaySummary + LevelUpdate + SESSION_LEVELS + LEVEL_ORIGIN DELETED; KEPT
+    LevelKind, LevelDirection, DisplayLevel, TouchEvent (live importers:
+    observations/service/runtime/dto). domain/sessions.py NOT deleted
+    (production-reached via seed.py - recorded as named debt).
+    
+    Deleted engine tests (enumerated, 24 collected): test_benchmark_smoke.py (whole
+    file, 2 - orphans the --run-benchmark conftest hook, harmless; removes the
+    suite's standing 1 skipped); test_prices_sessions_candles.py 6 CandleEngine
+    tests (14 engine-free survive); test_levels_observations.py 14
+    SessionLevelEngine tests (the observation-guard test survives);
+    test_seed.py 2 (the bar-id collision check + the vectorized-builder-vs-engine
+    parity cross-check - the deleted engine WAS the oracle for
+    build_tick_bars_from_frame; oracle loss recorded in PROGRESS).
+    
+    Acceptance guard STRENGTHENED (test_strategy_core_acceptance.py): new
+    test_deleted_shadow_engines_stay_deleted_across_backend_src bans the deleted
+    names across ALL of backend/src (any reintroduction fails), confines
+    SessionClassifier to sessions.py + the seed.py carve-out, and pins
+    domain/candles + domain/levels to their DTO-only public surface; carve-outs
+    documented in the test docstring (seed.py warm-up builder display-only with the
+    Chicago-clock named debt; the tracker cutoff math dies at D1b;
+    strategy_core_service display-flag re-derivation). Stale SessionLevelEngine
+    comment in adapters/synthetic_replay.py reworded (would trip the token scan).
+    
+    Rider 1: pyproject - httpx2>=2.3 moved [project].dependencies -> dev extra
+    (probe-settled: starlette-1.x cold-CI testclient backend imports httpx2; zero
+    direct imports anywhere; sole consumers are the 5 TestClient test files; CI
+    installs .[dev] per backend-ci.yml:37). Rider 2: lint fixes to the Part-1
+    gate-B harness file (unused noqa/int-cast/long lines - ruff project scope
+    includes validation/, missed in the D1a commit).
+    
+    Gates: suite 420 passed, 0 skipped (443 collected - 24 deleted + 1 new guard);
+    strengthened guard + seam green; git grep across backend/src for all deleted
+    names: zero matches; ruff clean.
+    
+    Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+diff --git a/backend/pyproject.toml b/backend/pyproject.toml
+index e94861c..5e884b4 100644
+--- a/backend/pyproject.toml
++++ b/backend/pyproject.toml
+@@ -11,7 +11,6 @@ requires-python = ">=3.13"
+ dependencies = [
+   "catboost>=1.2",
+   "fastapi>=0.115",
+-  "httpx2>=2.3",
+   "orjson>=3.10",
+   "pyarrow>=18.0",
+   "pydantic>=2.10",
+@@ -22,6 +21,10 @@ dependencies = [
+ 
+ [project.optional-dependencies]
+ dev = [
++  # starlette 1.x's TestClient backend (cold CI resolves starlette>=1.x, whose
++  # testclient imports `httpx2 as httpx`); sole consumers are the TestClient tests,
++  # so it is a test dependency, not a runtime one. CI installs .[dev].
++  "httpx2>=2.3",
+   "pytest>=8.3",
+   "pytest-asyncio>=0.24",
+   "ruff>=0.8",
+diff --git a/backend/src/trade_lab/adapters/synthetic_replay.py b/backend/src/trade_lab/adapters/synthetic_replay.py
+index d8fa282..aa022a5 100644
+--- a/backend/src/trade_lab/adapters/synthetic_replay.py
++++ b/backend/src/trade_lab/adapters/synthetic_replay.py
+@@ -55,7 +55,7 @@ def _nq_demo_events(requested_symbol: str) -> Iterator[MarketEvent]:
+ 
+     # First 180 trades occur during Asia and intentionally create a stable high at
+     # 68_020 ticks. London later revisits that exact level, producing an eligible
+-    # touch and observation through SessionLevelEngine/ObservationEngine.
++    # touch (via the Strategy-Core runtime) and observation (ObservationEngine).
+     for i in range(180):
+         price = 68_000 + (i % 21)
+         yield TradeEvent(
+diff --git a/backend/src/trade_lab/domain/candles.py b/backend/src/trade_lab/domain/candles.py
+index c1344f7..af1808c 100644
+--- a/backend/src/trade_lab/domain/candles.py
++++ b/backend/src/trade_lab/domain/candles.py
+@@ -1,12 +1,16 @@
+-"""Deterministic tick-bar aggregation from canonical trades only."""
++"""Tick-bar DTO/display types. Bar AGGREGATION lives in Strategy-Core (D2).
++
++The local candle-engine shadow implementation was deleted in D2: authoritative
++live/replay bars are produced by Strategy-Core's streaming engine and mapped into
++these compatibility types at the adapter seam (``strategy_core_service``). The
++only TL-local bar CONSTRUCTION left in production is the seed warm-up builder
++(``services/seed.py`` — display-only, documented carve-out in the acceptance guard).
++"""
+ 
+ from dataclasses import dataclass
+ from datetime import date, datetime
+ from enum import StrEnum
+ 
+-from trade_lab.domain.events import MarketEvent, TradeEvent
+-from trade_lab.domain.sessions import SessionClassifier
+-
+ 
+ class CandleCloseReason(StrEnum):
+     COMPLETE = "complete"
+@@ -32,165 +36,5 @@ class Candle:
+     close_reason: CandleCloseReason | None = None
+ 
+ 
+-@dataclass(slots=True)
+-class _MutableCandle:
+-    timeframe_ticks: int
+-    trading_day: date
+-    bar_index: int
+-    bar_id: str
+-    open_ts_utc: datetime
+-    close_ts_utc: datetime
+-    open_ticks: int
+-    high_ticks: int
+-    low_ticks: int
+-    close_ticks: int
+-    volume: int
+-    trade_count: int
+-
+-    @classmethod
+-    def from_trade(
+-        cls, timeframe_ticks: int, trade: TradeEvent, trading_day: date, bar_index: int
+-    ) -> "_MutableCandle":
+-        return cls(
+-            timeframe_ticks=timeframe_ticks,
+-            trading_day=trading_day,
+-            bar_index=bar_index,
+-            bar_id=make_bar_id(timeframe_ticks, trading_day, bar_index),
+-            open_ts_utc=trade.event_ts_utc,
+-            close_ts_utc=trade.event_ts_utc,
+-            open_ticks=trade.price_ticks,
+-            high_ticks=trade.price_ticks,
+-            low_ticks=trade.price_ticks,
+-            close_ticks=trade.price_ticks,
+-            volume=trade.size,
+-            trade_count=1,
+-        )
+-
+-    def add_trade(self, trade: TradeEvent) -> None:
+-        self.close_ts_utc = trade.event_ts_utc
+-        self.close_ticks = trade.price_ticks
+-        self.high_ticks = max(self.high_ticks, trade.price_ticks)
+-        self.low_ticks = min(self.low_ticks, trade.price_ticks)
+-        self.volume += trade.size
+-        self.trade_count += 1
+-
+-    def freeze(self, *, complete: bool, reason: CandleCloseReason | None) -> Candle:
+-        return Candle(
+-            timeframe_ticks=self.timeframe_ticks,
+-            trading_day=self.trading_day,
+-            bar_index=self.bar_index,
+-            bar_id=self.bar_id,
+-            open_ts_utc=self.open_ts_utc,
+-            close_ts_utc=self.close_ts_utc,
+-            open_ticks=self.open_ticks,
+-            high_ticks=self.high_ticks,
+-            low_ticks=self.low_ticks,
+-            close_ticks=self.close_ticks,
+-            volume=self.volume,
+-            trade_count=self.trade_count,
+-            is_complete=complete,
+-            is_partial=not complete,
+-            close_reason=reason,
+-        )
+-
+-
+-@dataclass(frozen=True, slots=True)
+-class CandleUpdate:
+-    completed: tuple[Candle, ...]
+-    current: tuple[Candle, ...]
+-
+-
+-class CandleEngine:
+-    """Build all configured tick bars concurrently.
+-
+-    Only `TradeEvent` is accepted for bar counting because quotes/status/statistics do
+-    not represent prints. This keeps live and replay bar semantics identical.
+-    """
+-
+-    def __init__(self, timeframes: tuple[int, ...] = (147, 987, 2000)) -> None:
+-        if not timeframes or any(size <= 0 for size in timeframes):
+-            raise ValueError("tick timeframes must be positive")
+-        self.timeframes = tuple(sorted(set(timeframes)))
+-        self._current: dict[int, _MutableCandle] = {}
+-        self._next_index: dict[tuple[int, date], int] = {}
+-        self._session_classifier = SessionClassifier()
+-
+-    def process_event(self, event: MarketEvent) -> CandleUpdate:
+-        if not isinstance(event, TradeEvent):
+-            return self.snapshot_update(())
+-        return self.process_trade(event)
+-
+-    def process_trade(self, trade: TradeEvent) -> CandleUpdate:
+-        trading_day, _session = self._session_classifier.classify(trade.event_ts_utc)
+-        if trading_day is None:
+-            return self.snapshot_update(())
+-
+-        completed: list[Candle] = []
+-        current = self._current
+-        price_ticks = trade.price_ticks
+-        event_ts_utc = trade.event_ts_utc
+-        size = trade.size
+-        for timeframe in self.timeframes:
+-            candle = current.get(timeframe)
+-            if candle is not None and candle.trading_day != trading_day:
+-                completed.append(candle.freeze(complete=False, reason=CandleCloseReason.END_OF_DAY))
+-                candle = None
+-            if candle is None:
+-                bar_index = self._allocate_bar_index(timeframe, trading_day)
+-                new_candle = _MutableCandle(
+-                    timeframe_ticks=timeframe,
+-                    trading_day=trading_day,
+-                    bar_index=bar_index,
+-                    bar_id=make_bar_id(timeframe, trading_day, bar_index),
+-                    open_ts_utc=event_ts_utc,
+-                    close_ts_utc=event_ts_utc,
+-                    open_ticks=price_ticks,
+-                    high_ticks=price_ticks,
+-                    low_ticks=price_ticks,
+-                    close_ticks=price_ticks,
+-                    volume=size,
+-                    trade_count=1,
+-                )
+-                if timeframe == 1:
+-                    completed.append(
+-                        new_candle.freeze(complete=True, reason=CandleCloseReason.COMPLETE)
+-                    )
+-                else:
+-                    current[timeframe] = new_candle
+-                continue
+-            candle.close_ts_utc = event_ts_utc
+-            candle.close_ticks = price_ticks
+-            if price_ticks > candle.high_ticks:
+-                candle.high_ticks = price_ticks
+-            if price_ticks < candle.low_ticks:
+-                candle.low_ticks = price_ticks
+-            candle.volume += size
+-            candle.trade_count += 1
+-            if candle.trade_count == timeframe:
+-                completed.append(candle.freeze(complete=True, reason=CandleCloseReason.COMPLETE))
+-                del current[timeframe]
+-        return self.snapshot_update(tuple(completed))
+-
+-    def snapshot_update(self, completed: tuple[Candle, ...]) -> CandleUpdate:
+-        current = tuple(c.freeze(complete=False, reason=None) for c in self._current.values())
+-        return CandleUpdate(completed=completed, current=current)
+-
+-    def finalize_trading_day(self) -> tuple[Candle, ...]:
+-        """Explicitly close all incomplete bars at their last trade."""
+-
+-        completed = tuple(
+-            c.freeze(complete=False, reason=CandleCloseReason.END_OF_DAY)
+-            for c in self._current.values()
+-        )
+-        self._current.clear()
+-        return completed
+-
+-    def _allocate_bar_index(self, timeframe: int, trading_day: date) -> int:
+-        key = (timeframe, trading_day)
+-        bar_index = self._next_index.get(key, 0)
+-        self._next_index[key] = bar_index + 1
+-        return bar_index
+-
+-
+ def make_bar_id(timeframe_ticks: int, trading_day: date, bar_index: int) -> str:
+     return f"{timeframe_ticks}t:{trading_day.isoformat()}:{bar_index}"
+diff --git a/backend/src/trade_lab/domain/levels.py b/backend/src/trade_lab/domain/levels.py
+index 1006a0a..2971957 100644
+--- a/backend/src/trade_lab/domain/levels.py
++++ b/backend/src/trade_lab/domain/levels.py
+@@ -1,16 +1,17 @@
+-"""Session levels, eligibility, and exact-price touches.
++"""Level/touch DTO/display types. Level DERIVATION lives in Strategy-Core (D2).
+ 
+-The engine consumes trades, not candles, because timeframe selection must never alter
+-authoritative highs/lows or touch timing.
++The local session-level-engine shadow implementation (session range tracking,
++PDH/PDL rolls, exact-price touch detection) was deleted in D2: authoritative
++levels and touches are produced by Strategy-Core's plugin-owned level state and
++mapped into these compatibility types at the adapter seam
++(``strategy_core_service``).
+ """
+ 
+ from dataclasses import dataclass
+ from datetime import date, datetime
+ from enum import StrEnum
+-from uuid import uuid4
+ 
+-from trade_lab.domain.events import TradeEvent
+-from trade_lab.domain.sessions import SessionClassifier, SessionName
++from trade_lab.domain.sessions import SessionName
+ 
+ 
+ class LevelKind(StrEnum):
+@@ -40,24 +41,6 @@ class LevelDirection(StrEnum):
+     SHORT = "short"
+ 
+ 
+-SESSION_LEVELS: dict[SessionName, tuple[LevelKind, LevelKind]] = {
+-    SessionName.ASIA: (LevelKind.ASIA_HIGH, LevelKind.ASIA_LOW),
+-    SessionName.LONDON: (LevelKind.LONDON_HIGH, LevelKind.LONDON_LOW),
+-    SessionName.NY: (LevelKind.NY_HIGH, LevelKind.NY_LOW),
+-}
+-
+-LEVEL_ORIGIN: dict[LevelKind, SessionName | None] = {
+-    LevelKind.PDH: None,
+-    LevelKind.PDL: None,
+-    LevelKind.ASIA_HIGH: SessionName.ASIA,
+-    LevelKind.ASIA_LOW: SessionName.ASIA,
+-    LevelKind.LONDON_HIGH: SessionName.LONDON,
+-    LevelKind.LONDON_LOW: SessionName.LONDON,
+-    LevelKind.NY_HIGH: SessionName.NY,
+-    LevelKind.NY_LOW: SessionName.NY,
+-}
+-
+-
+ @dataclass(frozen=True, slots=True)
+ class DisplayLevel:
+     kind: LevelKind
+@@ -85,227 +68,3 @@ class TouchEvent:
+     # audit #NN-1: authoritative direction carried from Strategy-Core's Touch.direction.
+     # Defaults to None so existing constructions keep working; the adapter always sets it.
+     direction: LevelDirection | None = None
+-
+-
+-@dataclass(frozen=True, slots=True)
+-class LevelUpdate:
+-    display_levels: tuple[DisplayLevel, ...]
+-    touches: tuple[TouchEvent, ...]
+-
+-
+-@dataclass(slots=True)
+-class _SessionRange:
+-    high: int | None = None
+-    low: int | None = None
+-
+-    def update(self, price_ticks: int) -> bool:
+-        changed = False
+-        if self.high is None or price_ticks > self.high:
+-            self.high = price_ticks
+-            changed = True
+-        if self.low is None or price_ticks < self.low:
+-            self.low = price_ticks
+-            changed = True
+-        return changed
+-
+-
+-@dataclass(frozen=True, slots=True)
+-class _DaySummary:
+-    high: int
+-    low: int
+-
+-
+-class SessionLevelEngine:
+-    """Maintain display levels and detect valid exact-price touches."""
+-
+-    def __init__(self) -> None:
+-        self._trading_day: date | None = None
+-        self._session: SessionName | None = None
+-        self._day_high: int | None = None
+-        self._day_low: int | None = None
+-        self._prior_day_high: int | None = None
+-        self._prior_day_low: int | None = None
+-        self._completed_day_summaries: dict[date, _DaySummary] = {}
+-        self._ranges: dict[SessionName, _SessionRange] = {
+-            SessionName.ASIA: _SessionRange(),
+-            SessionName.LONDON: _SessionRange(),
+-            SessionName.NY: _SessionRange(),
+-        }
+-        self._touched: set[tuple[date, SessionName, LevelKind]] = set()
+-        self._touch_counts: dict[tuple[date, SessionName], int] = {}
+-        self._session_classifier = SessionClassifier()
+-        self._display_cache_session: SessionName | None = None
+-        self._display_cache: tuple[DisplayLevel, ...] | None = None
+-
+-    def process_trade(self, trade: TradeEvent) -> LevelUpdate:
+-        trading_day, session = self._session_classifier.classify(trade.event_ts_utc)
+-        if trading_day is None or session is SessionName.CLOSED:
+-            return LevelUpdate(self.display_levels(current_session=SessionName.CLOSED), ())
+-
+-        self._roll_if_needed(trading_day, session)
+-        touches = self._detect_touches(trade, trading_day, session)
+-
+-        # Update after touch detection so same-session new highs/lows do not create
+-        # their own signal touch while the level is still developing.
+-        display_changed = False
+-        if self._day_high is None or trade.price_ticks > self._day_high:
+-            self._day_high = trade.price_ticks
+-            display_changed = True
+-        if self._day_low is None or trade.price_ticks < self._day_low:
+-            self._day_low = trade.price_ticks
+-            display_changed = True
+-        display_changed = self._ranges[session].update(trade.price_ticks) or display_changed
+-        if display_changed:
+-            self._clear_display_cache()
+-        return LevelUpdate(self.display_levels(current_session=session), touches)
+-
+-    def display_levels(
+-        self, current_session: SessionName | None = None
+-    ) -> tuple[DisplayLevel, ...]:
+-        if self._trading_day is None:
+-            return ()
+-        if self._display_cache_session is current_session and self._display_cache is not None:
+-            return self._display_cache
+-        levels: list[DisplayLevel] = []
+-        if self._prior_day_high is not None:
+-            levels.append(self._level(LevelKind.PDH, self._prior_day_high, current_session))
+-        if self._prior_day_low is not None:
+-            levels.append(self._level(LevelKind.PDL, self._prior_day_low, current_session))
+-        for session, (high_kind, low_kind) in SESSION_LEVELS.items():
+-            rng = self._ranges[session]
+-            if rng.high is not None:
+-                levels.append(self._level(high_kind, rng.high, current_session))
+-            if rng.low is not None:
+-                levels.append(self._level(low_kind, rng.low, current_session))
+-        display_levels = tuple(levels)
+-        self._display_cache_session = current_session
+-        self._display_cache = display_levels
+-        return display_levels
+-
+-    def finalize_trading_day(self, trading_day: date) -> None:
+-        """Mark an observed trading day complete and eligible for future PDH/PDL.
+-
+-        Partial snippets are deliberately not promoted during automatic day rollover.
+-        Callers must invoke this once they know the observed stream spans the full
+-        trading day, or use ``load_prior_day_summary`` for a known complete summary.
+-        """
+-
+-        if self._trading_day != trading_day:
+-            raise ValueError("can only finalize the currently observed trading day")
+-        if self._day_high is None or self._day_low is None:
+-            raise ValueError("cannot finalize a trading day with no observed trades")
+-        self._completed_day_summaries[trading_day] = _DaySummary(self._day_high, self._day_low)
+-        self._apply_prior_day_summary_for_current_day()
+-
+-    def load_prior_day_summary(self, trading_day: date, high_ticks: int, low_ticks: int) -> None:
+-        """Load a known complete trading-day high/low summary for PDH/PDL use."""
+-
+-        if high_ticks < low_ticks:
+-            raise ValueError("prior day high_ticks must be greater than or equal to low_ticks")
+-        self._completed_day_summaries[trading_day] = _DaySummary(high_ticks, low_ticks)
+-        self._apply_prior_day_summary_for_current_day()
+-
+-    def _level(
+-        self, kind: LevelKind, price_ticks: int, current_session: SessionName | None
+-    ) -> DisplayLevel:
+-        origin = LEVEL_ORIGIN[kind]
+-        developing = origin is not None and origin == current_session
+-        eligible = current_session not in (None, SessionName.CLOSED) and not developing
+-        return DisplayLevel(
+-            kind=kind,
+-            price_ticks=price_ticks,
+-            trading_day=self._trading_day,  # type: ignore[arg-type]
+-            origin_session=origin,
+-            is_developing=developing,
+-            is_eligible=eligible,
+-        )
+-
+-    def _roll_if_needed(self, trading_day: date, session: SessionName) -> None:
+-        if self._trading_day != trading_day:
+-            self._trading_day = trading_day
+-            self._session = None
+-            self._day_high = None
+-            self._day_low = None
+-            self._prior_day_high = None
+-            self._prior_day_low = None
+-            self._apply_prior_day_summary_for_current_day()
+-            self._ranges = {name: _SessionRange() for name in SESSION_LEVELS}
+-            self._touched.clear()
+-            self._touch_counts.clear()
+-            self._clear_display_cache()
+-        if self._session != session:
+-            self._session = session
+-            self._clear_display_cache()
+-            # One touch per level per session: touch keys include session, so no global
+-            # level state is cleared here.
+-
+-    def _apply_prior_day_summary_for_current_day(self) -> None:
+-        if self._trading_day is None:
+-            return
+-        prior_trading_day = max(
+-            (
+-                trading_day
+-                for trading_day in self._completed_day_summaries
+-                if trading_day < self._trading_day
+-            ),
+-            default=None,
+-        )
+-        if prior_trading_day is None:
+-            return
+-        summary = self._completed_day_summaries[prior_trading_day]
+-        self._prior_day_high = summary.high
+-        self._prior_day_low = summary.low
+-        self._clear_display_cache()
+-
+-    def _clear_display_cache(self) -> None:
+-        self._display_cache_session = None
+-        self._display_cache = None
+-
+-    def _detect_touches(
+-        self, trade: TradeEvent, trading_day: date, session: SessionName
+-    ) -> tuple[TouchEvent, ...]:
+-        touches: list[TouchEvent] = []
+-        for kind, level_price_ticks in self._eligible_level_prices(session):
+-            key = (trading_day, session, kind)
+-            if key in self._touched:
+-                continue
+-            if trade.price_ticks != level_price_ticks:
+-                continue
+-            self._touched.add(key)
+-            count_key = (trading_day, session)
+-            sequence = self._touch_counts.get(count_key, 0) + 1
+-            self._touch_counts[count_key] = sequence
+-            touches.append(
+-                TouchEvent(
+-                    touch_id=str(uuid4()),
+-                    event_ts_utc=trade.event_ts_utc,
+-                    trading_day=trading_day,
+-                    session=session,
+-                    level_kind=kind,
+-                    level_price_ticks=level_price_ticks,
+-                    trade_price_ticks=trade.price_ticks,
+-                    requested_symbol=trade.requested_symbol,
+-                    raw_symbol=trade.raw_symbol,
+-                    instrument_id=trade.instrument_id,
+-                    sequence_in_session=sequence,
+-                )
+-            )
+-        return tuple(touches)
+-
+-    def _eligible_level_prices(
+-        self, current_session: SessionName
+-    ) -> tuple[tuple[LevelKind, int], ...]:
+-        levels: list[tuple[LevelKind, int]] = []
+-        if self._prior_day_high is not None:
+-            levels.append((LevelKind.PDH, self._prior_day_high))
+-        if self._prior_day_low is not None:
+-            levels.append((LevelKind.PDL, self._prior_day_low))
+-        for session, (high_kind, low_kind) in SESSION_LEVELS.items():
+-            if session is current_session:
+-                continue
+-            rng = self._ranges[session]
+-            if rng.high is not None:
+-                levels.append((high_kind, rng.high))
+-            if rng.low is not None:
+-                levels.append((low_kind, rng.low))
+-        return tuple(levels)
+diff --git a/backend/tests/test_benchmark_smoke.py b/backend/tests/test_benchmark_smoke.py
+deleted file mode 100644
+index 30f5ab0..0000000
+--- a/backend/tests/test_benchmark_smoke.py
++++ /dev/null
+@@ -1,82 +0,0 @@
+-from datetime import UTC, datetime, timedelta
+-from time import perf_counter
+-
+-import pytest
+-
+-from trade_lab.domain.candles import CandleEngine
+-from trade_lab.domain.events import TradeEvent
+-from trade_lab.domain.levels import SessionLevelEngine
+-
+-
+-def test_synthetic_benchmark_path_is_deterministic_at_small_scale() -> None:
+-    start = datetime(2026, 1, 5, 0, 0, tzinfo=UTC)
+-    candles = CandleEngine((10,))
+-    levels = SessionLevelEngine()
+-    completed = 0
+-    touches = 0
+-
+-    for i in range(25):
+-        event = TradeEvent(
+-            start + timedelta(seconds=i),
+-            None,
+-            1,
+-            "NQ.c.0",
+-            "NQM6",
+-            68_000 + (i % 4),
+-            1,
+-        )
+-        completed += len(candles.process_trade(event).completed)
+-        touches += len(levels.process_trade(event).touches)
+-
+-    assert completed == 2
+-    assert touches == 0
+-
+-
+-@pytest.mark.benchmark
+-def test_synthetic_domain_throughput_smoke() -> None:
+-    count = 100_000
+-    warmup_count = 10_000
+-    runs = 5
+-    gate_events_per_second = 100_000
+-    start = datetime(2026, 1, 5, 0, 0, tzinfo=UTC)
+-    events = tuple(
+-        TradeEvent(
+-            start + timedelta(milliseconds=i),
+-            None,
+-            1,
+-            "NQ.c.0",
+-            "NQM6",
+-            68_000 + (i % 40),
+-            1,
+-        )
+-        for i in range(count)
+-    )
+-
+-    def run_once(sample: tuple[TradeEvent, ...]) -> float:
+-        candles = CandleEngine()
+-        levels = SessionLevelEngine()
+-        process_candle = candles.process_trade
+-        process_level = levels.process_trade
+-
+-        t0 = perf_counter()
+-        for event in sample:
+-            process_candle(event)
+-            process_level(event)
+-        return len(sample) / (perf_counter() - t0)
+-
+-    # This opt-in smoke benchmark gates the CandleEngine + SessionLevelEngine domain
+-    # hot path only. Setup, API, websocket, replay controls, and synthetic event
+-    # construction stay outside the timed region. A short untimed warmup and best-of-N
+-    # policy reduce scheduler/CPU-frequency noise while still requiring one full,
+-    # meaningful candle+level processing pass to clear the gate.
+-    run_once(events[:warmup_count])
+-    throughputs = [run_once(events) for _ in range(runs)]
+-    best = max(throughputs)
+-    median = sorted(throughputs)[runs // 2]
+-    formatted_runs = ", ".join(f"{throughput:,.0f}" for throughput in throughputs)
+-    print(
+-        "synthetic candle+level throughput: "
+-        f"best {best:,.0f} events/sec, median {median:,.0f} events/sec "
+-        f"over {count:,} events x {runs} runs (runs: {formatted_runs})"
+-    )
+-    assert best >= gate_events_per_second
+diff --git a/backend/tests/test_levels_observations.py b/backend/tests/test_levels_observations.py
+index 143ab9b..27bf84c 100644
+--- a/backend/tests/test_levels_observations.py
++++ b/backend/tests/test_levels_observations.py
+@@ -1,214 +1,16 @@
+-from datetime import UTC, date, datetime, timedelta
+-
+-import pytest
+-
+-from trade_lab.domain.events import TradeEvent
+-from trade_lab.domain.levels import LevelKind, SessionLevelEngine
+-from trade_lab.domain.observations import ObservationEngine, ObservationStatus
+-from trade_lab.domain.sessions import SessionName
+-
+-
+-def trade(ts: datetime, price_ticks: int) -> TradeEvent:
+-    return TradeEvent(ts, None, 1, "NQ.c.0", "NQM6", price_ticks, 1)
+-
+-
+-def level_prices(update) -> dict[LevelKind, int]:
+-    return {level.kind: level.price_ticks for level in update.display_levels}
+-
+-
+-def test_partial_prior_day_high_and_low_do_not_roll_into_pdh_pdl() -> None:
+-    engine = SessionLevelEngine()
+-    engine.process_trade(trade(datetime(2026, 1, 5, 0, 0, tzinfo=UTC), 100))
+-    engine.process_trade(trade(datetime(2026, 1, 5, 8, 0, tzinfo=UTC), 90))
+-    engine.process_trade(trade(datetime(2026, 1, 5, 14, 0, tzinfo=UTC), 110))
+-
+-    update = engine.process_trade(trade(datetime(2026, 1, 6, 0, 0, tzinfo=UTC), 105))
+-
+-    prices = level_prices(update)
+-    assert LevelKind.PDH not in prices
+-    assert LevelKind.PDL not in prices
+-    assert level_prices(update)[LevelKind.ASIA_HIGH] == 105
+-    assert level_prices(update)[LevelKind.ASIA_LOW] == 105
+-
+-
+-def test_explicit_finalized_prior_day_rolls_into_pdh_pdl() -> None:
+-    engine = SessionLevelEngine()
+-    engine.process_trade(trade(datetime(2026, 1, 5, 0, 0, tzinfo=UTC), 100))
+-    engine.process_trade(trade(datetime(2026, 1, 5, 8, 0, tzinfo=UTC), 90))
+-    engine.process_trade(trade(datetime(2026, 1, 5, 14, 0, tzinfo=UTC), 110))
+-    engine.finalize_trading_day(date(2026, 1, 5))
+-
+-    update = engine.process_trade(trade(datetime(2026, 1, 6, 0, 0, tzinfo=UTC), 105))
+-
+-    assert level_prices(update)[LevelKind.PDH] == 110
+-    assert level_prices(update)[LevelKind.PDL] == 90
+-
+-
+-def test_loaded_prior_day_summary_rolls_into_pdh_pdl() -> None:
+-    engine = SessionLevelEngine()
+-    engine.load_prior_day_summary(date(2026, 1, 5), high_ticks=120, low_ticks=80)
+-
+-    update = engine.process_trade(trade(datetime(2026, 1, 6, 0, 0, tzinfo=UTC), 105))
+-
+-    assert level_prices(update)[LevelKind.PDH] == 120
+-    assert level_prices(update)[LevelKind.PDL] == 80
+-
+-
+-def test_finalized_friday_summary_rolls_into_monday_pdh_pdl_after_weekend() -> None:
+-    engine = SessionLevelEngine()
+-    engine.process_trade(trade(datetime(2026, 1, 9, 0, 0, tzinfo=UTC), 100))
+-    engine.process_trade(trade(datetime(2026, 1, 9, 8, 0, tzinfo=UTC), 90))
+-    engine.process_trade(trade(datetime(2026, 1, 9, 14, 0, tzinfo=UTC), 110))
+-    engine.finalize_trading_day(date(2026, 1, 9))
+-
+-    update = engine.process_trade(trade(datetime(2026, 1, 12, 0, 0, tzinfo=UTC), 105))
+-
+-    prices = level_prices(update)
+-    assert prices[LevelKind.PDH] == 110
+-    assert prices[LevelKind.PDL] == 90
+-
+-
+-def test_loaded_friday_summary_rolls_into_sunday_evening_monday_trading_day() -> None:
+-    engine = SessionLevelEngine()
+-    engine.load_prior_day_summary(date(2026, 1, 9), high_ticks=120, low_ticks=80)
+-
+-    update = engine.process_trade(trade(datetime(2026, 1, 12, 0, 0, tzinfo=UTC), 105))
+-
+-    prices = level_prices(update)
+-    assert prices[LevelKind.PDH] == 120
+-    assert prices[LevelKind.PDL] == 80
+-    assert all(level.trading_day == date(2026, 1, 12) for level in update.display_levels)
+-
+-
+-def test_developing_session_levels_update_live_and_are_display_only() -> None:
+-    engine = SessionLevelEngine()
+-
+-    first = engine.process_trade(trade(datetime(2026, 1, 5, 0, 0, tzinfo=UTC), 100))
+-    second = engine.process_trade(trade(datetime(2026, 1, 5, 0, 1, tzinfo=UTC), 105))
+-
+-    assert first.touches == ()
+-    assert second.touches == ()
+-    assert level_prices(second)[LevelKind.ASIA_HIGH] == 105
+-    assert level_prices(second)[LevelKind.ASIA_LOW] == 100
+-    assert all(level.is_developing for level in second.display_levels)
+-    assert all(not level.is_eligible for level in second.display_levels)
++"""Observation-engine lifecycle guards.
+ 
++The SessionLevelEngine tests that lived here died with the engine in D2 (level
++derivation is Strategy-Core's; see ``tests/test_strategy_core_acceptance.py`` for
++the guard). Observation lifecycle behavior driven from REAL Strategy-Core touches
++is covered by the runtime/inference suites (e.g. ``test_inference_engine.py``).
++"""
+ 
+-def test_completed_asia_levels_are_touch_eligible_in_london_once_per_session() -> None:
+-    engine = SessionLevelEngine()
+-    engine.process_trade(trade(datetime(2026, 1, 5, 0, 0, tzinfo=UTC), 100))
+-    engine.process_trade(trade(datetime(2026, 1, 5, 1, 0, tzinfo=UTC), 105))
++from datetime import datetime, timedelta
+ 
+-    first_london = engine.process_trade(trade(datetime(2026, 1, 5, 8, 0, tzinfo=UTC), 105))
+-    assert len(first_london.touches) == 1
+-    assert first_london.touches[0].level_kind == LevelKind.ASIA_HIGH
+-    assert first_london.touches[0].session == SessionName.LONDON
+-    assert first_london.touches[0].sequence_in_session == 1
+-
+-    second_london = engine.process_trade(trade(datetime(2026, 1, 5, 8, 1, tzinfo=UTC), 105))
+-    assert second_london.touches == ()
+-
+-
+-def test_exact_tick_equality_is_required_for_touches() -> None:
+-    engine = SessionLevelEngine()
+-    engine.process_trade(trade(datetime(2026, 1, 5, 0, 0, tzinfo=UTC), 100))
+-    engine.process_trade(trade(datetime(2026, 1, 5, 1, 0, tzinfo=UTC), 105))
+-
+-    near_miss = engine.process_trade(trade(datetime(2026, 1, 5, 8, 0, tzinfo=UTC), 104))
+-    exact = engine.process_trade(trade(datetime(2026, 1, 5, 8, 1, tzinfo=UTC), 105))
+-
+-    assert near_miss.touches == ()
+-    assert [touch.level_kind for touch in exact.touches] == [LevelKind.ASIA_HIGH]
+-
+-
+-def test_same_level_can_touch_once_in_each_later_session_without_cutoff() -> None:
+-    engine = SessionLevelEngine()
+-    engine.process_trade(trade(datetime(2026, 1, 5, 0, 0, tzinfo=UTC), 100))
+-    engine.process_trade(trade(datetime(2026, 1, 5, 1, 0, tzinfo=UTC), 105))
+-
+-    london = engine.process_trade(trade(datetime(2026, 1, 5, 8, 0, tzinfo=UTC), 105))
+-    ny = engine.process_trade(trade(datetime(2026, 1, 5, 21, 59, tzinfo=UTC), 105))
+-
+-    assert [touch.level_kind for touch in london.touches] == [LevelKind.ASIA_HIGH]
+-    assert LevelKind.ASIA_HIGH in [touch.level_kind for touch in ny.touches]
+-    assert ny.touches[0].session == SessionName.NY
+-
+-
+-def test_pdh_and_pdl_are_touch_eligible_in_all_open_sessions_on_new_day() -> None:
+-    engine = SessionLevelEngine()
+-    engine.process_trade(trade(datetime(2026, 1, 5, 0, 0, tzinfo=UTC), 100))
+-    engine.process_trade(trade(datetime(2026, 1, 5, 8, 0, tzinfo=UTC), 90))
+-    engine.process_trade(trade(datetime(2026, 1, 5, 14, 0, tzinfo=UTC), 110))
+-    engine.finalize_trading_day(date(2026, 1, 5))
+-
+-    asia = engine.process_trade(trade(datetime(2026, 1, 6, 0, 0, tzinfo=UTC), 110))
+-    london = engine.process_trade(trade(datetime(2026, 1, 6, 8, 0, tzinfo=UTC), 90))
+-    ny = engine.process_trade(trade(datetime(2026, 1, 6, 14, 0, tzinfo=UTC), 110))
+-
+-    assert [touch.level_kind for touch in asia.touches] == [LevelKind.PDH]
+-    assert [touch.level_kind for touch in london.touches] == [LevelKind.PDL]
+-    assert LevelKind.PDH in [touch.level_kind for touch in ny.touches]
+-
+-
+-def test_rollover_resets_session_ranges_and_touch_state_deterministically() -> None:
+-    engine = SessionLevelEngine()
+-    engine.process_trade(trade(datetime(2026, 1, 5, 0, 0, tzinfo=UTC), 100))
+-    engine.process_trade(trade(datetime(2026, 1, 5, 1, 0, tzinfo=UTC), 105))
+-    engine.process_trade(trade(datetime(2026, 1, 5, 8, 0, tzinfo=UTC), 105))
+-    engine.finalize_trading_day(date(2026, 1, 5))
+-
+-    new_day = engine.process_trade(trade(datetime(2026, 1, 6, 0, 0, tzinfo=UTC), 101))
+-
+-    prices = level_prices(new_day)
+-    assert prices[LevelKind.PDH] == 105
+-    assert prices[LevelKind.PDL] == 100
+-    assert prices[LevelKind.ASIA_HIGH] == 101
+-    assert prices[LevelKind.ASIA_LOW] == 101
+-    assert LevelKind.LONDON_HIGH not in prices
+-    assert new_day.touches == ()
+-
+-
+-def test_display_levels_are_not_eligible_during_closed_session() -> None:
+-    engine = SessionLevelEngine()
+-    engine.process_trade(trade(datetime(2026, 1, 5, 0, 0, tzinfo=UTC), 100))
+-    engine.process_trade(trade(datetime(2026, 1, 5, 8, 0, tzinfo=UTC), 105))
+-
+-    update = engine.process_trade(trade(datetime(2026, 1, 5, 22, 0, tzinfo=UTC), 105))
+-
+-    assert update.display_levels
+-    assert all(not level.is_eligible for level in update.display_levels)
+-
+-
+-def test_observation_starts_from_touch_with_default_five_minute_window() -> None:
+-    levels = SessionLevelEngine()
+-    levels.process_trade(trade(datetime(2026, 1, 5, 0, 0, tzinfo=UTC), 100))
+-    touch = levels.process_trade(trade(datetime(2026, 1, 5, 8, 0, tzinfo=UTC), 100)).touches[0]
+-
+-    obs = ObservationEngine().start_from_touch(touch)
+-
+-    assert obs.status == ObservationStatus.ACTIVE
+-    assert obs.originating_touch_id == touch.touch_id
+-    assert obs.scheduled_end_ts_utc == touch.event_ts_utc + timedelta(minutes=5)
+-    assert obs.level_kind == touch.level_kind
+-    assert obs.level_price_ticks == touch.level_price_ticks
+-
+-
+-def test_observation_duration_is_configurable_and_expiry_changes_status() -> None:
+-    levels = SessionLevelEngine()
+-    levels.process_trade(trade(datetime(2026, 1, 5, 0, 0, tzinfo=UTC), 100))
+-    touch = levels.process_trade(trade(datetime(2026, 1, 5, 8, 0, tzinfo=UTC), 100)).touches[0]
+-    observations = ObservationEngine(timedelta(seconds=30))
+-    obs = observations.start_from_touch(touch)
+-
+-    assert observations.refresh(obs.scheduled_end_ts_utc - timedelta(microseconds=1)) == ()
+-    assert observations.active()[0].status == ObservationStatus.ACTIVE
+-
+-    expired = observations.refresh(obs.scheduled_end_ts_utc)
++import pytest
+ 
+-    assert len(expired) == 1
+-    assert expired[0].observation_id == obs.observation_id
+-    assert expired[0].status == ObservationStatus.EXPIRED
+-    assert observations.active() == ()
++from trade_lab.domain.observations import ObservationEngine
+ 
+ 
+ def test_observation_engine_rejects_invalid_duration_and_naive_refresh_time() -> None:
+diff --git a/backend/tests/test_prices_sessions_candles.py b/backend/tests/test_prices_sessions_candles.py
+index ea9b043..ae45c13 100644
+--- a/backend/tests/test_prices_sessions_candles.py
++++ b/backend/tests/test_prices_sessions_candles.py
+@@ -1,11 +1,10 @@
+-from dataclasses import FrozenInstanceError
++﻿from dataclasses import FrozenInstanceError
+ from datetime import UTC, datetime, timedelta
+ from decimal import Decimal
+ from types import MappingProxyType
+ 
+ import pytest
+ 
+-from trade_lab.domain.candles import CandleCloseReason, CandleEngine
+ from trade_lab.domain.events import (
+     DailyStatisticEvent,
+     MarketStatus,
+@@ -194,122 +193,3 @@ def test_cached_session_classifier_preserves_minute_boundary_semantics() -> None
+ 
+     assert asia == (datetime(2026, 1, 5, tzinfo=UTC).date(), SessionName.ASIA)
+     assert london == (datetime(2026, 1, 5, tzinfo=UTC).date(), SessionName.LONDON)
+-
+-
+-def test_candle_engine_counts_only_trade_events_and_completes_exactly_n() -> None:
+-    engine = CandleEngine((3,))
+-    quote = MarketStatusEvent(datetime(2026, 1, 5, 0, 0, tzinfo=UTC), 1, MarketStatus.OPEN)
+-    assert engine.process_event(quote).completed == ()
+-
+-    assert engine.process_trade(trade(datetime(2026, 1, 5, 0, 0, tzinfo=UTC), 100)).completed == ()
+-    current = engine.process_trade(trade(datetime(2026, 1, 5, 0, 1, tzinfo=UTC), 101, 2)).current[0]
+-    assert current.bar_index == 0
+-    assert current.bar_id == "3t:2026-01-05:0"
+-    assert current.open_ticks == 100
+-    assert current.high_ticks == 101
+-    assert current.low_ticks == 100
+-    assert current.close_ticks == 101
+-    assert current.volume == 3
+-    assert current.trade_count == 2
+-    assert current.is_partial
+-
+-    update = engine.process_trade(trade(datetime(2026, 1, 5, 0, 2, tzinfo=UTC), 99, 2))
+-    assert update.current == ()
+-    assert len(update.completed) == 1
+-    candle = update.completed[0]
+-    assert candle.bar_index == current.bar_index
+-    assert candle.bar_id == current.bar_id
+-    assert candle.trade_count == 3
+-    assert candle.open_ticks == 100
+-    assert candle.high_ticks == 101
+-    assert candle.low_ticks == 99
+-    assert candle.close_ticks == 99
+-    assert candle.volume == 5
+-    assert candle.is_complete
+-    assert not candle.is_partial
+-    assert candle.close_reason == CandleCloseReason.COMPLETE
+-
+-
+-def test_candle_engine_assigns_stable_incrementing_bar_identity_for_same_second_bars() -> None:
+-    engine = CandleEngine((1, 2))
+-    ts = datetime(2026, 1, 5, 0, 0, 0, 500_000, tzinfo=UTC)
+-
+-    first = engine.process_trade(trade(ts, 100)).completed
+-    second = engine.process_trade(trade(ts, 101)).completed
+-    closed_two_tick = second[1]
+-    next_current = engine.process_trade(trade(ts, 102)).current[0]
+-
+-    assert [(bar.timeframe_ticks, bar.bar_index, bar.bar_id) for bar in first] == [
+-        (1, 0, "1t:2026-01-05:0")
+-    ]
+-    assert (second[0].timeframe_ticks, second[0].bar_index, second[0].bar_id) == (
+-        1,
+-        1,
+-        "1t:2026-01-05:1",
+-    )
+-    assert (closed_two_tick.bar_index, closed_two_tick.bar_id) == (0, "2t:2026-01-05:0")
+-    assert (next_current.bar_index, next_current.bar_id) == (1, "2t:2026-01-05:1")
+-
+-
+-def test_candle_engine_tracks_147_987_and_2000_tick_bars_concurrently() -> None:
+-    engine = CandleEngine()
+-    completed_timeframes: list[int] = []
+-    start = datetime(2026, 1, 5, 0, 0, tzinfo=UTC)
+-
+-    for i in range(2000):
+-        update = engine.process_trade(trade(start + timedelta(seconds=i), 68_000 + (i % 10), 1))
+-        completed_timeframes.extend(candle.timeframe_ticks for candle in update.completed)
+-
+-    assert completed_timeframes.count(147) == 13
+-    assert completed_timeframes.count(987) == 2
+-    assert completed_timeframes.count(2000) == 1
+-    assert sorted(candle.timeframe_ticks for candle in engine.snapshot_update(()).current) == [
+-        147,
+-        987,
+-    ]
+-
+-
+-def test_candle_engine_finalizes_partial_at_day_boundary_and_starts_fresh_sequence() -> None:
+-    engine = CandleEngine((3,))
+-    engine.process_trade(trade(datetime(2026, 1, 5, 0, 0, tzinfo=UTC), 100))
+-    update = engine.process_trade(trade(datetime(2026, 1, 6, 0, 0, tzinfo=UTC), 110))
+-
+-    assert len(update.completed) == 1
+-    partial = update.completed[0]
+-    assert partial.is_partial
+-    assert partial.close_reason == CandleCloseReason.END_OF_DAY
+-    assert partial.close_ts_utc == datetime(2026, 1, 5, 0, 0, tzinfo=UTC)
+-    assert update.current[0].open_ticks == 110
+-    assert update.current[0].bar_index == 0
+-    assert update.current[0].bar_id == "3t:2026-01-06:0"
+-    assert update.current[0].trade_count == 1
+-    assert update.current[0].trading_day.isoformat() == "2026-01-06"
+-
+-
+-def test_candle_engine_does_not_reset_at_asia_london_or_ny_boundaries() -> None:
+-    engine = CandleEngine((4,))
+-    for ts, price in [
+-        (datetime(2026, 1, 5, 7, 59, tzinfo=UTC), 100),
+-        (datetime(2026, 1, 5, 8, 0, tzinfo=UTC), 101),
+-        (datetime(2026, 1, 5, 13, 59, tzinfo=UTC), 102),
+-        (datetime(2026, 1, 5, 14, 0, tzinfo=UTC), 103),
+-    ]:
+-        update = engine.process_trade(trade(ts, price))
+-
+-    assert len(update.completed) == 1
+-    assert update.completed[0].open_ticks == 100
+-    assert update.completed[0].close_ticks == 103
+-    assert update.completed[0].trade_count == 4
+-
+-
+-def test_explicit_finalize_closes_all_incomplete_bars_as_end_of_day_partials() -> None:
+-    engine = CandleEngine((3, 5))
+-    engine.process_trade(trade(datetime(2026, 1, 5, 0, 0, tzinfo=UTC), 100))
+-    engine.process_trade(trade(datetime(2026, 1, 5, 0, 1, tzinfo=UTC), 101))
+-
+-    finalized = engine.finalize_trading_day()
+-
+-    assert {candle.timeframe_ticks for candle in finalized} == {3, 5}
+-    assert all(candle.is_partial for candle in finalized)
+-    assert all(candle.close_reason == CandleCloseReason.END_OF_DAY for candle in finalized)
+-    assert engine.snapshot_update(()).current == ()
+diff --git a/backend/tests/test_seed.py b/backend/tests/test_seed.py
+index a0421b9..351cae8 100644
+--- a/backend/tests/test_seed.py
++++ b/backend/tests/test_seed.py
+@@ -5,12 +5,10 @@ from datetime import UTC, datetime
+ import pandas as pd
+ 
+ from trade_lab.adapters.databento_historical import DatabentoHistoricalSource
+-from trade_lab.domain.candles import CandleEngine
+ from trade_lab.domain.data_quality import DataQualityCode
+-from trade_lab.domain.events import TradeEvent
+ from trade_lab.services.live import LiveConfig, LiveMarketDataService, LiveState
+ from trade_lab.services.runtime import ApplicationRuntime
+-from trade_lab.services.seed import HistoricalSeedService, build_tick_bars_from_frame
++from trade_lab.services.seed import HistoricalSeedService
+ 
+ # now() pinned to 2026-01-07 14:00 CT (NY session) -> current trading day 2026-01-07,
+ # so seed bars must come only from completed sessions strictly before it.
+@@ -92,26 +90,6 @@ def test_build_seed_bars_keeps_only_recent_completed_sessions() -> None:
+     assert all(bar.trading_day.isoformat() < "2026-01-07" for bar in bars)
+ 
+ 
+-def test_seed_bars_do_not_collide_with_live_engine_today_bar_ids() -> None:
+-    seed_ids = {bar.bar_id for bar in _seed_service().build_seed_bars()}
+-
+-    live_engine = CandleEngine((2,))
+-    update = live_engine.process_trade(
+-        TradeEvent(
+-            event_ts_utc=datetime(2026, 1, 7, 18, 0, tzinfo=UTC),
+-            receive_ts_utc=None,
+-            instrument_id=1,
+-            requested_symbol="NQ.c.0",
+-            raw_symbol="NQH6",
+-            price_ticks=68_000,
+-            size=1,
+-        )
+-    )
+-    live_today_ids = {bar.bar_id for bar in (*update.completed, *update.current)}
+-
+-    assert seed_ids.isdisjoint(live_today_ids)
+-
+-
+ def test_seed_is_skipped_when_disabled_or_source_unavailable() -> None:
+     assert _seed_service(enabled=False).enabled is False
+     assert _seed_service(enabled=False).build_seed_bars() == ()
+@@ -154,46 +132,6 @@ def test_runtime_reset_clears_seed_bars() -> None:
+     assert runtime.snapshot().recent_closed_bars == ()
+ 
+ 
+-def test_vectorized_builder_matches_candle_engine() -> None:
+-    # Multi-session trades incl. an 18:30 CT roll into the next trading day and a
+-    # 16:30 CT closed-window trade both paths must drop. CST (UTC-6) in January.
+-    rows = [
+-        ("2026-01-12T00:30:00Z", 68_000, 1),  # 2026-01-11 18:30 CT -> trading day 01-12
+-        ("2026-01-12T15:00:00Z", 68_001, 2),  # 09:00 CT NY
+-        ("2026-01-12T15:00:01Z", 68_002, 1),
+-        ("2026-01-12T15:00:02Z", 68_003, 3),
+-        ("2026-01-12T22:30:00Z", 69_000, 9),  # 16:30 CT closed window -> dropped by both
+-        ("2026-01-13T15:00:00Z", 68_010, 1),
+-        ("2026-01-13T15:00:01Z", 68_011, 2),
+-        ("2026-01-13T15:00:02Z", 68_012, 1),
+-    ]
+-    timeframes = (2, 3)
+-
+-    engine = CandleEngine(timeframes)
+-    engine_bars: list = []
+-    for iso, ticks, size in rows:
+-        trade = TradeEvent(
+-            event_ts_utc=datetime.fromisoformat(iso.replace("Z", "+00:00")),
+-            receive_ts_utc=None,
+-            instrument_id=1,
+-            requested_symbol="NQ.c.0",
+-            raw_symbol="NQH6",
+-            price_ticks=ticks,
+-            size=size,
+-        )
+-        engine_bars.extend(engine.process_trade(trade).completed)
+-    engine_bars.extend(engine.finalize_trading_day())
+-
+-    frame = _frame_from_rows([(iso, ticks * 0.25, size) for iso, ticks, size in rows])
+-    vector_bars = build_tick_bars_from_frame(frame, timeframes)
+-
+-    def key(bar):
+-        return (bar.timeframe_ticks, bar.trading_day, bar.bar_index)
+-
+-    assert sorted(engine_bars, key=key) == sorted(vector_bars, key=key)
+-    assert engine_bars  # sanity: the fixture actually produced bars
+-
+-
+ def test_live_start_seeds_chart_and_broadcasts_history() -> None:
+     asyncio.run(_run_live_start_seeds())
+ 
+diff --git a/backend/tests/test_strategy_core_acceptance.py b/backend/tests/test_strategy_core_acceptance.py
+index 2d0b73c..ad49da2 100644
+--- a/backend/tests/test_strategy_core_acceptance.py
++++ b/backend/tests/test_strategy_core_acceptance.py
+@@ -1,9 +1,11 @@
+ import inspect
+ from datetime import UTC, datetime
++from pathlib import Path
+ 
+ from strategy_core.runtime.state import StrategyRuntime
+ from strategy_core.types import Trade as CoreTrade
+ 
++import trade_lab
+ from trade_lab.domain.events import TradeEvent
+ from trade_lab.services import runtime as runtime_module
+ from trade_lab.services.runtime import ApplicationRuntime
+@@ -76,3 +78,75 @@ def test_runtime_path_uses_strategy_core_service_not_legacy_strategy_engines() -
+     assert "CandleEngine" not in service_source
+     assert "SessionLevelEngine" not in service_source
+     assert "SessionClassifier" not in service_source
++
++
++def test_deleted_shadow_engines_stay_deleted_across_backend_src() -> None:
++    """D2 guard: the dormant local strategy engines are DELETED, not just unwired.
++
++    ``domain/candles.py``'s CandleEngine and ``domain/levels.py``'s
++    SessionLevelEngine were drift-capable shadow implementations of Strategy-Core
++    semantics with no production consumer; D2 removed them. This guard fails if any
++    deleted engine name/module is reintroduced ANYWHERE under backend/src, and pins
++    the kept modules to their DTO/display surface.
++
++    Documented carve-outs (deliberate, named in PROGRESS):
++      * ``services/seed.py`` — the vectorized warm-up bar BUILDER stays (display-only
++        context; its Chicago-clock divergence from Strategy-Core's ET sessions is a
++        named debt). It may use ``SessionClassifier``/``make_bar_id`` but never the
++        deleted engines.
++      * ``services/inference/outcome_tracker.py`` — the tracker's local RTH-cutoff
++        wall-clock math (contract-parameterized) dies WITH the tracker at D1b.
++      * ``services/strategy_core_service.py`` — display-flag re-derivation
++        (``is_eligible``/``is_developing`` off Strategy-Core ``available_from``) on
++        the DTO seam.
++    """
++
++    src_root = Path(trade_lab.__file__).parent
++    banned = (
++        "CandleEngine",
++        "SessionLevelEngine",
++        "_MutableCandle",
++        "_SessionRange",
++        "CandleUpdate",
++        "LevelUpdate",
++    )
++    offenders = []
++    classifier_files = set()
++    for path in sorted(src_root.rglob("*.py")):
++        text = path.read_text(encoding="utf-8")
++        offenders.extend(f"{path.name}: {name}" for name in banned if name in text)
++        if "SessionClassifier" in text:
++            classifier_files.add(path.name)
++    assert offenders == [], f"deleted engine names reintroduced in src: {offenders}"
++    # Local wall-clock session math is allowed ONLY in its home module and the
++    # seed warm-up carve-out.
++    assert classifier_files <= {"sessions.py", "seed.py"}, (
++        f"SessionClassifier escaped its carve-outs: {sorted(classifier_files)}"
++    )
++
++    # The kept modules expose DTO/display types only — no bar-building or level
++    # engine survives on them.
++    from trade_lab.domain import candles as candles_module
++    from trade_lab.domain import levels as levels_module
++
++    for name in ("CandleEngine", "_MutableCandle", "CandleUpdate"):
++        assert not hasattr(candles_module, name)
++    for name in (
++        "SessionLevelEngine",
++        "_SessionRange",
++        "_DaySummary",
++        "LevelUpdate",
++        "SESSION_LEVELS",
++        "LEVEL_ORIGIN",
++    ):
++        assert not hasattr(levels_module, name)
++    candles_public = {n for n in dir(candles_module) if not n.startswith("_")}
++    assert candles_public <= {
++        "Candle", "CandleCloseReason", "make_bar_id",  # the surface
++        "StrEnum", "dataclass", "date", "datetime",  # stdlib imports
++    }
++    levels_public = {n for n in dir(levels_module) if not n.startswith("_")}
++    assert levels_public <= {
++        "DisplayLevel", "LevelDirection", "LevelKind", "TouchEvent", "SessionName",
++        "StrEnum", "dataclass", "date", "datetime",
++    }
+diff --git a/backend/validation/d1_characterization_harness.py b/backend/validation/d1_characterization_harness.py
+index d9dadaf..1af4cff 100644
+--- a/backend/validation/d1_characterization_harness.py
++++ b/backend/validation/d1_characterization_harness.py
+@@ -89,7 +89,7 @@ def _read_trade_events(day: str) -> list[TradeEvent]:
+             instrument_id=1,
+             requested_symbol="NQ.c.0",
+             raw_symbol=str(fm),
+-            price_ticks=int(round(px[i] / TICK_SIZE)),
++            price_ticks=round(px[i] / TICK_SIZE),
+             size=int(sz[i]),
+             side=_SIDE.get(side[i], TradeSide.UNKNOWN),
+             source_schema="mbp-10",
+@@ -152,17 +152,19 @@ def main() -> None:
+     # Harness end: flush the dark resolver past the last day's window so still-open
+     # setups finalize exactly as the streaming cutoff rule dictates.
+     _, _, last_end = _window(DAYS[-1])
+-    resolver = runtime._honest_resolver  # noqa: SLF001 - gate-B harness owns the dark seat
++    resolver = runtime._honest_resolver  # gate-B harness owns the dark seat
+     flushed = resolver.flush(last_end.to_pydatetime()) if resolver is not None else ()
+     if flushed:
+-        runtime._append_dark(flushed)  # noqa: SLF001
++        runtime._append_dark(flushed)
+     old_still_open = (
+         runtime._outcome_tracker.open_count if runtime._outcome_tracker is not None else 0
+-    )  # noqa: SLF001
++    )
+     dark = {item.key: item for item in runtime.dark_outcomes}
+ 
+     lines.append("## Per-day\n")
+-    lines.append("| day | trades | predictions | old outcomes (by type) | dark events | dark (by kind) |")
++    lines.append(
++        "| day | trades | predictions | old outcomes (by type) | dark events | dark (by kind) |"
++    )
+     lines.append("|---|---|---|---|---|---|")
+     for day, n_trades, day_preds, day_old, dark_delta, day_dark in per_day_rows:
+         lines.append(f"| {day} | {n_trades} | {day_preds} | {dict(day_old) or '-'} "
+@@ -176,8 +178,8 @@ def main() -> None:
+     new_kinds = Counter(_dark_kind(i) for i in dark.values())
+     lines.append("\n## Totals\n")
+     lines.append(f"- predictions registered (both paths, one-for-one): **{total_preds}**")
+-    lines.append(f"- OLD path resolutions: **{sum(old_types.values())}** by type {dict(old_types)}; "
+-                 f"still open at harness end: {old_still_open}")
++    lines.append(f"- OLD path resolutions: **{sum(old_types.values())}** by type "
++                 f"{dict(old_types)}; still open at harness end: {old_still_open}")
+     lines.append(f"- NEW path events: **{len(dark)}** by kind {dict(new_kinds)}; "
+                  f"still open after flush: {resolver.open_count if resolver else 0}")
+ 

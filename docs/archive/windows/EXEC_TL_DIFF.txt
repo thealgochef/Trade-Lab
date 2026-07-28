@@ -1,0 +1,4005 @@
+diff --git a/backend/src/trade_lab/api/app.py b/backend/src/trade_lab/api/app.py
+index 39c7187..d612831 100644
+--- a/backend/src/trade_lab/api/app.py
++++ b/backend/src/trade_lab/api/app.py
+@@ -24,6 +24,12 @@ from trade_lab.api.dto import (
+ )
+ from trade_lab.config import Settings, load_settings
+ from trade_lab.services.broadcaster import WebSocketBroadcaster
++from trade_lab.services.execution import (
++    ExecutionJournal,
++    ExecutionPolicy,
++    PaperExecutionTracker,
++    executions_root_for,
++)
+ from trade_lab.services.inference.features import DEFAULT_FEATURE_REGISTRY
+ from trade_lab.services.inference.inference_engine import InferenceEngine
+ from trade_lab.services.journal import PredictionJournal
+@@ -283,6 +289,32 @@ def create_app(
+     broadcaster = broadcaster or WebSocketBroadcaster(runtime)
+     app.state.runtime = runtime
+     app.state.broadcaster = broadcaster
++
++    # EXEC P2/P3a: the paper-execution tracker — an observer of the observer.
++    # It consumes the broadcast RuntimeUpdate stream plus two READ-ONLY
++    # providers (the resolver's open-setup snapshot and the active contract's
++    # execution economics) and writes only its own executions journal beside
++    # the prediction journal. Zero influence on the serving path.
++    def _execution_policy() -> ExecutionPolicy | None:
++        active = inference_engine.active()
++        if active is None:
++            return None
++        contract = active.contract
++        return ExecutionPolicy(
++            tick_size=contract.tick_size,
++            tp_points=contract.label_policy.tp_points,
++            sl_points=contract.label_policy.sl_points,
++            point_value=contract.point_value,
++        )
++
++    executions_root = executions_root_for(settings.journal_path)
++    execution_tracker = PaperExecutionTracker(
++        open_setups=runtime.open_setup_views,
++        policy=_execution_policy,
++        journal=ExecutionJournal(executions_root),
++    )
++    broadcaster.set_execution_tracker(execution_tracker)
++    app.state.execution_tracker = execution_tracker
+     replay = replay or HistoricalReplayService(runtime)
+     if not replay.has_update_callback:
+         replay.set_update_callback(broadcaster.broadcast_update)
+@@ -521,17 +553,19 @@ def create_app(
+ 
+         bundle_dir: Path | None = None
+         if bundle is not None:
+-            # Same id hygiene as activation: path-like ids are a 400, unknown
+-            # (but well-formed) ids a 404 — never a filesystem probe.
++            # Same id hygiene as activation: path-like ids are a 400 — never a
++            # filesystem probe. A well-formed id absent from models_root is NOT
++            # an error: the bundle_id row filter still applies so retired
++            # bundles' journal history stays queryable; only the OOS panel
++            # needs the on-disk bundle dir.
+             if not is_safe_model_id(bundle):
+                 raise HTTPException(status_code=400, detail="invalid model id")
+             candidate = None if settings.models_path is None else settings.models_path / bundle
+             try:
+-                if candidate is None or not candidate.is_dir() or candidate.is_symlink():
+-                    raise HTTPException(status_code=404, detail="unknown model id")
+-            except OSError as exc:
+-                raise HTTPException(status_code=404, detail="unknown model id") from exc
+-            bundle_dir = candidate
++                if candidate is not None and candidate.is_dir() and not candidate.is_symlink():
++                    bundle_dir = candidate
++            except OSError:
++                bundle_dir = None
+         try:
+             filters = PerformanceFilters(
+                 mode=mode,
+@@ -546,6 +580,8 @@ def create_app(
+                 filters=filters,
+                 models_root=settings.models_path,
+                 bundle_dir=bundle_dir,
++                # EXEC P3d: the paper-execution summary rides the same report.
++                executions_dir=executions_root,
+             )
+         except InvalidPerformanceFilter as exc:
+             raise HTTPException(status_code=400, detail=str(exc)) from exc
+diff --git a/backend/src/trade_lab/api/dto.py b/backend/src/trade_lab/api/dto.py
+index 8cb63ae..6d762b3 100644
+--- a/backend/src/trade_lab/api/dto.py
++++ b/backend/src/trade_lab/api/dto.py
+@@ -16,6 +16,7 @@ from trade_lab.domain.feed import FeedConnectionState, FeedStatus
+ from trade_lab.domain.levels import DisplayLevel, TouchEvent
+ from trade_lab.domain.observations import Observation
+ from trade_lab.domain.outcomes import DroppedPrediction, Outcome
++from trade_lab.services.execution import ClosedExecution, OpenPosition
+ from trade_lab.services.inference.inference_engine import Prediction
+ from trade_lab.services.model_registry import ModelBundle
+ from trade_lab.services.replay import ReplayStatus
+@@ -35,6 +36,8 @@ MessageType = Literal[
+     "prediction.created",
+     "prediction.resolved",
+     "prediction.dropped",
++    "position.opened",
++    "position.closed",
+     "model.status",
+     "model.reset",
+ ]
+@@ -139,6 +142,56 @@ class DroppedPredictionDTO(ApiModel):
+     entry_price: float | None = None
+ 
+ 
++class OpenPositionDTO(ApiModel):
++    """One tracked paper position (EXEC P3a). Both entry columns + barriers.
++
++    ``unrealized_points``/``unrealized_points_conservative`` are marked against
++    ``last_price`` (the tracker's last-seen trade print at serialization time);
++    all three are ``None`` when no print has been observed yet.
++    """
++
++    prediction_id: str
++    touch_id: str
++    direction: str
++    contracts: int
++    entry_ts_utc: datetime
++    entry_price: float
++    entry_price_conservative: float
++    tp_price: float
++    sl_price: float
++    session: str
++    level_kind: str
++    bundle_id: str
++    mode: str
++    point_value: float
++    last_price: float | None = None
++    unrealized_points: float | None = None
++    unrealized_points_conservative: float | None = None
++
++
++class ClosedExecutionDTO(ApiModel):
++    """One closed paper execution (EXEC P3a): both columns realized."""
++
++    prediction_id: str
++    touch_id: str
++    direction: str
++    contracts: int
++    entry_ts_utc: datetime
++    exit_ts_utc: datetime | None
++    reason: str
++    entry_price: float
++    entry_price_conservative: float
++    exit_price: float
++    exit_price_conservative: float
++    points: float
++    points_conservative: float
++    dollars: float
++    dollars_conservative: float
++    point_value: float
++    session: str
++    level_kind: str
++
++
+ class ModelStatusDTO(ApiModel):
+     """Active model status for the UI. Path-free and secret-free by construction."""
+ 
+@@ -198,6 +251,9 @@ class SnapshotPayload(ApiModel):
+     predictions: list[PredictionDTO] = Field(default_factory=list)
+     outcomes: list[OutcomeDTO] = Field(default_factory=list)
+     dropped: list[DroppedPredictionDTO] = Field(default_factory=list)
++    # EXEC P3a: the paper-execution open-position block, with live unrealized
++    # P&L (both columns) against the tracker's last-seen trade print.
++    open_positions: list[OpenPositionDTO] = Field(default_factory=list)
+     model_status: ModelStatusDTO
+     session: str | None = None
+     trading_day: date | None = None
+@@ -340,6 +396,58 @@ def dropped_to_dto(dropped: DroppedPrediction) -> DroppedPredictionDTO:
+     )
+ 
+ 
++def open_position_to_dto(
++    position: OpenPosition, last_trade_price_ticks: int | None
++) -> OpenPositionDTO:
++    last_price = (
++        None if last_trade_price_ticks is None else last_trade_price_ticks * position.tick_size
++    )
++    return OpenPositionDTO(
++        prediction_id=position.prediction_id,
++        touch_id=position.touch_id,
++        direction=position.direction,
++        contracts=position.contracts,
++        entry_ts_utc=position.entry_ts_utc,
++        entry_price=position.entry_price,
++        entry_price_conservative=position.entry_price_conservative,
++        tp_price=position.tp_price,
++        sl_price=position.sl_price,
++        session=position.session,
++        level_kind=position.level_kind,
++        bundle_id=position.bundle_id,
++        mode=position.mode,
++        point_value=position.point_value,
++        last_price=last_price,
++        unrealized_points=position.unrealized_points(last_trade_price_ticks),
++        unrealized_points_conservative=position.unrealized_points_conservative(
++            last_trade_price_ticks
++        ),
++    )
++
++
++def closed_execution_to_dto(execution: ClosedExecution) -> ClosedExecutionDTO:
++    return ClosedExecutionDTO(
++        prediction_id=execution.prediction_id,
++        touch_id=execution.touch_id,
++        direction=execution.direction,
++        contracts=execution.contracts,
++        entry_ts_utc=execution.entry_ts_utc,
++        exit_ts_utc=execution.exit_ts_utc,
++        reason=execution.reason,
++        entry_price=execution.entry_price,
++        entry_price_conservative=execution.entry_price_conservative,
++        exit_price=execution.exit_price,
++        exit_price_conservative=execution.exit_price_conservative,
++        points=execution.points,
++        points_conservative=execution.points_conservative,
++        dollars=execution.dollars,
++        dollars_conservative=execution.dollars_conservative,
++        point_value=execution.point_value,
++        session=execution.session,
++        level_kind=execution.level_kind,
++    )
++
++
+ def model_status_to_dto(status: ModelStatus) -> ModelStatusDTO:
+     return ModelStatusDTO(
+         loaded=status.loaded,
+@@ -454,6 +562,18 @@ def dropped_payload(dropped: DroppedPrediction) -> dict[str, Any]:
+     return {"dropped": dropped_to_dto(dropped).model_dump(mode="json")}
+ 
+ 
++def position_opened_payload(
++    position: OpenPosition, last_trade_price_ticks: int | None
++) -> dict[str, Any]:
++    return {
++        "position": open_position_to_dto(position, last_trade_price_ticks).model_dump(mode="json")
++    }
++
++
++def position_closed_payload(execution: ClosedExecution) -> dict[str, Any]:
++    return {"execution": closed_execution_to_dto(execution).model_dump(mode="json")}
++
++
+ def make_envelope(
+     message_type: MessageType,
+     sequence: int,
+diff --git a/backend/src/trade_lab/services/broadcaster.py b/backend/src/trade_lab/services/broadcaster.py
+index 2d66457..82516f9 100644
+--- a/backend/src/trade_lab/services/broadcaster.py
++++ b/backend/src/trade_lab/services/broadcaster.py
+@@ -21,7 +21,10 @@ from trade_lab.api.dto import (
+     make_envelope,
+     model_status_to_dto,
+     observation_to_dto,
++    open_position_to_dto,
+     outcome_payload,
++    position_closed_payload,
++    position_opened_payload,
+     prediction_payload,
+     snapshot_payload_from_runtime,
+     touch_to_dto,
+@@ -29,6 +32,7 @@ from trade_lab.api.dto import (
+ )
+ from trade_lab.api.serialization import dumps_bytes
+ from trade_lab.domain.data_quality import DataQualityCode, DataQualityWarning
++from trade_lab.services.execution import PaperExecutionTracker
+ from trade_lab.services.runtime import ApplicationRuntime, ModelStatus, RuntimeUpdate
+ 
+ 
+@@ -46,9 +50,25 @@ class WebSocketBroadcaster:
+         # Track the active model id so a model.status delta is emitted only when the
+         # active model actually changes (activate/deactivate), not on every update.
+         self._last_model_id = runtime.model_status().model_id
++        # EXEC P3a: the paper-execution tracker observes every broadcast update
++        # (the single choke point every UI-bound RuntimeUpdate flows through —
++        # replay/live callbacks AND the activation-endpoint broadcasts), so it
++        # sees exactly what the UI sees, clients connected or not.
++        self._execution_tracker: PaperExecutionTracker | None = None
++
++    def set_execution_tracker(self, tracker: PaperExecutionTracker | None) -> None:
++        self._execution_tracker = tracker
+ 
+     def snapshot_payload(self) -> SnapshotPayload:
+-        return snapshot_payload_from_runtime(self.runtime.snapshot())
++        payload = snapshot_payload_from_runtime(self.runtime.snapshot())
++        tracker = self._execution_tracker
++        if tracker is not None:
++            last_ticks = tracker.last_trade_price_ticks
++            payload.open_positions = [
++                open_position_to_dto(position, last_ticks)
++                for position in tracker.open_positions()
++            ]
++        return payload
+ 
+     def envelope_bytes(self, message_type: MessageType, payload: Any) -> bytes:
+         return dumps_bytes(make_envelope(message_type, next(self._sequence), payload))
+@@ -128,6 +148,25 @@ class WebSocketBroadcaster:
+             messages.append(self.envelope_bytes("prediction.resolved", outcome_payload(outcome)))
+         for dropped in update.dropped:
+             messages.append(self.envelope_bytes("prediction.dropped", dropped_payload(dropped)))
++        # EXEC P3a: advance the paper-execution tracker on this update (observe()
++        # never raises) and append its typed deltas AFTER the prediction frames
++        # they derive from. The observation runs here — once per broadcast — so
++        # the executions journal is written whether or not any client is
++        # connected.
++        tracker = self._execution_tracker
++        if tracker is not None:
++            opened, closed = tracker.observe(update)
++            for position in opened:
++                messages.append(
++                    self.envelope_bytes(
++                        "position.opened",
++                        position_opened_payload(position, tracker.last_trade_price_ticks),
++                    )
++                )
++            for execution in closed:
++                messages.append(
++                    self.envelope_bytes("position.closed", position_closed_payload(execution))
++                )
+         model_status_message = self._model_status_message_if_changed()
+         if model_status_message is not None:
+             messages.append(model_status_message)
+diff --git a/backend/src/trade_lab/services/execution.py b/backend/src/trade_lab/services/execution.py
+new file mode 100644
+index 0000000..ec7aa90
+--- /dev/null
++++ b/backend/src/trade_lab/services/execution.py
+@@ -0,0 +1,644 @@
++"""Paper execution tracking — derived fills, positions, and P&L (EXEC P2).
++
++An OBSERVER OF THE OBSERVER: the tracker consumes the same
++:class:`~trade_lab.services.runtime.RuntimeUpdate` stream the WebSocket
++broadcaster fans out to the UI, plus two read-only providers (the honest
++resolver's :meth:`open_setups` snapshot and the active contract's execution
++policy). INVARIANT: zero influence on touches, inference, the resolver, or the
++prediction journal — nothing here mutates runtime/engine state, and the only
++artifact written is the tracker's own ``executions/<trading_day>.jsonl``
++(beside the prediction journal, same never-raises discipline).
++
++OPEN: when an ELIGIBLE prediction's setup appears in ``open_setups()`` the
++resolver filled it — the position opens at the honest entry (the view's fill),
++side from the prediction's direction. Ineligible predictions are never tracked
++in v1. A same-batch race (the setup registers AND resolves/terminal-drops on
++one trade batch, so it is already gone from the snapshot) opens from the
++outcome/drop row's own honest ``entry_price`` and is counted
++(``opened_from_resolution``).
++
++CLOSE: ``tp_hit``/``sl_hit`` outcomes exit at the setup's barrier price;
++terminal drops (``no_forward``/``no_resolution`` — entry present) exit at the
++tracker's last-seen trade price at the drop instant (the latest trade print in
++the tracker's observed stream when the drop is observed); registration-time
++drops (``flatten``/``cutoff``/``no_fill`` — entry null) mean the resolver never
++filled, so the position never existed (an open position receiving one is an
++invariant violation, counted, never raised).
++
++TWO COLUMNS per fill, both always computed:
++
++* ``optimistic`` — exact anchor/barriers: entry at the honest fill, tp/sl exits
++  at the exact barrier prices, drop exits at the last trade print.
++* ``conservative`` — entry 1 tick adverse; sl exit 1 tick adverse; tp exit AT
++  the barrier (the print requirement is already resolution semantics: the
++  excursion rule fires only once a print reaches the barrier); drop exits at
++  the print as-is (it is already a real print).
++
++Sizing: 1 contract at the active contract's ``point_value`` (default 20).
++
++RESET semantics: a runtime reset (replay start / live start / model
++activation, observed via ``RuntimeUpdate.model_reset_reason``) clears open
++positions with a ``reset`` event row — no phantom carry, no synthetic closes.
++
++LIVE-ORIGINATED ONLY BY CONSTRUCTION: the live warm gate (WARM-FIX P3,
++anchor-based) suppresses prediction production for warm-REPLAYED touches, so
++no position can ever originate from replayed history; a live-originated touch
++during the catch-up tail CAN predict, and its update reaches the tracker
++because serving deltas are exempt from the live broadcast throttle
++(``live.py::_emit_market``, EXEC verify fix). Replay positions ride the
++replay clock.
++
++All prices are tracked internally in integer TICKS (the view/bar grid) and
++surfaced in points via the policy ``tick_size``, so column arithmetic is exact.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++from collections.abc import Callable, Sequence
++from dataclasses import dataclass
++from datetime import datetime
++from pathlib import Path
++from typing import Any
++
++from trade_lab.domain.outcomes import DroppedPrediction, Outcome, ResolutionType
++from trade_lab.domain.trading_day import trading_day_for
++from trade_lab.services.inference.inference_engine import Prediction
++from trade_lab.services.runtime import RuntimeUpdate
++
++logger = logging.getLogger(__name__)
++
++#: Registration-time drop reasons: the resolver never filled (entry null).
++REGISTRATION_DROP_REASONS = frozenset({"flatten", "cutoff", "no_fill"})
++#: Terminal drop reasons: the setup was live and carries the honest entry.
++TERMINAL_DROP_REASONS = frozenset({"no_forward", "no_resolution"})
++
++#: Bound on simultaneously open tracked positions. Setups resolve or flush at
++#: their cutoff daily, so this is a leak backstop, not an expected limit.
++_OPEN_POSITION_CAP = 500
++
++
++def executions_root_for(journal_path: Path) -> Path:
++    """The executions directory beside the prediction journal directory."""
++
++    return Path(journal_path).parent / "executions"
++
++
++@dataclass(frozen=True, slots=True)
++class ExecutionPolicy:
++    """The active contract's execution economics, read at open time."""
++
++    tick_size: float
++    tp_points: float
++    sl_points: float
++    point_value: float = 20.0
++
++
++@dataclass(frozen=True, slots=True)
++class OpenPosition:
++    """One tracked paper position, priced in integer ticks (exact arithmetic).
++
++    ``entry_price_ticks`` is the honest fill (optimistic column);
++    ``entry_price_conservative_ticks`` is 1 tick adverse. ``source`` is
++    ``"open_setups"`` for the normal path or ``"resolution_fallback"`` for the
++    same-batch race (see the module docstring).
++    """
++
++    prediction_id: str
++    touch_id: str
++    direction: str  # "long" | "short"
++    contracts: int
++    entry_ts_utc: datetime
++    entry_price_ticks: int
++    entry_price_conservative_ticks: int
++    tp_price_ticks: int
++    sl_price_ticks: int
++    tick_size: float
++    point_value: float
++    session: str
++    level_kind: str
++    bundle_id: str
++    mode: str
++    source: str
++
++    @property
++    def is_long(self) -> bool:
++        return self.direction == "long"
++
++    @property
++    def entry_price(self) -> float:
++        return self.entry_price_ticks * self.tick_size
++
++    @property
++    def entry_price_conservative(self) -> float:
++        return self.entry_price_conservative_ticks * self.tick_size
++
++    @property
++    def tp_price(self) -> float:
++        return self.tp_price_ticks * self.tick_size
++
++    @property
++    def sl_price(self) -> float:
++        return self.sl_price_ticks * self.tick_size
++
++    def _points(self, entry_ticks: int, exit_ticks: int) -> float:
++        signed = exit_ticks - entry_ticks if self.is_long else entry_ticks - exit_ticks
++        return signed * self.tick_size
++
++    def unrealized_points(self, last_trade_price_ticks: int | None) -> float | None:
++        """Optimistic mark-to-last-print (no exit adjustment: a print is a print)."""
++
++        if last_trade_price_ticks is None:
++            return None
++        return self._points(self.entry_price_ticks, last_trade_price_ticks)
++
++    def unrealized_points_conservative(
++        self, last_trade_price_ticks: int | None
++    ) -> float | None:
++        """Conservative mark: the 1-tick-adverse entry against the same print."""
++
++        if last_trade_price_ticks is None:
++            return None
++        return self._points(self.entry_price_conservative_ticks, last_trade_price_ticks)
++
++
++@dataclass(frozen=True, slots=True)
++class ClosedExecution:
++    """One closed paper execution: both columns realized, in points and dollars."""
++
++    prediction_id: str
++    touch_id: str
++    direction: str
++    contracts: int
++    entry_ts_utc: datetime
++    exit_ts_utc: datetime | None
++    reason: str  # tp_hit | sl_hit | no_forward | no_resolution
++    entry_price: float
++    entry_price_conservative: float
++    exit_price: float
++    exit_price_conservative: float
++    points: float
++    points_conservative: float
++    dollars: float
++    dollars_conservative: float
++    point_value: float
++    session: str
++    level_kind: str
++    bundle_id: str
++    mode: str
++
++
++class ExecutionJournal:
++    """Append paper-execution events to per-trading-day JSONL files.
++
++    Mirrors :class:`~trade_lab.services.journal.PredictionJournal`: one file per
++    trading day (18:00 ET roll) under the executions root, line-buffered append,
++    no fsync, failures logged and never propagated.
++    """
++
++    def __init__(self, root: Path) -> None:
++        self._root = Path(root)
++
++    def record(self, ts_utc: datetime | None, payload: dict[str, Any]) -> None:
++        try:
++            day = trading_day_for(ts_utc) if ts_utc is not None else None
++            name = f"{day.isoformat()}.jsonl" if day is not None else "undated.jsonl"
++            self._root.mkdir(parents=True, exist_ok=True)
++            line = json.dumps(payload, default=_json_default, separators=(",", ":"))
++            with (self._root / name).open("a", encoding="utf-8") as handle:
++                handle.write(line + "\n")
++        except Exception:
++            logger.warning("execution journal append failed", exc_info=True)
++
++
++class PaperExecutionTracker:
++    """The pure paper-execution state machine over observed RuntimeUpdates.
++
++    Inputs are injected read-only providers: ``open_setups`` returns the honest
++    resolver's current :class:`OpenSetupView` snapshot (duck-typed: objects with
++    ``prediction_id``/``entry_price_ticks``/``entry_ts_utc``/``tp_price_ticks``/
++    ``sl_price_ticks``); ``policy`` returns the active contract's
++    :class:`ExecutionPolicy` (or ``None`` when no model is active — no position
++    can open then, counted). ``observe()`` must be called once per broadcast
++    RuntimeUpdate, AFTER the runtime processed the underlying events (the
++    broadcaster's position). It returns the (opened, closed) deltas for the WS
++    surface and never raises.
++    """
++
++    def __init__(
++        self,
++        *,
++        open_setups: Callable[[], Sequence[Any]],
++        policy: Callable[[], ExecutionPolicy | None],
++        journal: ExecutionJournal | None = None,
++    ) -> None:
++        self._open_setups = open_setups
++        self._policy = policy
++        self._journal = journal
++        self._open: dict[str, OpenPosition] = {}
++        self._mode = "unknown"
++        self._last_trade_price_ticks: int | None = None
++        self._last_event_ts_utc: datetime | None = None
++        self._anomalies: dict[str, int] = {}
++
++    # -- read-only surface ---------------------------------------------------
++
++    @property
++    def last_trade_price_ticks(self) -> int | None:
++        return self._last_trade_price_ticks
++
++    def open_positions(self) -> tuple[OpenPosition, ...]:
++        return tuple(self._open.values())
++
++    def anomalies(self) -> dict[str, int]:
++        return dict(self._anomalies)
++
++    # -- the state machine ---------------------------------------------------
++
++    def observe(
++        self, update: RuntimeUpdate
++    ) -> tuple[tuple[OpenPosition, ...], tuple[ClosedExecution, ...]]:
++        """Advance on one observed update; returns (opened, closed) deltas."""
++
++        try:
++            return self._observe(update)
++        except Exception:
++            # The tracker must never break the broadcast path it observes.
++            logger.warning("paper execution tracker observe failed", exc_info=True)
++            return (), ()
++
++    def _observe(
++        self, update: RuntimeUpdate
++    ) -> tuple[tuple[OpenPosition, ...], tuple[ClosedExecution, ...]]:
++        # Reset FIRST: a coalesced replay batch can carry the reset plus the
++        # fresh post-reset deltas in one update (the broadcaster emits the reset
++        # frame first for the same reason).
++        if update.model_reset_reason is not None:
++            self._reset(update.model_reset_reason)
++        if update.feed_status is not None:
++            self._mode = update.feed_status.mode
++            if update.feed_status.last_event_ts_utc is not None:
++                self._last_event_ts_utc = update.feed_status.last_event_ts_utc
++        self._advance_last_trade(update)
++
++        opened: list[OpenPosition] = []
++        for prediction in update.predictions:
++            position = self._maybe_open(prediction, update)
++            if position is not None:
++                opened.append(position)
++
++        closed: list[ClosedExecution] = []
++        for outcome in update.outcomes:
++            execution = self._close_on_outcome(outcome)
++            if execution is not None:
++                closed.append(execution)
++        for drop in update.dropped:
++            execution = self._close_on_drop(drop)
++            if execution is not None:
++                closed.append(execution)
++        return tuple(opened), tuple(closed)
++
++    def _advance_last_trade(self, update: RuntimeUpdate) -> None:
++        # The last trade print, observed exactly as the UI observes it: the
++        # newest bar's close is the newest trade's price. Closed bars first so
++        # a batch's forming bar (which includes its latest trade) wins.
++        for bars in (update.closed_bars, update.current_bars):
++            if bars:
++                bar = bars[-1]
++                self._last_trade_price_ticks = bar.close_ticks
++                self._last_event_ts_utc = bar.close_ts_utc
++
++    # -- open ------------------------------------------------------------------
++
++    def _maybe_open(
++        self, prediction: Prediction, update: RuntimeUpdate
++    ) -> OpenPosition | None:
++        if not prediction.is_eligible:
++            return None  # ineligible predictions are never tracked in v1
++        pid = prediction.prediction_id
++        if pid in self._open:
++            self._count("duplicate_open_suppressed")
++            return None
++        policy = self._policy()
++        if policy is None:
++            self._count("open_without_policy")
++            return None
++        view = self._find_view(pid)
++        if view is not None:
++            position = self._position_from_view(prediction, view, policy)
++        else:
++            position = self._position_from_same_batch_resolution(
++                prediction, update, policy
++            )
++            if position is None:
++                # No fill exists: a registration-time drop rode this update, or
++                # the resolver registration failed upstream. Never opened.
++                if not any(
++                    drop.prediction_id == pid
++                    and drop.reason in REGISTRATION_DROP_REASONS
++                    for drop in update.dropped
++                ):
++                    self._count("eligible_prediction_without_setup")
++                return None
++        self._open[pid] = position
++        self._evict_if_over_cap()
++        self._journal_open(position)
++        return position
++
++    def _find_view(self, prediction_id: str) -> Any | None:
++        try:
++            views = self._open_setups()
++        except Exception:
++            logger.warning("open-setup snapshot read failed", exc_info=False)
++            self._count("open_setups_read_failed")
++            return None
++        for view in views:
++            if view.prediction_id == prediction_id:
++                return view
++        return None
++
++    def _position_from_view(
++        self, prediction: Prediction, view: Any, policy: ExecutionPolicy
++    ) -> OpenPosition:
++        entry_ticks = int(view.entry_price_ticks)
++        return self._build_position(
++            prediction,
++            policy,
++            entry_ticks=entry_ticks,
++            entry_ts_utc=view.entry_ts_utc,
++            tp_ticks=int(view.tp_price_ticks),
++            sl_ticks=int(view.sl_price_ticks),
++            source="open_setups",
++        )
++
++    def _position_from_same_batch_resolution(
++        self, prediction: Prediction, update: RuntimeUpdate, policy: ExecutionPolicy
++    ) -> OpenPosition | None:
++        """The same-batch race: the setup registered AND left within one batch.
++
++        The resolver filled (the outcome/terminal-drop row carries the honest
++        entry) but the snapshot no longer holds the setup, so the fill and the
++        policy-implied barriers are reconstructed from the row itself.
++        """
++
++        pid = prediction.prediction_id
++        entry_price: float | None = None
++        for outcome in update.outcomes:
++            if outcome.prediction_id == pid:
++                entry_price = outcome.entry_price
++                break
++        if entry_price is None:
++            for drop in update.dropped:
++                if (
++                    drop.prediction_id == pid
++                    and drop.reason in TERMINAL_DROP_REASONS
++                    and drop.entry_price is not None
++                ):
++                    entry_price = drop.entry_price
++                    break
++        if entry_price is None:
++            return None
++        tick = policy.tick_size
++        entry_ticks = round(entry_price / tick)
++        tp_offset = round(policy.tp_points / tick)
++        sl_offset = round(policy.sl_points / tick)
++        is_long = prediction.direction == "long"
++        self._count("opened_from_resolution")
++        return self._build_position(
++            prediction,
++            policy,
++            entry_ticks=entry_ticks,
++            entry_ts_utc=prediction.event_ts_utc,
++            tp_ticks=entry_ticks + tp_offset if is_long else entry_ticks - tp_offset,
++            sl_ticks=entry_ticks - sl_offset if is_long else entry_ticks + sl_offset,
++            source="resolution_fallback",
++        )
++
++    def _build_position(
++        self,
++        prediction: Prediction,
++        policy: ExecutionPolicy,
++        *,
++        entry_ticks: int,
++        entry_ts_utc: datetime,
++        tp_ticks: int,
++        sl_ticks: int,
++        source: str,
++    ) -> OpenPosition:
++        is_long = prediction.direction == "long"
++        return OpenPosition(
++            prediction_id=prediction.prediction_id,
++            touch_id=prediction.touch_id,
++            direction=prediction.direction,
++            contracts=1,
++            entry_ts_utc=entry_ts_utc,
++            entry_price_ticks=entry_ticks,
++            # Conservative column: entry 1 tick adverse.
++            entry_price_conservative_ticks=entry_ticks + 1 if is_long else entry_ticks - 1,
++            tp_price_ticks=tp_ticks,
++            sl_price_ticks=sl_ticks,
++            tick_size=policy.tick_size,
++            point_value=policy.point_value,
++            session=prediction.session,
++            level_kind=prediction.level_kind,
++            bundle_id=prediction.model_id,
++            mode=self._mode,
++            source=source,
++        )
++
++    def _evict_if_over_cap(self) -> None:
++        while len(self._open) > _OPEN_POSITION_CAP:
++            evicted_pid = next(iter(self._open))
++            del self._open[evicted_pid]
++            self._count("evicted_open_positions")
++            logger.warning("paper execution tracker evicted an open position (cap)")
++
++    # -- close -----------------------------------------------------------------
++
++    def _close_on_outcome(self, outcome: Outcome) -> ClosedExecution | None:
++        position = self._open.pop(outcome.prediction_id, None)
++        if position is None:
++            return None  # ineligible or pre-tracker prediction — not ours
++        if outcome.resolution_type is ResolutionType.TP_HIT:
++            # tp exit at the barrier in BOTH columns: the excursion rule fires
++            # only once a print reaches the barrier (resolution semantics).
++            exit_ticks = position.tp_price_ticks
++            exit_cons_ticks = position.tp_price_ticks
++        else:  # SL_HIT
++            exit_ticks = position.sl_price_ticks
++            exit_cons_ticks = (
++                position.sl_price_ticks - 1
++                if position.is_long
++                else position.sl_price_ticks + 1
++            )
++        return self._finalize_close(
++            position,
++            reason=outcome.resolution_type.value,
++            exit_ticks=exit_ticks,
++            exit_cons_ticks=exit_cons_ticks,
++            exit_ts_utc=outcome.resolved_ts_utc,
++        )
++
++    def _close_on_drop(self, drop: DroppedPrediction) -> ClosedExecution | None:
++        position = self._open.get(drop.prediction_id)
++        if drop.reason in REGISTRATION_DROP_REASONS:
++            if position is not None:
++                # The resolver never filled — the tracker must never have
++                # opened this. Invariant violation: counted, position removed
++                # without synthesizing a fill that never existed.
++                del self._open[drop.prediction_id]
++                self._count("registration_drop_for_open_position")
++                logger.warning(
++                    "registration-time drop received for an open paper position"
++                )
++            return None
++        if position is None:
++            return None  # ineligible or pre-tracker — not ours
++        del self._open[drop.prediction_id]
++        exit_ticks = self._last_trade_price_ticks
++        if exit_ticks is None:
++            # No print ever observed (cannot happen after a real open): fall
++            # back to the entry (flat close), counted.
++            exit_ticks = position.entry_price_ticks
++            self._count("drop_close_without_price")
++        return self._finalize_close(
++            position,
++            reason=drop.reason,
++            exit_ticks=exit_ticks,
++            # A print is a print: no conservative exit adjustment on drop
++            # closes; the conservative column still carries the adverse entry.
++            exit_cons_ticks=exit_ticks,
++            exit_ts_utc=self._last_event_ts_utc or drop.decision_ts_utc,
++        )
++
++    def _finalize_close(
++        self,
++        position: OpenPosition,
++        *,
++        reason: str,
++        exit_ticks: int,
++        exit_cons_ticks: int,
++        exit_ts_utc: datetime | None,
++    ) -> ClosedExecution:
++        sign = 1 if position.is_long else -1
++        points = (exit_ticks - position.entry_price_ticks) * sign * position.tick_size
++        points_cons = (
++            (exit_cons_ticks - position.entry_price_conservative_ticks)
++            * sign
++            * position.tick_size
++        )
++        execution = ClosedExecution(
++            prediction_id=position.prediction_id,
++            touch_id=position.touch_id,
++            direction=position.direction,
++            contracts=position.contracts,
++            entry_ts_utc=position.entry_ts_utc,
++            exit_ts_utc=exit_ts_utc,
++            reason=reason,
++            entry_price=position.entry_price,
++            entry_price_conservative=position.entry_price_conservative,
++            exit_price=exit_ticks * position.tick_size,
++            exit_price_conservative=exit_cons_ticks * position.tick_size,
++            points=points,
++            points_conservative=points_cons,
++            dollars=points * position.point_value * position.contracts,
++            dollars_conservative=points_cons * position.point_value * position.contracts,
++            point_value=position.point_value,
++            session=position.session,
++            level_kind=position.level_kind,
++            bundle_id=position.bundle_id,
++            mode=position.mode,
++        )
++        self._journal_close(execution)
++        return execution
++
++    # -- reset -------------------------------------------------------------------
++
++    def _reset(self, reason: str) -> None:
++        cleared = tuple(self._open)
++        self._open.clear()
++        if self._journal is not None:
++            self._journal.record(
++                self._last_event_ts_utc,
++                {
++                    "type": "reset",
++                    "mode": self._mode,
++                    "ts_utc": self._last_event_ts_utc,
++                    "reason": reason,
++                    "cleared": len(cleared),
++                    "cleared_prediction_ids": list(cleared),
++                },
++            )
++        # A fresh session gets a fresh clock and price frontier.
++        self._last_trade_price_ticks = None
++        self._last_event_ts_utc = None
++
++    # -- persistence ---------------------------------------------------------------
++
++    def _journal_open(self, position: OpenPosition) -> None:
++        if self._journal is None:
++            return
++        self._journal.record(
++            position.entry_ts_utc,
++            {
++                "type": "open",
++                "mode": position.mode,
++                "bundle_id": position.bundle_id,
++                "ts_utc": position.entry_ts_utc,
++                "prediction_id": position.prediction_id,
++                "touch_id": position.touch_id,
++                "direction": position.direction,
++                "contracts": position.contracts,
++                "point_value": position.point_value,
++                "tick_size": position.tick_size,
++                "entry_price": position.entry_price,
++                "entry_price_conservative": position.entry_price_conservative,
++                "tp_price": position.tp_price,
++                "sl_price": position.sl_price,
++                "session": position.session,
++                "level_kind": position.level_kind,
++                "source": position.source,
++            },
++        )
++
++    def _journal_close(self, execution: ClosedExecution) -> None:
++        if self._journal is None:
++            return
++        self._journal.record(
++            execution.exit_ts_utc,
++            {
++                "type": "close",
++                "mode": execution.mode,
++                "bundle_id": execution.bundle_id,
++                "ts_utc": execution.exit_ts_utc,
++                "prediction_id": execution.prediction_id,
++                "touch_id": execution.touch_id,
++                "reason": execution.reason,
++                "direction": execution.direction,
++                "contracts": execution.contracts,
++                "point_value": execution.point_value,
++                "entry_ts_utc": execution.entry_ts_utc,
++                "entry_price": execution.entry_price,
++                "entry_price_conservative": execution.entry_price_conservative,
++                "exit_price": execution.exit_price,
++                "exit_price_conservative": execution.exit_price_conservative,
++                "points": execution.points,
++                "points_conservative": execution.points_conservative,
++                "dollars": execution.dollars,
++                "dollars_conservative": execution.dollars_conservative,
++                "session": execution.session,
++                "level_kind": execution.level_kind,
++            },
++        )
++
++    def _count(self, key: str) -> None:
++        self._anomalies[key] = self._anomalies.get(key, 0) + 1
++
++
++def _json_default(value: Any) -> Any:
++    if isinstance(value, datetime):
++        return value.isoformat()
++    if hasattr(value, "value"):
++        return value.value
++    return str(value)
+diff --git a/backend/src/trade_lab/services/live.py b/backend/src/trade_lab/services/live.py
+index 286a1f7..170916b 100644
+--- a/backend/src/trade_lab/services/live.py
++++ b/backend/src/trade_lab/services/live.py
+@@ -619,6 +619,16 @@ class LiveMarketDataService:
+         wall clock is NOT streamed; a throttled full snapshot carries catch-up progress
+         instead, and per-event streaming resumes (after one flush) once the frontier
+         reaches real time. Feed-status / warning items (no event ts) always forward.
++
++        EXEC verify fix (major): updates carrying SERVING deltas (predictions,
++        outcomes, drops, resets) are NEVER suppressed. The paper-execution tracker
++        observes only broadcast updates (the broadcaster choke point) and an
++        outcome rides exactly one update — a suppressed resolution would leave a
++        paper position open forever with no close row, and a catch-up-tail
++        prediction (live-originated touch past the warm anchor, frontier still
++        lagging) would never open. These deltas are a handful per session, so
++        forwarding their full updates cannot flood the browser the way the
++        per-bar stream does; the UI also stops silently losing those frames.
+         """
+ 
+         if not self._throttle_warm_start:
+@@ -637,7 +647,7 @@ class LiveMarketDataService:
+             # Caught up: push the whole built-up day once, then stream per event.
+             self._live_streaming = True
+             await self._broadcast_snapshot()
+-        if self._live_streaming:
++        if self._live_streaming or _carries_serving_deltas(update):
+             await self._on_update(update)
+         else:
+             await self._maybe_emit_warm_snapshot()
+@@ -658,6 +668,22 @@ class LiveMarketDataService:
+         await self._broadcast_snapshot()
+ 
+ 
++def _carries_serving_deltas(update: RuntimeUpdate) -> bool:
++    """True when the update carries prediction/outcome/drop/reset deltas.
++
++    These are throttle-exempt (see ``_emit_market``): each rides exactly one
++    RuntimeUpdate and downstream consumers (the paper-execution tracker, the
++    prediction panes/blotter) have no snapshot-replay recovery path for them.
++    """
++
++    return bool(
++        update.predictions
++        or update.outcomes
++        or update.dropped
++        or update.model_reset_reason is not None
++    )
++
++
+ def _map_core_live_state(state: CoreLiveState, *, fallback: LiveState) -> LiveState:
+     return {
+         CoreLiveState.IDLE: fallback,
+diff --git a/backend/src/trade_lab/services/performance.py b/backend/src/trade_lab/services/performance.py
+index 4a650d8..fee4b41 100644
+--- a/backend/src/trade_lab/services/performance.py
++++ b/backend/src/trade_lab/services/performance.py
+@@ -49,6 +49,10 @@ KNOWN_RESOLUTIONS = frozenset({RESOLUTION_TP, RESOLUTION_SL})
+ 
+ MODES = frozenset({"replay", "live", "all"})
+ ELIGIBILITY_FILTERS = frozenset({"all", "eligible", "ineligible"})
++#: The plugin session vocabulary journal prediction rows carry (REPORT_RECON (a)).
++#: A filter value outside it can never match a row, so it is a caller error (400),
++#: not an all-zeros 200.
++KNOWN_SESSIONS = frozenset({"asia", "london", "ny"})
+ 
+ _STRATEGY_FILE = "strategy.json"
+ _EVALUATION_FILE = "evaluation.json"
+@@ -81,6 +85,8 @@ class PerformanceFilters:
+             raise InvalidPerformanceFilter(
+                 f"eligibility must be one of {sorted(ELIGIBILITY_FILTERS)}"
+             )
++        if self.session is not None and self.session not in KNOWN_SESSIONS:
++            raise InvalidPerformanceFilter(f"session must be one of {sorted(KNOWN_SESSIONS)}")
+         if (
+             self.from_day is not None
+             and self.to_day is not None
+@@ -101,6 +107,7 @@ class PerformanceReport:
+     anomalies: dict[str, Any]
+     pricing: dict[str, Any]
+     oos_comparison: dict[str, Any] | None
++    executions: dict[str, Any] | None = None
+ 
+     def to_payload(self) -> dict[str, Any]:
+         return {
+@@ -112,6 +119,7 @@ class PerformanceReport:
+             "anomalies": self.anomalies,
+             "pricing": self.pricing,
+             "oos_comparison": self.oos_comparison,
++            "executions": self.executions,
+         }
+ 
+ 
+@@ -369,14 +377,17 @@ def aggregate_performance(
+     filters: PerformanceFilters | None = None,
+     models_root: Path | None = None,
+     bundle_dir: Path | None = None,
++    executions_dir: Path | None = None,
+ ) -> PerformanceReport:
+     """Aggregate the journal directory into a :class:`PerformanceReport`.
+ 
+     ``models_root`` enables per-row pricing from each row's own ``bundle_id``
+     contract; ``bundle_dir`` supplies the fallback ("active") contract AND
+-    enables the OOS comparison section. Raises :class:`JournalDirectoryNotFound`
+-    when the directory is absent and :class:`InvalidPerformanceFilter` on
+-    out-of-domain filter values.
++    enables the OOS comparison section; ``executions_dir`` enables the EXEC P3d
++    paper-execution summary (``None`` section when unset or the directory does
++    not exist yet). Raises :class:`JournalDirectoryNotFound` when the journal
++    directory is absent and :class:`InvalidPerformanceFilter` on out-of-domain
++    filter values.
+     """
+ 
+     filters = filters or PerformanceFilters()
+@@ -767,6 +778,12 @@ def aggregate_performance(
+         "eligibility": filters.eligibility,
+     }
+ 
++    executions = (
++        aggregate_executions(executions_dir, filters=filters)
++        if executions_dir is not None
++        else None
++    )
++
+     return PerformanceReport(
+         applied_filters=applied_filters,
+         headline=headline,
+@@ -776,9 +793,183 @@ def aggregate_performance(
+         anomalies=anomalies,
+         pricing=pricing_section,
+         oos_comparison=oos_comparison,
++        executions=executions,
+     )
+ 
+ 
++# ---------------------------------------------------------------------------
++# Paper-execution summary (EXEC P3d)
++# ---------------------------------------------------------------------------
++
++
++def aggregate_executions(
++    executions_dir: Path, *, filters: PerformanceFilters | None = None
++) -> dict[str, Any] | None:
++    """Summarize the paper-execution journal — ONE function, counted buckets.
++
++    Returns ``None`` when the directory does not exist (the surface stays dark
++    until the tracker writes its first file). Reads every ``*.jsonl`` with the
++    same discipline as the prediction-journal reader: unreadable files and
++    decode errors are counted and salvaged, malformed lines counted, unknown
++    row types counted — nothing silently dropped.
++
++    Realized P&L comes from ``close`` rows, filtered by mode/bundle/session and
++    the trading-day window (a close row is dated by its own ``ts_utc`` — the
++    realization instant; undated close rows are counted, not guessed). The
++    eligibility filter needs no row check: v1 tracks eligible predictions only,
++    so ``eligibility="ineligible"`` scopes the realized block to zero. Close
++    rows missing numeric points land in ``closes_missing_pnl`` and are excluded
++    from the sums — never treated as zero.
++    """
++
++    filters = filters or PerformanceFilters()
++    filters.validate()
++    try:
++        if not executions_dir.is_dir():
++            return None
++    except OSError:
++        return None
++
++    summary: dict[str, Any] = {
++        "note": (
++            "paper executions (observer-derived fills; optimistic = exact "
++            "anchor/barriers, conservative = 1-tick-adverse entry + 1-tick-adverse "
++            "sl exit); close rows filtered like the journal, dated by their exit ts"
++        ),
++        "files_scanned": 0,
++        "unreadable_files": 0,
++        "decode_error_files": 0,
++        "lines_total": 0,
++        "malformed_lines": 0,
++        "unknown_type_rows": 0,
++        "undated_close_rows": 0,
++        "opens_total": 0,
++        "closes_total": 0,
++        "resets_total": 0,
++        "reset_cleared_positions": 0,
++        "closes_outside_filters": 0,
++        "closes_missing_pnl": 0,
++    }
++
++    def _in_window(day: date) -> bool:
++        if filters.from_day is not None and day < filters.from_day:
++            return False
++        return not (filters.to_day is not None and day > filters.to_day)
++
++    realized_count = 0
++    points = 0.0
++    points_conservative = 0.0
++    dollars = 0.0
++    dollars_conservative = 0.0
++    wins = 0
++    losses = 0
++    by_reason: dict[str, dict[str, Any]] = {}
++
++    for file in sorted(executions_dir.glob("*.jsonl"), key=lambda p: p.name):
++        summary["files_scanned"] += 1
++        try:
++            data = file.read_bytes()
++        except OSError:
++            summary["unreadable_files"] += 1
++            logger.warning("performance: executions file is unreadable: %s", file.name)
++            continue
++        try:
++            text = data.decode("utf-8")
++        except UnicodeDecodeError:
++            summary["decode_error_files"] += 1
++            logger.warning(
++                "performance: executions file has undecodable bytes: %s", file.name
++            )
++            text = data.decode("utf-8", errors="replace")
++        for line in text.splitlines():
++            if not line.strip():
++                continue
++            summary["lines_total"] += 1
++            try:
++                row = json.loads(line)
++            except json.JSONDecodeError:
++                summary["malformed_lines"] += 1
++                continue
++            if not isinstance(row, dict):
++                summary["malformed_lines"] += 1
++                continue
++            row_type = row.get("type")
++            if row_type == "open":
++                summary["opens_total"] += 1
++                continue
++            if row_type == "reset":
++                summary["resets_total"] += 1
++                cleared = row.get("cleared")
++                if isinstance(cleared, int):
++                    summary["reset_cleared_positions"] += cleared
++                continue
++            if row_type != "close":
++                summary["unknown_type_rows"] += 1
++                continue
++
++            summary["closes_total"] += 1
++            if filters.eligibility == "ineligible":
++                # v1 tracks eligible predictions only — nothing can match.
++                summary["closes_outside_filters"] += 1
++                continue
++            if filters.mode != "all" and row.get("mode") != filters.mode:
++                summary["closes_outside_filters"] += 1
++                continue
++            if filters.bundle_id is not None and row.get("bundle_id") != filters.bundle_id:
++                summary["closes_outside_filters"] += 1
++                continue
++            if filters.session is not None and row.get("session") != filters.session:
++                summary["closes_outside_filters"] += 1
++                continue
++            if filters.from_day is not None or filters.to_day is not None:
++                ts = _parse_ts(row.get("ts_utc"))
++                if ts is None:
++                    summary["undated_close_rows"] += 1
++                    continue
++                if not _in_window(trading_day_for(ts)):
++                    summary["closes_outside_filters"] += 1
++                    continue
++            row_points = row.get("points")
++            row_points_cons = row.get("points_conservative")
++            if not isinstance(row_points, int | float) or not isinstance(
++                row_points_cons, int | float
++            ):
++                summary["closes_missing_pnl"] += 1
++                continue
++            realized_count += 1
++            points += float(row_points)
++            points_conservative += float(row_points_cons)
++            row_dollars = row.get("dollars")
++            row_dollars_cons = row.get("dollars_conservative")
++            if isinstance(row_dollars, int | float):
++                dollars += float(row_dollars)
++            if isinstance(row_dollars_cons, int | float):
++                dollars_conservative += float(row_dollars_cons)
++            if float(row_points) > 0:
++                wins += 1
++            else:
++                losses += 1
++            reason = row.get("reason") if isinstance(row.get("reason"), str) else "unknown"
++            bucket = by_reason.setdefault(
++                reason, {"count": 0, "points": 0.0, "points_conservative": 0.0}
++            )
++            bucket["count"] += 1
++            bucket["points"] += float(row_points)
++            bucket["points_conservative"] += float(row_points_cons)
++
++    summary["realized"] = {
++        "count": realized_count,
++        "points": points,
++        "points_conservative": points_conservative,
++        "dollars": dollars,
++        "dollars_conservative": dollars_conservative,
++        "wins": wins,
++        "losses": losses,
++        "by_reason": by_reason,
++    }
++    return summary
++
++
+ # ---------------------------------------------------------------------------
+ # OOS comparison (bundle artifacts vs the filtered journal)
+ # ---------------------------------------------------------------------------
+diff --git a/backend/src/trade_lab/services/runtime.py b/backend/src/trade_lab/services/runtime.py
+index 8de298c..cb1981b 100644
+--- a/backend/src/trade_lab/services/runtime.py
++++ b/backend/src/trade_lab/services/runtime.py
+@@ -459,6 +459,25 @@ class ApplicationRuntime:
+ 
+         return tuple(self._dropped)
+ 
++    def open_setup_views(self):
++        """EXEC P2: read-only snapshot of the honest resolver's open setups.
++
++        A pass-through to the SC accessor for OBSERVER consumers (the paper
++        execution tracker). Zero influence on the resolver by construction —
++        the accessor constructs frozen views and mutates nothing. Returns ``()``
++        when no resolver is active; read failures are swallowed (the observer
++        must never disturb the serving path it watches).
++        """
++
++        resolver = self._honest_resolver
++        if resolver is None:
++            return ()
++        try:
++            return resolver.open_setups()
++        except Exception:
++            logger.warning("open-setup view read failed", exc_info=False)
++            return ()
++
+     def _append_dropped(self, dropped: DroppedPrediction) -> None:
+         self._dropped.append(dropped)
+         if len(self._dropped) > self._outcome_limit:
+diff --git a/backend/tests/test_api_contract.py b/backend/tests/test_api_contract.py
+index a9c8747..94beb5b 100644
+--- a/backend/tests/test_api_contract.py
++++ b/backend/tests/test_api_contract.py
+@@ -552,6 +552,7 @@ def test_websocket_snapshot_contract_is_versioned_deterministic_and_safe() -> No
+         "predictions",
+         "outcomes",
+         "dropped",
++        "open_positions",
+         "model_status",
+         "session",
+         "trading_day",
+@@ -564,6 +565,7 @@ def test_websocket_snapshot_contract_is_versioned_deterministic_and_safe() -> No
+     assert snapshot["payload"]["predictions"] == []
+     assert snapshot["payload"]["outcomes"] == []
+     assert snapshot["payload"]["dropped"] == []
++    assert snapshot["payload"]["open_positions"] == []
+     assert snapshot["payload"]["model_status"] == {
+         "loaded": False,
+         "model_id": None,
+@@ -658,6 +660,7 @@ def test_empty_snapshot_payload_has_required_shape() -> None:
+         "predictions",
+         "outcomes",
+         "dropped",
++        "open_positions",
+         "model_status",
+         "session",
+         "trading_day",
+diff --git a/backend/tests/test_execution_e2e.py b/backend/tests/test_execution_e2e.py
+new file mode 100644
+index 0000000..7189bd5
+--- /dev/null
++++ b/backend/tests/test_execution_e2e.py
+@@ -0,0 +1,210 @@
++"""EXEC end-to-end: real resolver -> accessor -> tracker -> WS + journal.
++
++Unlike the unit tests (fake providers), this drives the FULL observer chain the
++way production wires it: ApplicationRuntime with the real SC streaming resolver
++(fixture contract: tick 0.25, tp 15, sl 30, point_value 20) -> the runtime's
++open_setup_views() pass-through -> PaperExecutionTracker -> WebSocketBroadcaster
++message builder (the choke point every update flows through) -> the executions
++journal on disk. Also pins the observer invariant: the tracker's presence does
++not change the runtime's served outcome stream.
++"""
++
++from __future__ import annotations
++
++import json
++from datetime import UTC, datetime, timedelta
++from pathlib import Path
++from types import MappingProxyType, SimpleNamespace
++
++from strategy_core import load_strategy_contract
++
++from trade_lab.domain.events import TradeEvent, TradeSide
++from trade_lab.domain.levels import LevelDirection, LevelKind, TouchEvent
++from trade_lab.domain.sessions import SessionName
++from trade_lab.services.broadcaster import WebSocketBroadcaster
++from trade_lab.services.execution import (
++    ExecutionJournal,
++    ExecutionPolicy,
++    PaperExecutionTracker,
++    executions_root_for,
++)
++from trade_lab.services.inference.inference_engine import Prediction
++from trade_lab.services.runtime import ApplicationRuntime
++
++_FIXTURE_STRATEGY = Path(__file__).parent / "fixtures" / "strategy.json"
++_TOUCH_TS = datetime(2026, 1, 5, 14, 0, tzinfo=UTC)  # 10:00 ET weekday
++_LEVEL_TICKS = 68_000
++
++
++class _FakeEngine:
++    def __init__(self, contract) -> None:
++        self.active_contract = contract
++        self.has_active_model = True
++        self._counter = 0
++
++    def active(self):
++        return SimpleNamespace(
++            contract=self.active_contract,
++            section=None,
++            model_id="m-1",
++            validation_ok=True,
++            validation_detail="fake",
++        )
++
++    def predict_for_observation(self, observation, market_context) -> Prediction:
++        self._counter += 1
++        return Prediction(
++            prediction_id=f"pred-{self._counter}",
++            touch_id=observation.originating_touch_id,
++            observation_id=observation.observation_id,
++            event_ts_utc=observation.scheduled_end_ts_utc,
++            predicted_class="tradeable_reversal",
++            probabilities=MappingProxyType({"tradeable_reversal": 1.0}),
++            feature_values=MappingProxyType({}),
++            level_kind=observation.level_kind.value,
++            level_price_ticks=observation.level_price_ticks,
++            direction="long",
++            session="ny",
++            is_eligible=True,
++            model_id="m-1",
++            contract_id="NQ_test",
++            nan_count=0,
++        )
++
++
++def _trade(ts: datetime, price_ticks: int) -> TradeEvent:
++    return TradeEvent(
++        event_ts_utc=ts,
++        receive_ts_utc=None,
++        instrument_id=1,
++        requested_symbol="NQ.c.0",
++        raw_symbol=None,
++        price_ticks=price_ticks,
++        size=1,
++        side=TradeSide.UNKNOWN,
++        source_schema="trades",
++    )
++
++
++def _touch(ts: datetime = _TOUCH_TS) -> TouchEvent:
++    return TouchEvent(
++        touch_id="touch-1",
++        event_ts_utc=ts,
++        trading_day=ts.date(),
++        session=SessionName.NY,
++        level_kind=LevelKind.NY_LOW,
++        level_price_ticks=_LEVEL_TICKS,
++        trade_price_ticks=_LEVEL_TICKS,
++        requested_symbol="NQ.c.0",
++        raw_symbol=None,
++        instrument_id=1,
++        direction=LevelDirection.LONG,
++    )
++
++
++def _wire(tmp_path: Path):
++    """Compose runtime + broadcaster + tracker exactly the way create_app does."""
++
++    contract = load_strategy_contract(_FIXTURE_STRATEGY)
++    engine = _FakeEngine(contract)
++    runtime = ApplicationRuntime(
++        requested_symbol="NQ.c.0",
++        tick_timeframes=(147,),
++        observation_duration_seconds=300,
++        inference_engine=engine,
++    )
++    broadcaster = WebSocketBroadcaster(runtime)
++    executions_root = executions_root_for(tmp_path / "journal")
++    tracker = PaperExecutionTracker(
++        open_setups=runtime.open_setup_views,
++        policy=lambda: ExecutionPolicy(
++            tick_size=contract.tick_size,
++            tp_points=contract.label_policy.tp_points,
++            sl_points=contract.label_policy.sl_points,
++            point_value=contract.point_value,
++        ),
++        journal=ExecutionJournal(executions_root),
++    )
++    broadcaster.set_execution_tracker(tracker)
++    return runtime, broadcaster, tracker, executions_root
++
++
++def _drive(runtime, broadcaster, event) -> list[dict]:
++    """Process one event and broadcast its update — the production flow."""
++
++    update = runtime.process_market_event(event)
++    return [json.loads(raw) for raw in broadcaster.messages_for_update(update)]
++
++
++def test_full_lifecycle_through_the_real_resolver_and_choke_point(tmp_path: Path) -> None:
++    runtime, broadcaster, tracker, executions_root = _wire(tmp_path)
++    runtime.observations.start_from_touch(_touch())
++    _drive(runtime, broadcaster, _trade(_TOUCH_TS + timedelta(seconds=60), _LEVEL_TICKS + 4))
++    envelopes = _drive(
++        runtime, broadcaster, _trade(_TOUCH_TS + timedelta(seconds=301), _LEVEL_TICKS + 6)
++    )
++
++    # The registration update carried prediction.created AND position.opened.
++    types = [e["type"] for e in envelopes]
++    assert "prediction.created" in types and "position.opened" in types
++    opened = next(e for e in envelopes if e["type"] == "position.opened")["payload"]["position"]
++    # The honest fill from the REAL resolver accessor: the ring print at the
++    # decision instant is the +4-tick trade -> 17001.0. Barriers = fixture policy.
++    assert opened["entry_price"] == 17_001.0
++    assert opened["entry_price_conservative"] == 17_001.25
++    assert opened["tp_price"] == 17_016.0
++    assert opened["sl_price"] == 16_971.0
++    assert opened["point_value"] == 20.0
++    assert len(tracker.open_positions()) == 1
++
++    # Spike one 147t forward bar to +16 pts: TP resolution.
++    ts = _TOUCH_TS + timedelta(seconds=310)
++    closed_frames: list[dict] = []
++    for i in range(147):
++        envelopes = _drive(
++            runtime, broadcaster, _trade(ts + timedelta(seconds=i), _LEVEL_TICKS + 64)
++        )
++        closed_frames.extend(e for e in envelopes if e["type"] == "position.closed")
++        if closed_frames:
++            resolved_types = [e["type"] for e in envelopes]
++            assert resolved_types.index("prediction.resolved") < resolved_types.index(
++                "position.closed"
++            )
++            break
++    assert len(closed_frames) == 1
++    execution = closed_frames[0]["payload"]["execution"]
++    assert execution["reason"] == "tp_hit"
++    assert execution["exit_price"] == 17_016.0
++    assert execution["points"] == 15.0
++    assert execution["points_conservative"] == 14.75
++    assert execution["dollars"] == 300.0
++    assert tracker.open_positions() == ()
++
++    # The journal on disk: one open + one close row in the touch's trading-day file.
++    rows = []
++    for file in sorted(executions_root.glob("*.jsonl")):
++        rows.extend(json.loads(line) for line in file.read_text("utf-8").splitlines())
++    assert [row["type"] for row in rows] == ["open", "close"]
++    assert rows[1]["points"] == 15.0
++
++    # Observer invariant: the runtime's own served streams are what they always
++    # were — one outcome, no drops, resolver empty.
++    assert len(runtime.outcomes) == 1
++    assert runtime.dropped == ()
++    assert runtime.open_setup_views() == ()
++
++
++def test_registration_drop_never_opens_through_the_full_chain(tmp_path: Path) -> None:
++    runtime, broadcaster, tracker, executions_root = _wire(tmp_path)
++    # 21:36 UTC = 16:36 ET; decision (+5m) = 16:41 ET >= 16:40 flatten -> drop.
++    late = datetime(2026, 1, 5, 21, 36, tzinfo=UTC)
++    runtime.observations.start_from_touch(_touch(ts=late))
++    _drive(runtime, broadcaster, _trade(late + timedelta(seconds=60), _LEVEL_TICKS))
++    envelopes = _drive(runtime, broadcaster, _trade(late + timedelta(seconds=301), _LEVEL_TICKS))
++
++    types = [e["type"] for e in envelopes]
++    assert "prediction.dropped" in types
++    assert "position.opened" not in types and "position.closed" not in types
++    assert tracker.open_positions() == ()
++    # The position never existed: nothing was journaled.
++    assert not list(executions_root.glob("*.jsonl"))
+diff --git a/backend/tests/test_execution_surface.py b/backend/tests/test_execution_surface.py
+new file mode 100644
+index 0000000..86a3fc4
+--- /dev/null
++++ b/backend/tests/test_execution_surface.py
+@@ -0,0 +1,194 @@
++"""EXEC P3a: typed execution events + snapshot open_positions block.
++
++Drives the REAL WebSocketBroadcaster message builder with a tracker wired the
++way create_app wires it, and pins: position.opened/closed envelopes ride the
++same broadcast as their update (after the prediction frames), the snapshot
++carries the open-position block with unrealized P&L in both columns, and a
++broadcaster without a tracker emits no execution frames.
++"""
++
++import json
++from datetime import UTC, date, datetime, timedelta
++from types import MappingProxyType
++
++from strategy_core import Direction, OpenSetupView
++
++from trade_lab.domain.candles import Candle
++from trade_lab.domain.feed import FeedConnectionState, FeedStatus
++from trade_lab.domain.outcomes import Outcome, ResolutionType
++from trade_lab.services.broadcaster import WebSocketBroadcaster
++from trade_lab.services.execution import ExecutionPolicy, PaperExecutionTracker
++from trade_lab.services.inference.inference_engine import Prediction
++from trade_lab.services.runtime import ApplicationRuntime, RuntimeUpdate
++
++T0 = datetime(2026, 6, 11, 14, 30, tzinfo=UTC)
++
++POLICY = ExecutionPolicy(tick_size=0.25, tp_points=15.0, sl_points=30.0, point_value=20.0)
++
++
++def _prediction(pid: str) -> Prediction:
++    return Prediction(
++        prediction_id=pid,
++        touch_id=f"touch-{pid}",
++        observation_id=f"obs-{pid}",
++        event_ts_utc=T0,
++        predicted_class="tradeable_reversal",
++        probabilities=MappingProxyType({"tradeable_reversal": 0.8}),
++        feature_values=MappingProxyType({"f": 1.0}),
++        level_kind="pdl",
++        level_price_ticks=92_000,
++        direction="long",
++        session="ny",
++        is_eligible=True,
++        model_id="bundle-a",
++        contract_id="bundle-a",
++        nan_count=0,
++    )
++
++
++def _view(pid: str) -> OpenSetupView:
++    return OpenSetupView(
++        prediction_id=pid,
++        entry_price_ticks=92_000,
++        entry_ts_utc=T0,
++        direction=Direction.LONG,
++        tp_price_ticks=92_060,
++        sl_price_ticks=91_880,
++    )
++
++
++def _bar(close_ticks: int, close_ts: datetime) -> Candle:
++    return Candle(
++        timeframe_ticks=147,
++        trading_day=date(2026, 6, 11),
++        bar_index=0,
++        bar_id="147t:2026-06-11:0",
++        open_ts_utc=close_ts - timedelta(seconds=30),
++        close_ts_utc=close_ts,
++        open_ticks=close_ticks,
++        high_ticks=close_ticks,
++        low_ticks=close_ticks,
++        close_ticks=close_ticks,
++        volume=147,
++        trade_count=147,
++        is_complete=True,
++        is_partial=False,
++    )
++
++
++def _runtime() -> ApplicationRuntime:
++    return ApplicationRuntime(
++        requested_symbol="NQ.c.0",
++        tick_timeframes=(147,),
++        observation_duration_seconds=300,
++    )
++
++
++def _broadcaster(views: list[OpenSetupView]) -> tuple[WebSocketBroadcaster, PaperExecutionTracker]:
++    broadcaster = WebSocketBroadcaster(_runtime())
++    tracker = PaperExecutionTracker(
++        open_setups=lambda: tuple(views),
++        policy=lambda: POLICY,
++        journal=None,
++    )
++    broadcaster.set_execution_tracker(tracker)
++    return broadcaster, tracker
++
++
++def _decode(messages: tuple[bytes, ...]) -> list[dict]:
++    return [json.loads(message) for message in messages]
++
++
++def _open_update(pid: str) -> RuntimeUpdate:
++    return RuntimeUpdate(
++        feed_status=FeedStatus(
++            state=FeedConnectionState.REPLAYING,
++            mode="replay",
++            requested_symbol="NQ.c.0",
++            last_event_ts_utc=T0,
++        ),
++        current_bars=(_bar(92_000, T0),),
++        predictions=(_prediction(pid),),
++    )
++
++
++def test_position_opened_and_closed_frames_ride_the_broadcast() -> None:
++    views = [_view("p1")]
++    broadcaster, _tracker = _broadcaster(views)
++
++    envelopes = _decode(broadcaster.messages_for_update(_open_update("p1")))
++    types = [envelope["type"] for envelope in envelopes]
++    assert "position.opened" in types
++    # The position frame derives from the prediction frame, so it comes after.
++    assert types.index("prediction.created") < types.index("position.opened")
++    position = next(e for e in envelopes if e["type"] == "position.opened")["payload"][
++        "position"
++    ]
++    assert position["prediction_id"] == "p1"
++    assert position["direction"] == "long"
++    assert position["entry_price"] == 23_000.0
++    assert position["entry_price_conservative"] == 23_000.25
++    assert position["tp_price"] == 23_015.0
++    assert position["sl_price"] == 22_970.0
++    assert position["last_price"] == 23_000.0
++    assert position["unrealized_points"] == 0.0
++    assert position["unrealized_points_conservative"] == -0.25
++
++    views.clear()
++    resolved_ts = T0 + timedelta(minutes=10)
++    close_update = RuntimeUpdate(
++        outcomes=(
++            Outcome(
++                outcome_id="out-p1",
++                prediction_id="p1",
++                touch_id="touch-p1",
++                resolution_type=ResolutionType.TP_HIT,
++                actual_class="tradeable_reversal",
++                predicted_class="tradeable_reversal",
++                correct=True,
++                max_mfe_pts=16.0,
++                max_mae_pts=3.0,
++                bars_to_resolution=2,
++                resolved_ts_utc=resolved_ts,
++                entry_price=23_000.0,
++            ),
++        )
++    )
++    envelopes = _decode(broadcaster.messages_for_update(close_update))
++    types = [envelope["type"] for envelope in envelopes]
++    assert "position.closed" in types
++    assert types.index("prediction.resolved") < types.index("position.closed")
++    execution = next(e for e in envelopes if e["type"] == "position.closed")["payload"][
++        "execution"
++    ]
++    assert execution["reason"] == "tp_hit"
++    assert execution["points"] == 15.0
++    assert execution["points_conservative"] == 14.75
++    assert execution["dollars"] == 300.0
++    assert execution["dollars_conservative"] == 295.0
++
++
++def test_snapshot_carries_the_open_positions_block() -> None:
++    views = [_view("p1")]
++    broadcaster, tracker = _broadcaster(views)
++    broadcaster.messages_for_update(_open_update("p1"))
++    # A later print moves the mark: unrealized is computed against it.
++    broadcaster.messages_for_update(
++        RuntimeUpdate(current_bars=(_bar(92_010, T0 + timedelta(minutes=1)),))
++    )
++    assert tracker.last_trade_price_ticks == 92_010
++
++    payload = broadcaster.snapshot_payload().model_dump(mode="json")
++    assert len(payload["open_positions"]) == 1
++    position = payload["open_positions"][0]
++    assert position["prediction_id"] == "p1"
++    assert position["last_price"] == 23_002.5
++    assert position["unrealized_points"] == 2.5
++    assert position["unrealized_points_conservative"] == 2.25
++
++
++def test_broadcaster_without_tracker_emits_no_execution_frames() -> None:
++    broadcaster = WebSocketBroadcaster(_runtime())
++    envelopes = _decode(broadcaster.messages_for_update(_open_update("p1")))
++    assert all(not e["type"].startswith("position.") for e in envelopes)
++    assert broadcaster.snapshot_payload().open_positions == []
+diff --git a/backend/tests/test_execution_tracker.py b/backend/tests/test_execution_tracker.py
+new file mode 100644
+index 0000000..a6bed6f
+--- /dev/null
++++ b/backend/tests/test_execution_tracker.py
+@@ -0,0 +1,462 @@
++"""EXEC P2: paper execution tracker — lifecycle, both columns, reset, journal.
++
++Pure state-machine tests: synthetic RuntimeUpdates + the REAL strategy_core
++OpenSetupView (pins the P1 seam) + an injected policy. Policy used throughout:
++tick 0.25, tp 15.0, sl 30.0, point_value 20.0 — asymmetric tp/sl so a sign slip
++cannot cancel out. Long anchor: entry 23000.0 = 92000 ticks, conservative entry
++92001 (1 tick adverse), tp 92060 (23015.0), sl 91880 (22970.0).
++"""
++
++import json
++from datetime import UTC, date, datetime, timedelta
++from pathlib import Path
++from types import MappingProxyType
++
++from strategy_core import Direction, OpenSetupView
++
++from trade_lab.domain.candles import Candle
++from trade_lab.domain.feed import FeedConnectionState, FeedStatus
++from trade_lab.domain.outcomes import DroppedPrediction, Outcome, ResolutionType
++from trade_lab.services.execution import (
++    ExecutionJournal,
++    ExecutionPolicy,
++    PaperExecutionTracker,
++    executions_root_for,
++)
++from trade_lab.services.inference.inference_engine import Prediction
++from trade_lab.services.runtime import RuntimeUpdate
++
++T0 = datetime(2026, 6, 11, 14, 30, tzinfo=UTC)  # 10:30 ET -> trading day 2026-06-11
++
++POLICY = ExecutionPolicy(tick_size=0.25, tp_points=15.0, sl_points=30.0, point_value=20.0)
++
++
++def _prediction(pid: str, *, direction: str = "long", eligible: bool = True) -> Prediction:
++    return Prediction(
++        prediction_id=pid,
++        touch_id=f"touch-{pid}",
++        observation_id=f"obs-{pid}",
++        event_ts_utc=T0,
++        predicted_class="tradeable_reversal",
++        probabilities=MappingProxyType({"tradeable_reversal": 0.8}),
++        feature_values=MappingProxyType({"f": 1.0}),
++        level_kind="pdl",
++        level_price_ticks=92_000,
++        direction=direction,
++        session="ny",
++        is_eligible=eligible,
++        model_id="bundle-a",
++        contract_id="bundle-a",
++        nan_count=0,
++    )
++
++
++def _view(pid: str, *, direction: Direction = Direction.LONG) -> OpenSetupView:
++    is_long = direction is Direction.LONG
++    return OpenSetupView(
++        prediction_id=pid,
++        entry_price_ticks=92_000,
++        entry_ts_utc=T0,
++        direction=direction,
++        tp_price_ticks=92_060 if is_long else 91_940,
++        sl_price_ticks=91_880 if is_long else 92_120,
++    )
++
++
++def _bar(close_ticks: int, close_ts: datetime) -> Candle:
++    return Candle(
++        timeframe_ticks=147,
++        trading_day=date(2026, 6, 11),
++        bar_index=0,
++        bar_id="147t:2026-06-11:0",
++        open_ts_utc=close_ts - timedelta(seconds=30),
++        close_ts_utc=close_ts,
++        open_ticks=close_ticks,
++        high_ticks=close_ticks,
++        low_ticks=close_ticks,
++        close_ticks=close_ticks,
++        volume=147,
++        trade_count=147,
++        is_complete=True,
++        is_partial=False,
++    )
++
++
++def _feed(mode: str = "replay", ts: datetime | None = None) -> FeedStatus:
++    return FeedStatus(
++        state=FeedConnectionState.REPLAYING,
++        mode=mode,
++        requested_symbol="NQ.c.0",
++        last_event_ts_utc=ts,
++    )
++
++
++def _outcome(
++    pid: str,
++    resolution: ResolutionType,
++    *,
++    resolved_ts: datetime,
++    entry_price: float = 23_000.0,
++) -> Outcome:
++    return Outcome(
++        outcome_id=f"out-{pid}",
++        prediction_id=pid,
++        touch_id=f"touch-{pid}",
++        resolution_type=resolution,
++        actual_class="tradeable_reversal",
++        predicted_class="tradeable_reversal",
++        correct=True,
++        max_mfe_pts=16.0,
++        max_mae_pts=3.0,
++        bars_to_resolution=2,
++        resolved_ts_utc=resolved_ts,
++        entry_price=entry_price,
++    )
++
++
++def _tracker(
++    tmp_path: Path, views: list[OpenSetupView]
++) -> tuple[PaperExecutionTracker, Path]:
++    root = executions_root_for(tmp_path / "journal")
++    tracker = PaperExecutionTracker(
++        open_setups=lambda: tuple(views),
++        policy=lambda: POLICY,
++        journal=ExecutionJournal(root),
++    )
++    return tracker, root
++
++
++def _rows(root: Path) -> list[dict]:
++    rows: list[dict] = []
++    for file in sorted(root.glob("*.jsonl")):
++        rows.extend(json.loads(line) for line in file.read_text("utf-8").splitlines())
++    return rows
++
++
++def _open_update(pid: str, *, direction: str = "long", eligible: bool = True) -> RuntimeUpdate:
++    return RuntimeUpdate(
++        feed_status=_feed(ts=T0),
++        current_bars=(_bar(92_000, T0),),
++        predictions=(_prediction(pid, direction=direction, eligible=eligible),),
++    )
++
++
++def test_open_from_view_then_tp_close_both_columns(tmp_path: Path) -> None:
++    views = [_view("p1")]
++    tracker, _root = _tracker(tmp_path, views)
++
++    opened, closed = tracker.observe(_open_update("p1"))
++    assert closed == ()
++    assert len(opened) == 1
++    position = opened[0]
++    assert position.entry_price == 23_000.0
++    assert position.entry_price_conservative == 23_000.25  # 1 tick adverse
++    assert position.tp_price == 23_015.0
++    assert position.sl_price == 22_970.0
++    assert position.contracts == 1
++    assert position.point_value == 20.0
++    assert position.mode == "replay"
++    assert position.source == "open_setups"
++    assert tracker.open_positions() == (position,)
++
++    views.clear()  # the resolver emitted for it: the setup leaves the snapshot
++    resolved_ts = T0 + timedelta(minutes=10)
++    opened, closed = tracker.observe(
++        RuntimeUpdate(outcomes=(_outcome("p1", ResolutionType.TP_HIT, resolved_ts=resolved_ts),))
++    )
++    assert opened == ()
++    assert len(closed) == 1
++    execution = closed[0]
++    assert execution.reason == "tp_hit"
++    # tp exit at the barrier in BOTH columns (the print requirement is already
++    # resolution semantics); only the entry differs.
++    assert execution.exit_price == 23_015.0
++    assert execution.exit_price_conservative == 23_015.0
++    assert execution.points == 15.0
++    assert execution.points_conservative == 14.75
++    assert execution.dollars == 300.0
++    assert execution.dollars_conservative == 295.0
++    assert execution.exit_ts_utc == resolved_ts
++    assert tracker.open_positions() == ()
++
++
++def test_sl_close_is_two_ticks_worse_conservative(tmp_path: Path) -> None:
++    views = [_view("p1")]
++    tracker, _ = _tracker(tmp_path, views)
++    tracker.observe(_open_update("p1"))
++    views.clear()
++
++    _, closed = tracker.observe(
++        RuntimeUpdate(
++            outcomes=(
++                _outcome("p1", ResolutionType.SL_HIT, resolved_ts=T0 + timedelta(minutes=5)),
++            )
++        )
++    )
++    execution = closed[0]
++    assert execution.reason == "sl_hit"
++    assert execution.exit_price == 22_970.0
++    assert execution.exit_price_conservative == 22_969.75  # sl exit 1 tick adverse
++    assert execution.points == -30.0
++    assert execution.points_conservative == -30.5  # adverse entry + adverse sl exit
++    assert execution.dollars == -600.0
++    assert execution.dollars_conservative == -610.0
++
++
++def test_short_direction_arithmetic_mirrors(tmp_path: Path) -> None:
++    views = [_view("p1", direction=Direction.SHORT)]
++    tracker, _ = _tracker(tmp_path, views)
++    opened, _ = tracker.observe(_open_update("p1", direction="short"))
++    position = opened[0]
++    assert position.entry_price_conservative == 22_999.75  # short: 1 tick BELOW
++    assert position.tp_price == 22_985.0
++    assert position.sl_price == 23_030.0
++    views.clear()
++
++    _, closed = tracker.observe(
++        RuntimeUpdate(
++            outcomes=(
++                _outcome("p1", ResolutionType.SL_HIT, resolved_ts=T0 + timedelta(minutes=5)),
++            )
++        )
++    )
++    execution = closed[0]
++    assert execution.exit_price == 23_030.0
++    assert execution.exit_price_conservative == 23_030.25  # adverse = higher for short
++    assert execution.points == -30.0
++    assert execution.points_conservative == -30.5
++
++
++def test_terminal_drop_closes_at_last_seen_trade_price(tmp_path: Path) -> None:
++    views = [_view("p1")]
++    tracker, _ = _tracker(tmp_path, views)
++    tracker.observe(_open_update("p1"))
++    views.clear()
++
++    bar_ts = T0 + timedelta(minutes=7)
++    tracker.observe(RuntimeUpdate(current_bars=(_bar(92_010, bar_ts),)))
++    _, closed = tracker.observe(
++        RuntimeUpdate(
++            dropped=(
++                DroppedPrediction("p1", "touch-p1", "no_resolution", T0, entry_price=23_000.0),
++            )
++        )
++    )
++    execution = closed[0]
++    assert execution.reason == "no_resolution"
++    # A print is a print: both columns exit at the last-seen trade price; only
++    # the conservative entry differs.
++    assert execution.exit_price == 23_002.5
++    assert execution.exit_price_conservative == 23_002.5
++    assert execution.points == 2.5
++    assert execution.points_conservative == 2.25
++    assert execution.exit_ts_utc == bar_ts
++    assert tracker.open_positions() == ()
++
++
++def test_registration_drop_means_the_position_never_existed(tmp_path: Path) -> None:
++    # The resolver never filled (flatten at registration, entry null): the
++    # eligible prediction has no setup, and no position may ever open.
++    tracker, root = _tracker(tmp_path, views=[])
++    update = RuntimeUpdate(
++        feed_status=_feed(ts=T0),
++        current_bars=(_bar(92_000, T0),),
++        predictions=(_prediction("p1"),),
++        dropped=(DroppedPrediction("p1", "touch-p1", "flatten", T0, entry_price=None),),
++    )
++    opened, closed = tracker.observe(update)
++    assert opened == () and closed == ()
++    assert tracker.open_positions() == ()
++    assert "eligible_prediction_without_setup" not in tracker.anomalies()
++    assert all(row["type"] != "open" for row in _rows(root))
++
++    # Invariant guard: a registration-time drop arriving for an OPEN position
++    # is counted and clears the position without synthesizing a fill.
++    views = [_view("p2")]
++    tracker2, _ = _tracker(tmp_path / "second", views)
++    tracker2.observe(_open_update("p2"))
++    _, closed = tracker2.observe(
++        RuntimeUpdate(
++            dropped=(DroppedPrediction("p2", "touch-p2", "no_fill", T0, entry_price=None),)
++        )
++    )
++    assert closed == ()
++    assert tracker2.open_positions() == ()
++    assert tracker2.anomalies()["registration_drop_for_open_position"] == 1
++
++
++def test_ineligible_predictions_are_never_tracked(tmp_path: Path) -> None:
++    views = [_view("p1")]
++    tracker, _ = _tracker(tmp_path, views)
++    opened, _ = tracker.observe(_open_update("p1", eligible=False))
++    assert opened == ()
++    assert tracker.open_positions() == ()
++    # Its later outcome is not ours either.
++    _, closed = tracker.observe(
++        RuntimeUpdate(
++            outcomes=(
++                _outcome("p1", ResolutionType.TP_HIT, resolved_ts=T0 + timedelta(minutes=5)),
++            )
++        )
++    )
++    assert closed == ()
++
++
++def test_reset_clears_open_positions_with_a_reset_row(tmp_path: Path) -> None:
++    views = [_view("p1")]
++    tracker, root = _tracker(tmp_path, views)
++    tracker.observe(_open_update("p1"))
++    assert len(tracker.open_positions()) == 1
++
++    opened, closed = tracker.observe(
++        RuntimeUpdate(feed_status=_feed(mode="idle"), model_reset_reason="replay_reset")
++    )
++    assert opened == () and closed == ()  # no synthetic closes, no phantom carry
++    assert tracker.open_positions() == ()
++    reset_rows = [row for row in _rows(root) if row["type"] == "reset"]
++    assert len(reset_rows) == 1
++    assert reset_rows[0]["reason"] == "replay_reset"
++    assert reset_rows[0]["cleared"] == 1
++    assert reset_rows[0]["cleared_prediction_ids"] == ["p1"]
++
++    # A late terminal drop for the cleared id is ignored (the position is gone).
++    _, closed = tracker.observe(
++        RuntimeUpdate(
++            dropped=(
++                DroppedPrediction("p1", "touch-p1", "no_resolution", T0, entry_price=23_000.0),
++            )
++        )
++    )
++    assert closed == ()
++
++
++def test_same_batch_registration_and_resolution_falls_back_to_the_outcome_fill(
++    tmp_path: Path,
++) -> None:
++    # The setup registered AND resolved within one coalesced batch: it is
++    # already gone from open_setups(), so the open reconstructs from the
++    # outcome row's own honest entry + the policy barriers.
++    tracker, _ = _tracker(tmp_path, views=[])
++    resolved_ts = T0 + timedelta(minutes=1)
++    update = RuntimeUpdate(
++        feed_status=_feed(ts=resolved_ts),
++        current_bars=(_bar(92_060, resolved_ts),),
++        predictions=(_prediction("p1"),),
++        outcomes=(_outcome("p1", ResolutionType.TP_HIT, resolved_ts=resolved_ts),),
++    )
++    opened, closed = tracker.observe(update)
++    assert len(opened) == 1 and len(closed) == 1
++    assert opened[0].source == "resolution_fallback"
++    assert opened[0].entry_price == 23_000.0
++    assert closed[0].points == 15.0
++    assert closed[0].points_conservative == 14.75
++    assert tracker.anomalies()["opened_from_resolution"] == 1
++    assert tracker.open_positions() == ()
++
++
++def test_unrealized_both_columns_against_last_price(tmp_path: Path) -> None:
++    views = [_view("p1")]
++    tracker, _ = _tracker(tmp_path, views)
++    opened, _ = tracker.observe(_open_update("p1"))
++    position = opened[0]
++    assert position.unrealized_points(None) is None
++    assert position.unrealized_points(92_010) == 2.5
++    assert position.unrealized_points_conservative(92_010) == 2.25
++    assert tracker.last_trade_price_ticks == 92_000
++
++
++def test_journal_rows_shape_and_trading_day_files(tmp_path: Path) -> None:
++    views = [_view("p1")]
++    tracker, root = _tracker(tmp_path, views)
++    tracker.observe(_open_update("p1"))
++    views.clear()
++    tracker.observe(
++        RuntimeUpdate(
++            outcomes=(
++                _outcome("p1", ResolutionType.TP_HIT, resolved_ts=T0 + timedelta(minutes=5)),
++            )
++        )
++    )
++    tracker.observe(RuntimeUpdate(model_reset_reason="replay_reset"))
++
++    day_file = root / "2026-06-11.jsonl"
++    assert day_file.is_file()
++    rows = _rows(root)
++    assert [row["type"] for row in rows] == ["open", "close", "reset"]
++    open_row, close_row, reset_row = rows
++    assert set(open_row) == {
++        "type",
++        "mode",
++        "bundle_id",
++        "ts_utc",
++        "prediction_id",
++        "touch_id",
++        "direction",
++        "contracts",
++        "point_value",
++        "tick_size",
++        "entry_price",
++        "entry_price_conservative",
++        "tp_price",
++        "sl_price",
++        "session",
++        "level_kind",
++        "source",
++    }
++    assert set(close_row) == {
++        "type",
++        "mode",
++        "bundle_id",
++        "ts_utc",
++        "prediction_id",
++        "touch_id",
++        "reason",
++        "direction",
++        "contracts",
++        "point_value",
++        "entry_ts_utc",
++        "entry_price",
++        "entry_price_conservative",
++        "exit_price",
++        "exit_price_conservative",
++        "points",
++        "points_conservative",
++        "dollars",
++        "dollars_conservative",
++        "session",
++        "level_kind",
++    }
++    assert close_row["points"] == 15.0
++    assert close_row["points_conservative"] == 14.75
++    assert set(reset_row) == {
++        "type",
++        "mode",
++        "ts_utc",
++        "reason",
++        "cleared",
++        "cleared_prediction_ids",
++    }
++
++
++def test_journal_append_failure_never_raises(tmp_path: Path) -> None:
++    blocker = tmp_path / "blocked"
++    blocker.write_text("not a directory", encoding="utf-8")
++    views = [_view("p1")]
++    tracker = PaperExecutionTracker(
++        open_setups=lambda: tuple(views),
++        policy=lambda: POLICY,
++        journal=ExecutionJournal(blocker / "executions"),
++    )
++    opened, _ = tracker.observe(_open_update("p1"))  # must not raise
++    assert len(opened) == 1
++
++
++def test_outcome_for_unknown_prediction_is_ignored(tmp_path: Path) -> None:
++    tracker, _ = _tracker(tmp_path, views=[])
++    _, closed = tracker.observe(
++        RuntimeUpdate(
++            outcomes=(_outcome("ghost", ResolutionType.TP_HIT, resolved_ts=T0),)
++        )
++    )
++    assert closed == ()
++    assert tracker.open_positions() == ()
+diff --git a/backend/tests/test_live_databento.py b/backend/tests/test_live_databento.py
+index 41841b3..028acbd 100644
+--- a/backend/tests/test_live_databento.py
++++ b/backend/tests/test_live_databento.py
+@@ -1015,6 +1015,115 @@ def test_warm_start_throttle_suppresses_replay_deltas_until_caught_up() -> None:
+     assert len(snapshot_calls) >= 1
+ 
+ 
++def test_warm_throttle_never_suppresses_serving_deltas() -> None:
++    # EXEC verify fix (major): an update carrying prediction/outcome/drop deltas
++    # is forwarded even while the frontier lags (warm catch-up tail OR a
++    # mid-session >30s stall relapse). The paper-execution tracker observes ONLY
++    # broadcast updates and an outcome rides exactly one update — suppression
++    # would leave a paper position open forever with no close journal row, and a
++    # catch-up-tail prediction would never open. Market-only updates keep the
++    # existing throttle behaviour (snapshots, no per-event stream).
++    from datetime import date, timedelta
++    from types import MappingProxyType
++
++    from trade_lab.domain.candles import Candle
++    from trade_lab.domain.outcomes import DroppedPrediction, Outcome, ResolutionType
++    from trade_lab.services.inference.inference_engine import Prediction
++    from trade_lab.services.runtime import RuntimeUpdate
++
++    runtime = _runtime()
++    now = datetime(2026, 6, 16, 16, 0, 0, tzinfo=UTC)
++    update_calls: list[RuntimeUpdate] = []
++    snapshot_calls: list[bool] = []
++
++    async def on_update(update: RuntimeUpdate) -> None:
++        update_calls.append(update)
++
++    async def on_snapshot() -> None:
++        snapshot_calls.append(True)
++
++    live = LiveMarketDataService(
++        runtime,
++        _live_config(),
++        lambda _config: None,
++        on_update=on_update,
++        throttle_warm_start=True,
++        now_provider=lambda: now,
++    )
++    live.set_snapshot_callback(on_snapshot)
++    live._market_update_lag = 3600.0  # frontier deep behind wall clock
++    live._live_streaming = False
++
++    event_ts = now - timedelta(hours=1)
++    bar = Candle(
++        timeframe_ticks=2,
++        trading_day=date(2026, 6, 16),
++        bar_index=0,
++        bar_id="2t:2026-06-16:0",
++        open_ts_utc=event_ts,
++        close_ts_utc=event_ts,
++        open_ticks=68_000,
++        high_ticks=68_002,
++        low_ticks=67_998,
++        close_ticks=68_001,
++        volume=2,
++        trade_count=2,
++        is_complete=False,
++        is_partial=True,
++    )
++    prediction = Prediction(
++        prediction_id="pred-1",
++        touch_id="touch-1",
++        observation_id="obs-1",
++        event_ts_utc=event_ts,
++        predicted_class="tradeable_reversal",
++        probabilities=MappingProxyType({"tradeable_reversal": 1.0}),
++        feature_values=MappingProxyType({}),
++        level_kind="pdl",
++        level_price_ticks=68_000,
++        direction="long",
++        session="ny",
++        is_eligible=True,
++        model_id="m-1",
++        contract_id="m-1",
++        nan_count=0,
++    )
++    outcome = Outcome(
++        outcome_id="out-1",
++        prediction_id="pred-1",
++        touch_id="touch-1",
++        resolution_type=ResolutionType.TP_HIT,
++        actual_class="tradeable_reversal",
++        predicted_class="tradeable_reversal",
++        correct=True,
++        max_mfe_pts=16.0,
++        max_mae_pts=1.0,
++        bars_to_resolution=0,
++        resolved_ts_utc=event_ts,
++        entry_price=17_000.0,
++    )
++    drop = DroppedPrediction("pred-2", "touch-2", "no_resolution", event_ts, entry_price=17_000.0)
++
++    async def run() -> None:
++        # Market-only update while lagging: suppressed (snapshot path).
++        await live._emit_market(RuntimeUpdate(current_bars=(bar,)))
++        assert update_calls == []
++        # Prediction / outcome / drop updates while lagging: ALWAYS forwarded.
++        await live._emit_market(RuntimeUpdate(current_bars=(bar,), predictions=(prediction,)))
++        await live._emit_market(RuntimeUpdate(outcomes=(outcome,)))
++        await live._emit_market(RuntimeUpdate(dropped=(drop,)))
++
++    asyncio.run(run())
++
++    assert len(update_calls) == 3
++    assert update_calls[0].predictions == (prediction,)
++    assert update_calls[1].outcomes == (outcome,)
++    assert update_calls[2].dropped == (drop,)
++    # The exemption forwards the delta without flipping streaming mode on.
++    assert live._live_streaming is False
++    assert len(snapshot_calls) >= 1
++
++
+ def test_warm_start_throttle_off_streams_every_event() -> None:
+     # Default (throttle off): behaviour is unchanged — every market delta streams,
+     # regardless of how far its timestamp lags wall clock.
+diff --git a/backend/tests/test_performance.py b/backend/tests/test_performance.py
+index 1f0811f..65dbd69 100644
+--- a/backend/tests/test_performance.py
++++ b/backend/tests/test_performance.py
+@@ -495,7 +495,10 @@ def test_payload_shape(tmp_path: Path) -> None:
+         "anomalies",
+         "pricing",
+         "oos_comparison",
++        "executions",
+     }
++    # No executions_dir supplied -> the EXEC P3d section stays None.
++    assert payload["executions"] is None
+     assert set(payload["applied_filters"]) == {
+         "mode",
+         "from",
+diff --git a/backend/tests/test_performance_api.py b/backend/tests/test_performance_api.py
+index 2294ca7..839e488 100644
+--- a/backend/tests/test_performance_api.py
++++ b/backend/tests/test_performance_api.py
+@@ -1,10 +1,12 @@
+ """Contract tests for GET /api/v1/performance (REPORT P3).
+ 
+ Read-only endpoint over the journal directory + model store: 404 clean on a
+-missing journal dir, 400 on out-of-domain filters/path-like bundle ids, 404 on
+-unknown bundle ids, per-request file opens (a row appended between calls shows
+-up on the next call), torn-tail-line tolerance, and a pinned payload shape with
+-no path/secret leakage.
++missing journal dir, 400 on out-of-domain filters/path-like bundle ids,
++row-filter-only semantics for well-formed bundle ids absent from the model
++store (retired bundles' journal history stays queryable; no OOS panel),
++per-request file opens (a row appended between calls shows up on the next
++call), torn-tail-line tolerance, and a pinned payload shape with no
++path/secret leakage.
+ """
+ 
+ import json
+@@ -129,7 +131,10 @@ def test_payload_shape_and_no_path_leakage(tmp_path: Path) -> None:
+         "anomalies",
+         "pricing",
+         "oos_comparison",
++        "executions",
+     }
++    # EXEC P3d: no executions directory yet -> the section is dark, not zeroed.
++    assert payload["executions"] is None
+     assert payload["applied_filters"] == {
+         "mode": "all",
+         "from": None,
+@@ -186,11 +191,81 @@ def test_torn_tail_line_is_counted_not_fatal(tmp_path: Path) -> None:
+     assert payload["anomalies"]["malformed_lines"] == 1
+ 
+ 
++def test_executions_summary_rides_the_report(tmp_path: Path) -> None:
++    # EXEC P3d: the executions dir sits beside the journal dir; close rows are
++    # filtered like the journal and summed in both columns.
++    client, journal = _client(tmp_path)
++    _append(journal, [_prediction("p1"), _outcome("p1")])
++    executions = journal.parent / "executions"
++    executions.mkdir(parents=True)
++    rows = [
++        {
++            "type": "open",
++            "mode": "live",
++            "bundle_id": BUNDLE,
++            "ts_utc": "2026-06-18T08:05:00+00:00",
++            "prediction_id": "p1",
++        },
++        {
++            "type": "close",
++            "mode": "live",
++            "bundle_id": BUNDLE,
++            "ts_utc": "2026-06-18T08:10:00+00:00",
++            "prediction_id": "p1",
++            "reason": "tp_hit",
++            "session": "ny",
++            "points": 15.0,
++            "points_conservative": 14.75,
++            "dollars": 300.0,
++            "dollars_conservative": 295.0,
++        },
++        {
++            "type": "close",
++            "mode": "replay",
++            "bundle_id": BUNDLE,
++            "ts_utc": "2026-06-18T09:10:00+00:00",
++            "prediction_id": "p2",
++            "reason": "sl_hit",
++            "session": "ny",
++            "points": -30.0,
++            "points_conservative": -30.5,
++            "dollars": -600.0,
++            "dollars_conservative": -610.0,
++        },
++        "not json {",
++    ]
++    with (executions / "2026-06-18.jsonl").open("w", encoding="utf-8") as handle:
++        for row in rows:
++            handle.write((row if isinstance(row, str) else json.dumps(row)) + "\n")
++
++    payload = client.get("/api/v1/performance").json()
++    executions_section = payload["executions"]
++    assert executions_section["files_scanned"] == 1
++    assert executions_section["malformed_lines"] == 1
++    assert executions_section["opens_total"] == 1
++    assert executions_section["closes_total"] == 2
++    realized = executions_section["realized"]
++    assert realized["count"] == 2
++    assert realized["points"] == -15.0
++    assert realized["points_conservative"] == -15.75
++    assert realized["wins"] == 1 and realized["losses"] == 1
++    assert realized["by_reason"]["tp_hit"]["count"] == 1
++
++    live_only = client.get("/api/v1/performance", params={"mode": "live"}).json()
++    live_realized = live_only["executions"]["realized"]
++    assert live_realized["count"] == 1
++    assert live_realized["points"] == 15.0
++    assert live_only["executions"]["closes_outside_filters"] == 1
++
++
+ def test_400_on_bad_filters(tmp_path: Path) -> None:
+     client, _ = _client(tmp_path)
+     assert client.get("/api/v1/performance", params={"mode": "bogus"}).status_code == 400
+     assert client.get("/api/v1/performance", params={"from": "not-a-date"}).status_code == 400
+     assert client.get("/api/v1/performance", params={"eligibility": "maybe"}).status_code == 400
++    # EXEC P0a: a session outside the plugin vocabulary can never match a row,
++    # so it is a 400 like the other filters — not an all-zeros 200.
++    assert client.get("/api/v1/performance", params={"session": "nyse"}).status_code == 400
+     assert (
+         client.get(
+             "/api/v1/performance", params={"from": "2026-06-19", "to": "2026-06-18"}
+@@ -200,11 +275,23 @@ def test_400_on_bad_filters(tmp_path: Path) -> None:
+ 
+ 
+ def test_bundle_id_hygiene(tmp_path: Path) -> None:
+-    client, _ = _client(tmp_path)
++    client, journal = _client(tmp_path)
+     # Path-like ids are a 400 before any filesystem access.
+     assert (
+         client.get("/api/v1/performance", params={"bundle": "..\\escape"}).status_code == 400
+     )
+     assert client.get("/api/v1/performance", params={"bundle": "a/b"}).status_code == 400
+-    # Well-formed but unknown ids are a clean 404.
+-    assert client.get("/api/v1/performance", params={"bundle": "NO_SUCH"}).status_code == 404
++    # EXEC P0b: a well-formed id absent from the model store applies the
++    # bundle_id row filter with NO bundle dir — retired bundles' journal
++    # history stays queryable; the OOS panel is simply absent.
++    _append(journal, [_prediction("p1", bundle_id="NO_SUCH"), _outcome("p1", bundle_id="NO_SUCH")])
++    response = client.get("/api/v1/performance", params={"bundle": "NO_SUCH"})
++    assert response.status_code == 200
++    payload = response.json()
++    assert payload["applied_filters"]["bundle_id"] == "NO_SUCH"
++    assert payload["headline"]["resolved_trades"] == 1
++    assert payload["oos_comparison"] is None
++    # The row filter still scopes: the retired-bundle rows are invisible under
++    # a DIFFERENT bundle id (the on-disk one).
++    other = client.get("/api/v1/performance", params={"bundle": BUNDLE}).json()
++    assert other["headline"]["resolved_trades"] == 0
+diff --git a/frontend/src/App.tsx b/frontend/src/App.tsx
+index db23963..78ad64e 100644
+--- a/frontend/src/App.tsx
++++ b/frontend/src/App.tsx
+@@ -5,6 +5,7 @@ import { realtimeClient } from './realtime/client';
+ import { addBlotterEvent, liveStore, replayStore, runtimeStore } from './state/stores';
+ import { TopStatusBar } from './components/TopStatusBar';
+ import { ChartWorkspace } from './components/ChartWorkspace';
++import { ExecutionsPanel } from './components/ExecutionsPanel';
+ import { IntelligencePanel } from './components/IntelligencePanel';
+ import { EventBlotter } from './components/EventBlotter';
+ import { ReplayControls } from './components/ReplayControls';
+@@ -67,6 +68,7 @@ export function App() {
+             <ChartWorkspace />
+             <IntelligencePanel />
+           </section>
++          <ExecutionsPanel />
+           <EventBlotter />
+         </>
+       ) : (
+diff --git a/frontend/src/api/types.ts b/frontend/src/api/types.ts
+index ffe3ff1..81cefbb 100644
+--- a/frontend/src/api/types.ts
++++ b/frontend/src/api/types.ts
+@@ -251,6 +251,36 @@ export type PerformanceOOSComparisonDTO = {
+   };
+ };
+ 
++// EXEC P3d: paper-execution summary — realized P&L in BOTH columns (optimistic
++// exact anchor/barriers; conservative 1-tick-adverse entry + sl exit), plus the
++// counted read/anomaly buckets from the executions journal directory.
++export type PerformanceExecutionsDTO = {
++  note: string;
++  files_scanned: number;
++  unreadable_files: number;
++  decode_error_files: number;
++  lines_total: number;
++  malformed_lines: number;
++  unknown_type_rows: number;
++  undated_close_rows: number;
++  opens_total: number;
++  closes_total: number;
++  resets_total: number;
++  reset_cleared_positions: number;
++  closes_outside_filters: number;
++  closes_missing_pnl: number;
++  realized: {
++    count: number;
++    points: number;
++    points_conservative: number;
++    dollars: number;
++    dollars_conservative: number;
++    wins: number;
++    losses: number;
++    by_reason: Record<string, { count: number; points: number; points_conservative: number }>;
++  };
++};
++
+ export type PerformanceReportDTO = {
+   applied_filters: {
+     mode: string;
+@@ -271,6 +301,7 @@ export type PerformanceReportDTO = {
+     fallback_contract: { tp_points: number; sl_points: number; point_value: number | null } | null;
+   };
+   oos_comparison: PerformanceOOSComparisonDTO | null;
++  executions: PerformanceExecutionsDTO | null;
+ };
+ 
+ export type PerformanceQuery = {
+diff --git a/frontend/src/chart/viewModels.test.ts b/frontend/src/chart/viewModels.test.ts
+index 17fa2bb..8d33796 100644
+--- a/frontend/src/chart/viewModels.test.ts
++++ b/frontend/src/chart/viewModels.test.ts
+@@ -1,6 +1,6 @@
+ import { describe, expect, it } from 'vitest';
+-import { MAX_BARS_PER_TIMEFRAME, combineMarkers, createChartTimeResolver, normalizeBarsForTimeframe, normalizeLevels, normalizeObservationMarkers, normalizeOutcomeMarkers, normalizePredictionMarkers, normalizeTouchMarkers } from './viewModels';
+-import type { MarketBar, MarketLevel, MarketTouch, Observation, Outcome, Prediction } from '../domain/models';
++import { MAX_BARS_PER_TIMEFRAME, combineMarkers, createChartTimeResolver, normalizeBarsForTimeframe, normalizeExecutionMarkers, normalizeLevels, normalizeObservationMarkers, normalizeOutcomeMarkers, normalizePredictionMarkers, normalizeTouchMarkers } from './viewModels';
++import type { ClosedExecution, MarketBar, MarketLevel, MarketTouch, Observation, OpenPosition, Outcome, Prediction } from '../domain/models';
+ 
+ const bar = (overrides: Partial<MarketBar>): MarketBar => ({
+   timeframe: 147,
+@@ -343,3 +343,90 @@ describe('chart view model normalization', () => {
+     expect(markers.some((marker) => marker.time === bars[0].time)).toBe(false);
+   });
+ });
++
++const openPosition = (overrides: Partial<OpenPosition> = {}): OpenPosition => ({
++  predictionId: 'pred-open',
++  touchId: 'touch-1',
++  direction: 'long',
++  contracts: 1,
++  entryTsUtc: '2026-05-21T14:00:05Z',
++  entryPrice: 23000,
++  entryPriceConservative: 23000.25,
++  tpPrice: 23015,
++  slPrice: 22970,
++  session: 'ny',
++  levelKind: 'pdl',
++  bundleId: 'bundle-a',
++  mode: 'replay',
++  pointValue: 20,
++  lastPrice: null,
++  unrealizedPoints: null,
++  unrealizedPointsConservative: null,
++  ...overrides,
++});
++
++const closedExecution = (overrides: Partial<ClosedExecution> = {}): ClosedExecution => ({
++  predictionId: 'pred-closed',
++  touchId: 'touch-2',
++  direction: 'long',
++  contracts: 1,
++  entryTsUtc: '2026-05-21T14:00:05Z',
++  exitTsUtc: '2026-05-21T14:01:05Z',
++  reason: 'tp_hit',
++  entryPrice: 23000,
++  entryPriceConservative: 23000.25,
++  exitPrice: 23015,
++  exitPriceConservative: 23015,
++  points: 15,
++  pointsConservative: 14.75,
++  dollars: 300,
++  dollarsConservative: 295,
++  pointValue: 20,
++  session: 'ny',
++  levelKind: 'pdl',
++  ...overrides,
++});
++
++describe('paper-execution markers (EXEC P3b)', () => {
++  const execBars = () => normalizeBarsForTimeframe([
++    bar({ barIndex: 0, barId: '147t:2026-05-21:0', openTimeUtc: '2026-05-21T14:00:00Z', closeTimeUtc: '2026-05-21T14:00:10Z' }),
++    bar({ barIndex: 1, barId: '147t:2026-05-21:1', openTimeUtc: '2026-05-21T14:01:00Z', closeTimeUtc: '2026-05-21T14:01:10Z' }),
++  ], 147);
++
++  it('anchors entry and exit markers at the FILL PRICES (price-anchored, not bar-hugging)', () => {
++    const bars = execBars();
++    const resolve = createChartTimeResolver(bars);
++    const markers = normalizeExecutionMarkers([openPosition()], [closedExecution()], resolve);
++
++    const entryOpen = markers.find((marker) => marker.id === 'exec-entry:pred-open');
++    const entryClosed = markers.find((marker) => marker.id === 'exec-entry:pred-closed');
++    const exit = markers.find((marker) => marker.id === 'exec-exit:pred-closed');
++    expect(entryOpen).toMatchObject({ position: 'atPriceMiddle', price: 23000, shape: 'circle', time: bars[0].time });
++    expect(entryOpen?.text).toContain('open long @ 23000.00');
++    expect(entryClosed).toMatchObject({ position: 'atPriceMiddle', price: 23000, shape: 'circle' });
++    expect(exit).toMatchObject({ position: 'atPriceMiddle', price: 23015, shape: 'square', time: bars[1].time, color: '#36d399' });
++    expect(exit?.text).toContain('+15.00 pts (tp hit)');
++  });
++
++  it('colors losing exits red and keeps one entry marker per prediction id', () => {
++    const bars = execBars();
++    const resolve = createChartTimeResolver(bars);
++    const loser = closedExecution({ predictionId: 'pred-open', reason: 'sl_hit', exitPrice: 22970, points: -30, pointsConservative: -30.5 });
++    // The same prediction appears both as a (stale) open card and as closed:
++    // exactly one entry marker survives.
++    const markers = normalizeExecutionMarkers([openPosition()], [loser], resolve);
++    expect(markers.filter((marker) => marker.id.startsWith('exec-entry:')).length).toBe(1);
++    const exit = markers.find((marker) => marker.id === 'exec-exit:pred-open');
++    expect(exit).toMatchObject({ color: '#ff6b6b', price: 22970 });
++  });
++
++  it('drops execution markers whose timestamps predate the loaded bars and rides combineMarkers', () => {
++    const bars = execBars();
++    const stale = openPosition({ predictionId: 'pred-stale', entryTsUtc: '2026-05-21T08:00:00Z' });
++    const markers = combineMarkers([], [], [], bars, [stale, openPosition()], [closedExecution()]);
++    const ids = markers.map((marker) => marker.id);
++    expect(ids).not.toContain('exec-entry:pred-stale');
++    expect(ids).toContain('exec-entry:pred-open');
++    expect(ids).toContain('exec-exit:pred-closed');
++  });
++});
+diff --git a/frontend/src/chart/viewModels.ts b/frontend/src/chart/viewModels.ts
+index 7a77f52..1f0791f 100644
+--- a/frontend/src/chart/viewModels.ts
++++ b/frontend/src/chart/viewModels.ts
+@@ -1,5 +1,5 @@
+ import type { CandlestickData, SeriesMarker, Time, UTCTimestamp } from 'lightweight-charts';
+-import type { MarketBar, MarketLevel, MarketTouch, Observation, Prediction, Timeframe } from '../domain/models';
++import type { ClosedExecution, MarketBar, MarketLevel, MarketTouch, Observation, OpenPosition, Prediction, Timeframe } from '../domain/models';
+ 
+ export const PRICE_TICK_SIZE = 0.25;
+ // Sized to hold 2 full trading days (plus the current partial) per timeframe — the live
+@@ -213,7 +213,59 @@ export const normalizeOutcomeMarkers = (predictions: Prediction[], resolve: (iso
+     });
+ };
+ 
+-export const combineMarkers = (touches: MarketTouch[], observations: Observation[], predictions: Prediction[], bars: ChartBar[]): MarkerOverlay[] => {
++// Paper-execution markers (EXEC P3b) are PRICE-anchored (lightweight-charts v5
++// SeriesMarkerPrice) — they sit at the actual fill price rather than hugging a
++// bar edge, which keeps them visually distinct from every bar-anchored
++// touch/observation/prediction/outcome glyph. Entry = pale circle at the honest
++// fill; exit = square at the exit fill, green/red by realized optimistic points.
++const EXECUTION_ENTRY_COLOR = '#e8f1f8';
++
++export const normalizeExecutionMarkers = (
++  openPositions: OpenPosition[],
++  closed: ClosedExecution[],
++  resolve: (iso: string) => UTCTimestamp | null,
++): MarkerOverlay[] => {
++  const markers: MarkerOverlay[] = [];
++  const entrySeen = new Set<string>();
++  const pushEntry = (predictionId: string, direction: string, entryTsUtc: string, entryPrice: number, open: boolean) => {
++    if (entrySeen.has(predictionId)) return;
++    entrySeen.add(predictionId);
++    const time = resolve(entryTsUtc);
++    if (time === null) return;
++    markers.push({
++      id: `exec-entry:${predictionId}`,
++      time,
++      position: 'atPriceMiddle',
++      price: entryPrice,
++      shape: 'circle',
++      color: EXECUTION_ENTRY_COLOR,
++      text: `${open ? 'open ' : ''}${direction} @ ${entryPrice.toFixed(2)}`,
++    } satisfies MarkerOverlay);
++  };
++  const sortedOpen = [...openPositions].sort((a, b) => new Date(a.entryTsUtc).getTime() - new Date(b.entryTsUtc).getTime());
++  const sortedClosed = [...closed].sort((a, b) => new Date(a.entryTsUtc).getTime() - new Date(b.entryTsUtc).getTime());
++  // Closed executions first so a just-closed position keeps one entry marker
++  // even if a stale open card briefly coexists in the stores.
++  for (const execution of sortedClosed) pushEntry(execution.predictionId, execution.direction, execution.entryTsUtc, execution.entryPrice, false);
++  for (const position of sortedOpen) pushEntry(position.predictionId, position.direction, position.entryTsUtc, position.entryPrice, true);
++  for (const execution of sortedClosed) {
++    const time = resolve(execution.exitTsUtc ?? execution.entryTsUtc);
++    if (time === null) continue;
++    const win = execution.points > 0;
++    markers.push({
++      id: `exec-exit:${execution.predictionId}`,
++      time,
++      position: 'atPriceMiddle',
++      price: execution.exitPrice,
++      shape: 'square',
++      color: win ? '#36d399' : '#ff6b6b',
++      text: `exit ${win ? '+' : ''}${execution.points.toFixed(2)} pts (${execution.reason.replaceAll('_', ' ')})`,
++    } satisfies MarkerOverlay);
++  }
++  return markers;
++};
++
++export const combineMarkers = (touches: MarketTouch[], observations: Observation[], predictions: Prediction[], bars: ChartBar[], openPositions: OpenPosition[] = [], closedExecutions: ClosedExecution[] = []): MarkerOverlay[] => {
+   const resolve = createChartTimeResolver(bars);
+   const deduped = new Map<string, MarkerOverlay>();
+   for (const marker of [
+@@ -221,6 +273,7 @@ export const combineMarkers = (touches: MarketTouch[], observations: Observation
+     ...normalizeObservationMarkers(observations, resolve),
+     ...normalizePredictionMarkers(predictions, resolve),
+     ...normalizeOutcomeMarkers(predictions, resolve),
++    ...normalizeExecutionMarkers(openPositions, closedExecutions, resolve),
+   ]) deduped.set(marker.id, marker);
+   return [...deduped.values()].sort((a, b) => Number(a.time) - Number(b.time));
+ };
+diff --git a/frontend/src/components/ChartWorkspace.tsx b/frontend/src/components/ChartWorkspace.tsx
+index 2a28f44..958d408 100644
+--- a/frontend/src/components/ChartWorkspace.tsx
++++ b/frontend/src/components/ChartWorkspace.tsx
+@@ -1,7 +1,7 @@
+ import { useMemo } from 'react';
+ import { combineMarkers, normalizeBarsForTimeframe, normalizeLevels } from '../chart/viewModels';
+ import { TradingChart } from './TradingChart';
+-import { marketStore, useConnection, useIntelligence, useMarket, usePredictions, useRuntime } from '../state/stores';
++import { marketStore, useConnection, useExecutions, useIntelligence, useMarket, usePredictions, useRuntime } from '../state/stores';
+ import type { Timeframe } from '../domain/models';
+ 
+ const TIMEFRAMES: Timeframe[] = [147, 987, 2000];
+@@ -16,13 +16,15 @@ export function ChartWorkspace() {
+   const touches = useIntelligence((state) => state.touches);
+   const observations = useIntelligence((state) => state.observations);
+   const predictions = usePredictions();
++  const openPositions = useExecutions((state) => state.openPositions);
++  const closedExecutions = useExecutions((state) => state.closed);
+   const feedReady = useRuntime((state) => state.feedReady);
+   const apiOnline = useRuntime((state) => state.apiOnline);
+   const wsStatus = useConnection((state) => state.wsStatus);
+ 
+   const bars = useMemo(() => normalizeBarsForTimeframe([...currentBars, ...recentClosedBars], selectedTimeframe), [currentBars, recentClosedBars, selectedTimeframe]);
+   const levelOverlays = useMemo(() => normalizeLevels(levels), [levels]);
+-  const markerOverlays = useMemo(() => combineMarkers(touches, observations, predictions, bars), [touches, observations, predictions, bars]);
++  const markerOverlays = useMemo(() => combineMarkers(touches, observations, predictions, bars, openPositions, closedExecutions), [touches, observations, predictions, bars, openPositions, closedExecutions]);
+ 
+   return (
+     <section className="panel chart-panel">
+diff --git a/frontend/src/components/ExecutionsPanel.test.tsx b/frontend/src/components/ExecutionsPanel.test.tsx
+new file mode 100644
+index 0000000..a9cc33f
+--- /dev/null
++++ b/frontend/src/components/ExecutionsPanel.test.tsx
+@@ -0,0 +1,111 @@
++import { afterEach, beforeEach, describe, expect, it } from 'vitest';
++import { cleanup, render, screen } from '@testing-library/react';
++import { ExecutionsPanel } from './ExecutionsPanel';
++import { executionStore, marketStore } from '../state/stores';
++import type { ClosedExecution, OpenPosition } from '../domain/models';
++
++const openPosition = (overrides: Partial<OpenPosition> = {}): OpenPosition => ({
++  predictionId: 'pred-1',
++  touchId: 'touch-1',
++  direction: 'long',
++  contracts: 1,
++  entryTsUtc: '2026-05-21T14:00:00Z',
++  entryPrice: 23000,
++  entryPriceConservative: 23000.25,
++  tpPrice: 23015,
++  slPrice: 22970,
++  session: 'ny',
++  levelKind: 'pdl',
++  bundleId: 'bundle-a',
++  mode: 'replay',
++  pointValue: 20,
++  lastPrice: 23000,
++  unrealizedPoints: 0,
++  unrealizedPointsConservative: -0.25,
++  ...overrides,
++});
++
++const closedExecution = (overrides: Partial<ClosedExecution> = {}): ClosedExecution => ({
++  predictionId: 'pred-2',
++  touchId: 'touch-2',
++  direction: 'long',
++  contracts: 1,
++  entryTsUtc: '2026-05-21T14:00:00Z',
++  exitTsUtc: '2026-05-21T14:10:00Z',
++  reason: 'tp_hit',
++  entryPrice: 23000,
++  entryPriceConservative: 23000.25,
++  exitPrice: 23015,
++  exitPriceConservative: 23015,
++  points: 15,
++  pointsConservative: 14.75,
++  dollars: 300,
++  dollarsConservative: 295,
++  pointValue: 20,
++  session: 'ny',
++  levelKind: 'pdl',
++  ...overrides,
++});
++
++describe('ExecutionsPanel', () => {
++  beforeEach(() => {
++    executionStore.reset();
++    marketStore.reset();
++  });
++
++  afterEach(() => cleanup());
++
++  it('shows honest empty states when nothing is tracked', () => {
++    render(<ExecutionsPanel />);
++    expect(screen.getByText('No open paper position.')).toBeInTheDocument();
++    expect(screen.getByText('No closed paper executions this session.')).toBeInTheDocument();
++  });
++
++  it('renders an open-position card with side, entry, both unrealized columns, and age', () => {
++    executionStore.setState({ openPositions: [openPosition()], closed: [] });
++    marketStore.setState({
++      currentBars: [
++        {
++          timeframe: 147,
++          tradingDay: '2026-05-21',
++          barIndex: 5,
++          barId: '147t:2026-05-21:5',
++          openTimeUtc: '2026-05-21T14:03:00Z',
++          closeTimeUtc: '2026-05-21T14:03:20Z',
++          openTicks: 92000,
++          highTicks: 92012,
++          lowTicks: 91998,
++          closeTicks: 92010,
++          volume: 10,
++          tradeCount: 10,
++          complete: false,
++        },
++      ],
++    });
++    render(<ExecutionsPanel />);
++
++    expect(screen.getByText('long')).toBeInTheDocument();
++    expect(screen.getByText('entry 23000.00')).toBeInTheDocument();
++    // Unrealized recomputed against the local latest print 23002.5.
++    expect(screen.getByText('+2.50 pts')).toBeInTheDocument();
++    expect(screen.getByText('cons +2.25')).toBeInTheDocument();
++    expect(screen.getByText(/tp 23015\.00 · sl 22970\.00 · mark 23002\.50 · age 3m 20s/)).toBeInTheDocument();
++  });
++
++  it('renders the closed-executions table with both columns and the close reason', () => {
++    executionStore.setState({
++      openPositions: [],
++      closed: [closedExecution(), closedExecution({ predictionId: 'pred-3', reason: 'sl_hit', exitTsUtc: '2026-05-21T14:20:00Z', exitPrice: 22970, exitPriceConservative: 22969.75, points: -30, pointsConservative: -30.5, dollars: -600, dollarsConservative: -610 })],
++    });
++    render(<ExecutionsPanel />);
++
++    expect(screen.getByText('tp hit')).toBeInTheDocument();
++    expect(screen.getByText('sl hit')).toBeInTheDocument();
++    expect(screen.getByText('+15.00')).toBeInTheDocument();
++    expect(screen.getByText('+14.75')).toBeInTheDocument();
++    expect(screen.getByText('-30.00')).toBeInTheDocument();
++    expect(screen.getByText('-30.50')).toBeInTheDocument();
++    expect(screen.getByText('14:10:00')).toBeInTheDocument();
++    expect(screen.getByText('14:20:00')).toBeInTheDocument();
++  });
++});
+diff --git a/frontend/src/components/ExecutionsPanel.tsx b/frontend/src/components/ExecutionsPanel.tsx
+new file mode 100644
+index 0000000..7b846a1
+--- /dev/null
++++ b/frontend/src/components/ExecutionsPanel.tsx
+@@ -0,0 +1,108 @@
++import { useMemo } from 'react';
++import { formatAge, formatClock, formatSignedPoints, latestPrice, unrealizedFor } from '../execution/viewModels';
++import { useExecutions, useMarket } from '../state/stores';
++import type { ClosedExecution, OpenPosition } from '../domain/models';
++import type { LastPrice } from '../execution/viewModels';
++
++export function ExecutionsPanel() {
++  const openPositions = useExecutions((state) => state.openPositions);
++  const closed = useExecutions((state) => state.closed);
++  const currentBars = useMarket((state) => state.currentBars);
++  const recentClosedBars = useMarket((state) => state.recentClosedBars);
++  const last = useMemo(() => latestPrice(currentBars, recentClosedBars), [currentBars, recentClosedBars]);
++
++  return (
++    <section className="panel executions-panel" aria-label="Paper executions">
++      <div className="panel-header compact">
++        <span className="eyebrow">Paper executions</span>
++        <h2>Observer-derived fills</h2>
++        <span className="exec-note">
++          optimistic / conservative (1-tick-adverse entry, 1-tick-adverse sl exit) · 1 contract · no costs
++        </span>
++      </div>
++      <div className="exec-body">
++        <div className="exec-open" aria-label="Open paper positions">
++          <h3>Open positions</h3>
++          {openPositions.length === 0 ? (
++            <p className="empty-text">No open paper position.</p>
++          ) : (
++            openPositions.map((position) => (
++              <OpenPositionCard key={position.predictionId} position={position} last={last} />
++            ))
++          )}
++        </div>
++        <div className="exec-closed" aria-label="Closed paper executions">
++          <h3>Closed executions</h3>
++          {closed.length === 0 ? (
++            <p className="empty-text">No closed paper executions this session.</p>
++          ) : (
++            <table className="perf-table">
++              <thead>
++                <tr>
++                  <th>Exit (UTC)</th>
++                  <th>Side</th>
++                  <th>Entry</th>
++                  <th>Exit</th>
++                  <th>Pts</th>
++                  <th>Pts (cons)</th>
++                  <th>Reason</th>
++                </tr>
++              </thead>
++              <tbody>
++                {closed.map((execution) => (
++                  <ClosedExecutionRow key={execution.predictionId} execution={execution} />
++                ))}
++              </tbody>
++            </table>
++          )}
++        </div>
++      </div>
++    </section>
++  );
++}
++
++function OpenPositionCard({ position, last }: { position: OpenPosition; last: LastPrice | null }) {
++  const unrealized = unrealizedFor(position, last);
++  const tone = unrealized.points === null ? '' : unrealized.points >= 0 ? 'pos' : 'neg';
++  return (
++    <div className="exec-card">
++      <div className="exec-card-head">
++        <span className={`intel-badge ${position.direction === 'long' ? 'eligible' : 'incorrect'}`}>
++          {position.direction}
++        </span>
++        <strong>entry {position.entryPrice.toFixed(2)}</strong>
++        <span className={`exec-unrealized ${tone}`}>
++          {formatSignedPoints(unrealized.points)} pts
++        </span>
++        <span className="exec-meta">cons {formatSignedPoints(unrealized.pointsConservative)}</span>
++      </div>
++      <div className="exec-meta">
++        tp {position.tpPrice.toFixed(2)} · sl {position.slPrice.toFixed(2)} · mark{' '}
++        {unrealized.markPrice === null ? '—' : unrealized.markPrice.toFixed(2)} · age{' '}
++        {formatAge(position.entryTsUtc, last?.timeUtc ?? null)}
++      </div>
++      <div className="exec-meta">
++        {position.levelKind.replaceAll('_', ' ')} · {position.session} · {position.mode} ·{' '}
++        {position.contracts} contract @ ${position.pointValue}/pt
++      </div>
++    </div>
++  );
++}
++
++function ClosedExecutionRow({ execution }: { execution: ClosedExecution }) {
++  return (
++    <tr>
++      <td>{formatClock(execution.exitTsUtc)}</td>
++      <td>{execution.direction}</td>
++      <td>{execution.entryPrice.toFixed(2)}</td>
++      <td>{execution.exitPrice.toFixed(2)}</td>
++      <td className={execution.points >= 0 ? 'pnl-pos' : 'pnl-neg'}>
++        {formatSignedPoints(execution.points)}
++      </td>
++      <td className={execution.pointsConservative >= 0 ? 'pnl-pos' : 'pnl-neg'}>
++        {formatSignedPoints(execution.pointsConservative)}
++      </td>
++      <td>{execution.reason.replaceAll('_', ' ')}</td>
++    </tr>
++  );
++}
+diff --git a/frontend/src/components/PerformancePage.tsx b/frontend/src/components/PerformancePage.tsx
+index a9e7112..a46cf76 100644
+--- a/frontend/src/components/PerformancePage.tsx
++++ b/frontend/src/components/PerformancePage.tsx
+@@ -5,6 +5,7 @@ import {
+   DEFAULT_DOLLARS_PER_POINT,
+   buildCumulativeCurve,
+   buildDailyBars,
++  buildExecutionSummary,
+   buildMonthCalendar,
+   buildStatCards,
+   calendarCellColor,
+@@ -110,6 +111,14 @@ export function PerformancePage() {
+     [report],
+   );
+   const bars = useMemo(() => (report ? buildDailyBars(report.series, 640, 220) : null), [report]);
++  const executionSummary = useMemo(
++    () =>
++      buildExecutionSummary(report?.executions, {
++        showDollars,
++        dollarsPerPoint: report?.headline.point_value ?? DEFAULT_DOLLARS_PER_POINT,
++      }),
++    [report, showDollars],
++  );
+ 
+   const hasRows = report !== null && (report.series.length > 0 || report.headline.predictions > 0);
+ 
+@@ -547,6 +556,54 @@ export function PerformancePage() {
+             </section>
+           )}
+ 
++          {executionSummary.show && (
++            <section className="panel perf-exec-panel" aria-label="Paper executions summary">
++              <div className="perf-section-head">
++                <h3>Paper executions (realized, both columns)</h3>
++                <span>
++                  observer-derived fills · optimistic = exact anchor/barriers · conservative =
++                  1-tick-adverse entry + sl exit
++                </span>
++              </div>
++              <div className="perf-exec-columns">
++                <span>
++                  optimistic <strong>{executionSummary.realizedLabel}</strong>
++                </span>
++                <span>
++                  conservative <strong>{executionSummary.conservativeLabel}</strong>
++                </span>
++                <span>{executionSummary.countLabel}</span>
++              </div>
++              {executionSummary.reasons.length > 0 && (
++                <table className="perf-table">
++                  <thead>
++                    <tr>
++                      <th>Close reason</th>
++                      <th>Count</th>
++                      <th>Pts</th>
++                      <th>Pts (cons)</th>
++                    </tr>
++                  </thead>
++                  <tbody>
++                    {executionSummary.reasons.map((row) => (
++                      <tr key={row.reason}>
++                        <td>{row.reason}</td>
++                        <td>{row.count}</td>
++                        <td>{row.points}</td>
++                        <td>{row.pointsConservative}</td>
++                      </tr>
++                    ))}
++                  </tbody>
++                </table>
++              )}
++              {executionSummary.anomalyNotes.length > 0 && (
++                <div className="perf-note" role="status">
++                  {executionSummary.anomalyNotes.join(' · ')}
++                </div>
++              )}
++            </section>
++          )}
++
+           <section className="panel perf-quality" aria-label="Journal data quality">
+             <span className="eyebrow">Journal data quality (whole directory, pre-filter)</span>
+             <div className="perf-quality-row">
+diff --git a/frontend/src/domain/models.ts b/frontend/src/domain/models.ts
+index 1017162..0ca6aa0 100644
+--- a/frontend/src/domain/models.ts
++++ b/frontend/src/domain/models.ts
+@@ -80,7 +80,7 @@ export type WarningMetadata = {
+ export type BlotterEvent = {
+   id: string;
+   timeUtc: string;
+-  category: 'system' | 'feed' | 'warning' | 'market' | 'level' | 'touch' | 'observation' | 'replay' | 'live';
++  category: 'system' | 'feed' | 'warning' | 'market' | 'level' | 'touch' | 'observation' | 'execution' | 'replay' | 'live';
+   severity: 'info' | 'warning' | 'error';
+   message: string;
+   code?: string;
+@@ -156,6 +156,50 @@ export type DroppedPrediction = {
+   entryPrice: number | null;
+ };
+ 
++// EXEC P3: paper-execution positions derived by the backend observer tracker.
++// Both P&L columns ride every position: optimistic (exact anchor/barriers) and
++// conservative (1-tick-adverse entry; 1-tick-adverse sl exit).
++export type OpenPosition = {
++  predictionId: string;
++  touchId: string;
++  direction: string;
++  contracts: number;
++  entryTsUtc: string;
++  entryPrice: number;
++  entryPriceConservative: number;
++  tpPrice: number;
++  slPrice: number;
++  session: string;
++  levelKind: string;
++  bundleId: string;
++  mode: string;
++  pointValue: number;
++  lastPrice: number | null;
++  unrealizedPoints: number | null;
++  unrealizedPointsConservative: number | null;
++};
++
++export type ClosedExecution = {
++  predictionId: string;
++  touchId: string;
++  direction: string;
++  contracts: number;
++  entryTsUtc: string;
++  exitTsUtc: string | null;
++  reason: string;
++  entryPrice: number;
++  entryPriceConservative: number;
++  exitPrice: number;
++  exitPriceConservative: number;
++  points: number;
++  pointsConservative: number;
++  dollars: number;
++  dollarsConservative: number;
++  pointValue: number;
++  session: string;
++  levelKind: string;
++};
++
+ export type ModelStatus = {
+   loaded: boolean;
+   modelId: string | null;
+diff --git a/frontend/src/domain/normalize.ts b/frontend/src/domain/normalize.ts
+index cb19f7b..d606912 100644
+--- a/frontend/src/domain/normalize.ts
++++ b/frontend/src/domain/normalize.ts
+@@ -1,6 +1,6 @@
+ import type { LiveStatusDTO, ModelBundleDTO, ReplaySourceDTO, ReplayStatusDTO, RuntimeStatusDTO } from '../api/types';
+-import type { BarDTO, DataQualityWarningDTO, DisplayLevelDTO, DroppedPredictionDTO, ModelStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, TouchDTO } from '../realtime/types';
+-import type { DroppedPrediction, LiveStatus, MarketBar, MarketLevel, MarketTouch, ModelBundle, ModelStatus, Observation, Outcome, Prediction, ReplaySource, ReplayStatus, RuntimeSummary, Timeframe, Warning, WarningMetadata } from './models';
++import type { BarDTO, ClosedExecutionDTO, DataQualityWarningDTO, DisplayLevelDTO, DroppedPredictionDTO, ModelStatusDTO, ObservationDTO, OpenPositionDTO, OutcomeDTO, PredictionDTO, TouchDTO } from '../realtime/types';
++import type { ClosedExecution, DroppedPrediction, LiveStatus, MarketBar, MarketLevel, MarketTouch, ModelBundle, ModelStatus, Observation, OpenPosition, Outcome, Prediction, ReplaySource, ReplayStatus, RuntimeSummary, Timeframe, Warning, WarningMetadata } from './models';
+ 
+ // API DTOs stay at the transport boundary; components consume these narrower
+ // workstation models so future backend contract changes do not leak everywhere.
+@@ -155,6 +155,47 @@ export const normalizeDropped = (dto: DroppedPredictionDTO): DroppedPrediction =
+   entryPrice: dto.entry_price ?? null,
+ });
+ 
++export const normalizeOpenPosition = (dto: OpenPositionDTO): OpenPosition => ({
++  predictionId: dto.prediction_id,
++  touchId: dto.touch_id,
++  direction: dto.direction,
++  contracts: dto.contracts,
++  entryTsUtc: dto.entry_ts_utc,
++  entryPrice: dto.entry_price,
++  entryPriceConservative: dto.entry_price_conservative,
++  tpPrice: dto.tp_price,
++  slPrice: dto.sl_price,
++  session: dto.session,
++  levelKind: dto.level_kind,
++  bundleId: dto.bundle_id,
++  mode: dto.mode,
++  pointValue: dto.point_value,
++  lastPrice: dto.last_price ?? null,
++  unrealizedPoints: dto.unrealized_points ?? null,
++  unrealizedPointsConservative: dto.unrealized_points_conservative ?? null,
++});
++
++export const normalizeClosedExecution = (dto: ClosedExecutionDTO): ClosedExecution => ({
++  predictionId: dto.prediction_id,
++  touchId: dto.touch_id,
++  direction: dto.direction,
++  contracts: dto.contracts,
++  entryTsUtc: dto.entry_ts_utc,
++  exitTsUtc: dto.exit_ts_utc ?? null,
++  reason: dto.reason,
++  entryPrice: dto.entry_price,
++  entryPriceConservative: dto.entry_price_conservative,
++  exitPrice: dto.exit_price,
++  exitPriceConservative: dto.exit_price_conservative,
++  points: dto.points,
++  pointsConservative: dto.points_conservative,
++  dollars: dto.dollars,
++  dollarsConservative: dto.dollars_conservative,
++  pointValue: dto.point_value,
++  session: dto.session,
++  levelKind: dto.level_kind,
++});
++
+ export const normalizeModelStatus = (dto: ModelStatusDTO): ModelStatus => ({
+   loaded: dto.loaded,
+   modelId: dto.model_id ?? null,
+diff --git a/frontend/src/execution/viewModels.test.ts b/frontend/src/execution/viewModels.test.ts
+new file mode 100644
+index 0000000..92cf611
+--- /dev/null
++++ b/frontend/src/execution/viewModels.test.ts
+@@ -0,0 +1,88 @@
++import { describe, expect, it } from 'vitest';
++import { formatAge, formatClock, formatSignedPoints, latestPrice, unrealizedFor } from './viewModels';
++import type { MarketBar, OpenPosition } from '../domain/models';
++
++const bar = (overrides: Partial<MarketBar>): MarketBar => ({
++  timeframe: 147,
++  tradingDay: '2026-05-21',
++  barIndex: 0,
++  barId: '147t:2026-05-21:0',
++  openTimeUtc: '2026-05-21T14:00:00Z',
++  closeTimeUtc: '2026-05-21T14:00:10Z',
++  openTicks: 92000,
++  highTicks: 92008,
++  lowTicks: 91996,
++  closeTicks: 92004,
++  volume: 10,
++  tradeCount: 10,
++  complete: true,
++  ...overrides,
++});
++
++const position = (overrides: Partial<OpenPosition> = {}): OpenPosition => ({
++  predictionId: 'pred-1',
++  touchId: 'touch-1',
++  direction: 'long',
++  contracts: 1,
++  entryTsUtc: '2026-05-21T14:00:00Z',
++  entryPrice: 23000,
++  entryPriceConservative: 23000.25,
++  tpPrice: 23015,
++  slPrice: 22970,
++  session: 'ny',
++  levelKind: 'pdl',
++  bundleId: 'bundle-a',
++  mode: 'replay',
++  pointValue: 20,
++  lastPrice: 23001,
++  unrealizedPoints: 1,
++  unrealizedPointsConservative: 0.75,
++  ...overrides,
++});
++
++describe('execution view models', () => {
++  it('finds the newest print across forming and closed bars', () => {
++    const last = latestPrice(
++      [bar({ closeTicks: 92010, closeTimeUtc: '2026-05-21T14:05:00Z', complete: false })],
++      [bar({ closeTicks: 92004, closeTimeUtc: '2026-05-21T14:00:10Z' })],
++    );
++    expect(last).toEqual({ price: 23002.5, timeUtc: '2026-05-21T14:05:00Z' });
++    expect(latestPrice([], [])).toBeNull();
++  });
++
++  it('marks unrealized in both columns against the local print (long)', () => {
++    const view = unrealizedFor(position(), { price: 23002.5, timeUtc: '2026-05-21T14:05:00Z' });
++    expect(view.points).toBe(2.5);
++    expect(view.pointsConservative).toBe(2.25);
++    expect(view.markPrice).toBe(23002.5);
++  });
++
++  it('mirrors the arithmetic for shorts (conservative entry is BELOW)', () => {
++    const short = position({ direction: 'short', entryPriceConservative: 22999.75 });
++    const view = unrealizedFor(short, { price: 22990, timeUtc: '2026-05-21T14:05:00Z' });
++    expect(view.points).toBe(10);
++    expect(view.pointsConservative).toBe(9.75);
++  });
++
++  it('falls back to the backend-stamped mark when no local bar exists yet', () => {
++    const view = unrealizedFor(position(), null);
++    expect(view.points).toBe(1);
++    expect(view.pointsConservative).toBe(0.75);
++    expect(view.markPrice).toBe(23001);
++  });
++
++  it('formats signed points, ages on the event clock, and UTC clock cells', () => {
++    expect(formatSignedPoints(2.5)).toBe('+2.50');
++    expect(formatSignedPoints(-30.5)).toBe('-30.50');
++    expect(formatSignedPoints(null)).toBe('—');
++    expect(formatAge('2026-05-21T14:00:00Z', '2026-05-21T14:03:20Z')).toBe('3m 20s');
++    expect(formatAge('2026-05-21T14:00:00Z', '2026-05-21T16:04:00Z')).toBe('2h 04m');
++    expect(formatAge('2026-05-21T14:00:00Z', '2026-05-21T14:00:45Z')).toBe('45s');
++    expect(formatAge('2026-05-21T14:00:00Z', null)).toBe('—');
++    // A position "opened in the future" relative to the event clock is a data
++    // problem, not a negative age.
++    expect(formatAge('2026-05-21T15:00:00Z', '2026-05-21T14:00:00Z')).toBe('—');
++    expect(formatClock('2026-05-21T14:05:07Z')).toBe('14:05:07');
++    expect(formatClock(null)).toBe('—');
++  });
++});
+diff --git a/frontend/src/execution/viewModels.ts b/frontend/src/execution/viewModels.ts
+new file mode 100644
+index 0000000..e22cea9
+--- /dev/null
++++ b/frontend/src/execution/viewModels.ts
+@@ -0,0 +1,76 @@
++// Pure view-model math for the paper-execution surface (EXEC P3c). No React,
++// no IO — exercised directly by vitest.
++//
++// Column semantics mirror the backend tracker: optimistic = exact honest
++// anchor/barriers; conservative = 1-tick-adverse entry (and 1-tick-adverse sl
++// exit on realized closes). Unrealized marks apply the entry adjustment only —
++// a print is a print, so the mark itself is never adjusted.
++
++import { PRICE_TICK_SIZE } from '../chart/viewModels';
++import type { MarketBar, OpenPosition } from '../domain/models';
++
++export type LastPrice = { price: number; timeUtc: string };
++
++// The newest observed trade print, exactly as the chart sees it: the close of
++// the most recently closing bar (forming bars carry the very latest trade).
++export const latestPrice = (currentBars: MarketBar[], recentClosedBars: MarketBar[]): LastPrice | null => {
++  let best: MarketBar | null = null;
++  for (const bar of [...recentClosedBars, ...currentBars]) {
++    if (!Number.isFinite(bar.closeTicks)) continue;
++    if (best === null || Date.parse(bar.closeTimeUtc) >= Date.parse(best.closeTimeUtc)) best = bar;
++  }
++  return best === null ? null : { price: best.closeTicks * PRICE_TICK_SIZE, timeUtc: best.closeTimeUtc };
++};
++
++export type UnrealizedView = {
++  points: number | null;
++  pointsConservative: number | null;
++  markPrice: number | null;
++};
++
++// Live unrealized P&L (both columns) against the latest local print; falls
++// back to the values the backend stamped on the DTO when no bar has arrived
++// on this client yet (e.g. right after a snapshot).
++export const unrealizedFor = (position: OpenPosition, last: LastPrice | null): UnrealizedView => {
++  if (last === null) {
++    return {
++      points: position.unrealizedPoints,
++      pointsConservative: position.unrealizedPointsConservative,
++      markPrice: position.lastPrice,
++    };
++  }
++  const sign = position.direction === 'short' ? -1 : 1;
++  return {
++    points: (last.price - position.entryPrice) * sign,
++    pointsConservative: (last.price - position.entryPriceConservative) * sign,
++    markPrice: last.price,
++  };
++};
++
++export const formatSignedPoints = (value: number | null, digits = 2): string => {
++  if (value === null || Number.isNaN(value)) return '—';
++  return `${value > 0 ? '+' : ''}${value.toFixed(digits)}`;
++};
++
++// Position age on the EVENT clock (latest observed bar close), not the wall
++// clock — replay positions age at replay speed and a paused feed stops aging.
++export const formatAge = (entryTsUtc: string, nowUtc: string | null): string => {
++  if (!nowUtc) return '—';
++  const ms = Date.parse(nowUtc) - Date.parse(entryTsUtc);
++  if (!Number.isFinite(ms) || ms < 0) return '—';
++  const totalSeconds = Math.floor(ms / 1000);
++  const hours = Math.floor(totalSeconds / 3600);
++  const minutes = Math.floor((totalSeconds % 3600) / 60);
++  const seconds = totalSeconds % 60;
++  if (hours > 0) return `${hours}h ${minutes.toString().padStart(2, '0')}m`;
++  if (minutes > 0) return `${minutes}m ${seconds.toString().padStart(2, '0')}s`;
++  return `${seconds}s`;
++};
++
++// UTC wall-clock HH:MM:SS for compact table cells.
++export const formatClock = (iso: string | null): string => {
++  if (!iso) return '—';
++  const ms = Date.parse(iso);
++  if (!Number.isFinite(ms)) return '—';
++  return new Date(ms).toISOString().slice(11, 19);
++};
+diff --git a/frontend/src/performance/viewModels.test.ts b/frontend/src/performance/viewModels.test.ts
+index 3a33808..2ec1be7 100644
+--- a/frontend/src/performance/viewModels.test.ts
++++ b/frontend/src/performance/viewModels.test.ts
+@@ -5,12 +5,13 @@
+ // Monday's key), so weeks here are Mon..Fri trading weeks, never calendar weeks.
+ 
+ import { describe, expect, it } from 'vitest';
+-import type { PerformanceDayDTO, PerformanceHeadlineDTO } from '../api/types';
++import type { PerformanceDayDTO, PerformanceExecutionsDTO, PerformanceHeadlineDTO } from '../api/types';
+ import {
+   DEFAULT_DOLLARS_PER_POINT,
+   SIMULATED_DOLLARS_LABEL,
+   buildCumulativeCurve,
+   buildDailyBars,
++  buildExecutionSummary,
+   buildMonthCalendar,
+   buildStatCards,
+   calendarCellColor,
+@@ -242,3 +243,69 @@ describe('trading-day calendar math', () => {
+     expect(months).toEqual(['2026-05', '2026-06', '2026-07']);
+   });
+ });
++
++const executionsDto = (over: Partial<PerformanceExecutionsDTO> = {}): PerformanceExecutionsDTO => ({
++  note: 'paper executions',
++  files_scanned: 1,
++  unreadable_files: 0,
++  decode_error_files: 0,
++  lines_total: 3,
++  malformed_lines: 0,
++  unknown_type_rows: 0,
++  undated_close_rows: 0,
++  opens_total: 2,
++  closes_total: 2,
++  resets_total: 1,
++  reset_cleared_positions: 1,
++  closes_outside_filters: 0,
++  closes_missing_pnl: 0,
++  realized: {
++    count: 2,
++    points: -15,
++    points_conservative: -15.75,
++    dollars: -300,
++    dollars_conservative: -315,
++    wins: 1,
++    losses: 1,
++    by_reason: {
++      tp_hit: { count: 1, points: 15, points_conservative: 14.75 },
++      sl_hit: { count: 1, points: -30, points_conservative: -30.5 },
++    },
++  },
++  ...over,
++});
++
++describe('paper-execution summary card (EXEC P3d)', () => {
++  it('stays dark without execution files and shows once files exist', () => {
++    expect(buildExecutionSummary(null, { showDollars: false, dollarsPerPoint: 20 }).show).toBe(false);
++    expect(buildExecutionSummary(undefined, { showDollars: false, dollarsPerPoint: 20 }).show).toBe(false);
++    expect(
++      buildExecutionSummary(executionsDto({ files_scanned: 0 }), { showDollars: false, dollarsPerPoint: 20 }).show,
++    ).toBe(false);
++    expect(buildExecutionSummary(executionsDto(), { showDollars: false, dollarsPerPoint: 20 }).show).toBe(true);
++  });
++
++  it('formats realized points in BOTH columns, with the dollars toggle', () => {
++    const points = buildExecutionSummary(executionsDto(), { showDollars: false, dollarsPerPoint: 20 });
++    expect(points.realizedLabel).toBe('-15.0 pts');
++    expect(points.conservativeLabel).toBe('-15.8 pts');
++    expect(points.countLabel).toContain('2 closed · 1W/1L');
++    expect(points.countLabel).toContain('1 resets (1 cleared)');
++
++    const dollars = buildExecutionSummary(executionsDto(), { showDollars: true, dollarsPerPoint: 20 });
++    expect(dollars.realizedLabel).toBe('-$300');
++    expect(dollars.conservativeLabel).toBe('-$315');
++  });
++
++  it('lists close reasons and surfaces non-zero anomaly buckets only', () => {
++    const summary = buildExecutionSummary(
++      executionsDto({ malformed_lines: 2, closes_missing_pnl: 1 }),
++      { showDollars: false, dollarsPerPoint: 20 },
++    );
++    expect(summary.reasons).toEqual([
++      { reason: 'sl hit', count: 1, points: '-30.0', pointsConservative: '-30.5' },
++      { reason: 'tp hit', count: 1, points: '+15.0', pointsConservative: '+14.8' },
++    ]);
++    expect(summary.anomalyNotes).toEqual(['malformed lines: 2', 'closes missing P&L: 1']);
++  });
++});
+diff --git a/frontend/src/performance/viewModels.ts b/frontend/src/performance/viewModels.ts
+index 4170c17..8ca8694 100644
+--- a/frontend/src/performance/viewModels.ts
++++ b/frontend/src/performance/viewModels.ts
+@@ -10,6 +10,7 @@
+ import type {
+   MeanStatDTO,
+   PerformanceDayDTO,
++  PerformanceExecutionsDTO,
+   PerformanceHeadlineDTO,
+   RatioDTO,
+ } from '../api/types';
+@@ -129,6 +130,63 @@ export function buildStatCards(
+   ];
+ }
+ 
++// --- paper-execution summary card (EXEC P3d) ---------------------------------
++
++export type ExecutionSummaryVM = {
++  show: boolean;
++  realizedLabel: string;
++  conservativeLabel: string;
++  countLabel: string;
++  reasons: { reason: string; count: number; points: string; pointsConservative: string }[];
++  anomalyNotes: string[];
++};
++
++// The card renders only when execution FILES exist — an executions directory
++// the tracker has never written to keeps the surface dark, and a summary with
++// zero closes still shows (honest "no realized executions yet" state).
++export function buildExecutionSummary(
++  executions: PerformanceExecutionsDTO | null | undefined,
++  options: { showDollars: boolean; dollarsPerPoint: number },
++): ExecutionSummaryVM {
++  if (!executions || executions.files_scanned === 0) {
++    return { show: false, realizedLabel: '—', conservativeLabel: '—', countLabel: '', reasons: [], anomalyNotes: [] };
++  }
++  const realized = executions.realized;
++  const realizedLabel = options.showDollars
++    ? formatMoney(realized.points, options.dollarsPerPoint)
++    : `${formatPoints(realized.points)} pts`;
++  const conservativeLabel = options.showDollars
++    ? formatMoney(realized.points_conservative, options.dollarsPerPoint)
++    : `${formatPoints(realized.points_conservative)} pts`;
++  const reasons = Object.entries(realized.by_reason)
++    .sort(([a], [b]) => a.localeCompare(b))
++    .map(([reason, bucket]) => ({
++      reason: reason.replaceAll('_', ' '),
++      count: bucket.count,
++      points: formatPoints(bucket.points),
++      pointsConservative: formatPoints(bucket.points_conservative),
++    }));
++  const anomalyNotes: string[] = [];
++  const flag = (label: string, value: number) => {
++    if (value > 0) anomalyNotes.push(`${label}: ${value}`);
++  };
++  flag('unreadable files', executions.unreadable_files);
++  flag('decode-error files', executions.decode_error_files);
++  flag('malformed lines', executions.malformed_lines);
++  flag('unknown rows', executions.unknown_type_rows);
++  flag('undated closes', executions.undated_close_rows);
++  flag('closes missing P&L', executions.closes_missing_pnl);
++  flag('outside filters', executions.closes_outside_filters);
++  return {
++    show: true,
++    realizedLabel,
++    conservativeLabel,
++    countLabel: `${realized.count} closed · ${realized.wins}W/${realized.losses}L · ${executions.opens_total} opens · ${executions.resets_total} resets (${executions.reset_cleared_positions} cleared)`,
++    reasons,
++    anomalyNotes,
++  };
++}
++
+ // --- charts (SVG geometry) ----------------------------------------------------
+ 
+ export type CurvePoint = { x: number; y: number; day: string; cumulative: number };
+diff --git a/frontend/src/realtime/client.test.ts b/frontend/src/realtime/client.test.ts
+index 7256c57..2022db1 100644
+--- a/frontend/src/realtime/client.test.ts
++++ b/frontend/src/realtime/client.test.ts
+@@ -1,7 +1,7 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+ import { RealtimeClient } from './client';
+-import { blotterStore, connectionStore, intelligenceStore, liveStore, marketStore, predictionStore, replayStore, runtimeStore } from '../state/stores';
+-import type { BarDTO, DataQualityWarningDTO, DroppedPredictionDTO, Envelope, FeedStatusDTO, ModelStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, SnapshotPayloadDTO, TouchDTO } from './types';
++import { blotterStore, connectionStore, executionStore, intelligenceStore, liveStore, marketStore, predictionStore, replayStore, runtimeStore } from '../state/stores';
++import type { BarDTO, ClosedExecutionDTO, DataQualityWarningDTO, DroppedPredictionDTO, Envelope, FeedStatusDTO, ModelStatusDTO, ObservationDTO, OpenPositionDTO, OutcomeDTO, PredictionDTO, SnapshotPayloadDTO, TouchDTO } from './types';
+ import { MAX_BARS_PER_TIMEFRAME } from '../chart/viewModels';
+ import { normalizeBar, normalizeWarning } from '../domain/normalize';
+ 
+@@ -39,6 +39,7 @@ const resetStores = () => {
+   replayStore.reset();
+   liveStore.reset();
+   predictionStore.reset();
++  executionStore.reset();
+ };
+ 
+ const feedStatus = (state = 'connected'): FeedStatusDTO => ({
+@@ -158,6 +159,49 @@ const droppedDto = (overrides: Partial<DroppedPredictionDTO> = {}): DroppedPredi
+   ...overrides,
+ });
+ 
++const openPositionDto = (overrides: Partial<OpenPositionDTO> = {}): OpenPositionDTO => ({
++  prediction_id: 'pred-1',
++  touch_id: 'touch-1',
++  direction: 'long',
++  contracts: 1,
++  entry_ts_utc: '2026-05-21T14:02:00Z',
++  entry_price: 23000,
++  entry_price_conservative: 23000.25,
++  tp_price: 23015,
++  sl_price: 22970,
++  session: 'ny',
++  level_kind: 'pdh',
++  bundle_id: 'model-a',
++  mode: 'live',
++  point_value: 20,
++  last_price: 23000,
++  unrealized_points: 0,
++  unrealized_points_conservative: -0.25,
++  ...overrides,
++});
++
++const closedExecutionDto = (overrides: Partial<ClosedExecutionDTO> = {}): ClosedExecutionDTO => ({
++  prediction_id: 'pred-1',
++  touch_id: 'touch-1',
++  direction: 'long',
++  contracts: 1,
++  entry_ts_utc: '2026-05-21T14:02:00Z',
++  exit_ts_utc: '2026-05-21T14:12:00Z',
++  reason: 'tp_hit',
++  entry_price: 23000,
++  entry_price_conservative: 23000.25,
++  exit_price: 23015,
++  exit_price_conservative: 23015,
++  points: 15,
++  points_conservative: 14.75,
++  dollars: 300,
++  dollars_conservative: 295,
++  point_value: 20,
++  session: 'ny',
++  level_kind: 'pdh',
++  ...overrides,
++});
++
+ const modelStatus = (overrides: Partial<ModelStatusDTO> = {}): ModelStatusDTO => ({
+   loaded: true,
+   model_id: 'model-a',
+@@ -319,6 +363,47 @@ describe('RealtimeClient', () => {
+     expect(predictionStore.getSnapshot().dropped).toHaveLength(0);
+   });
+ 
++  it('routes position.opened/closed into the execution store with blotter events', () => {
++    client.start();
++
++    sockets[0].message(envelope('position.opened', { position: openPositionDto() }));
++    expect(executionStore.getSnapshot().openPositions[0]).toMatchObject({ predictionId: 'pred-1', direction: 'long', entryPrice: 23000, entryPriceConservative: 23000.25, tpPrice: 23015, slPrice: 22970 });
++    expect(blotterStore.getSnapshot().events.some((event) => event.category === 'execution' && event.message === 'Paper position opened (long @ 23000.00)')).toBe(true);
++
++    sockets[0].message(envelope('position.closed', { execution: closedExecutionDto() }));
++    expect(executionStore.getSnapshot().openPositions).toHaveLength(0);
++    expect(executionStore.getSnapshot().closed[0]).toMatchObject({ predictionId: 'pred-1', reason: 'tp_hit', points: 15, pointsConservative: 14.75 });
++    expect(blotterStore.getSnapshot().events.some((event) => event.category === 'execution' && event.message === 'Paper position closed (tp_hit, +15.00 pts)')).toBe(true);
++  });
++
++  it('seeds open positions from the snapshot block and clears executions on model.reset', () => {
++    client.start();
++    sockets[0].message(envelope('position.closed', { execution: closedExecutionDto({ prediction_id: 'pred-old' }) }));
++
++    const snapshot: SnapshotPayloadDTO = {
++      current_bars: [],
++      recent_closed_bars: [],
++      display_levels: [],
++      active_observations: [],
++      feed_status: feedStatus('connected'),
++      warnings: [],
++      predictions: [],
++      outcomes: [],
++      open_positions: [openPositionDto({ prediction_id: 'pred-snap' })],
++      model_status: modelStatus(),
++      session: 'ny',
++      trading_day: '2026-05-21',
++    };
++    sockets[0].message(envelope('system.snapshot', snapshot));
++    expect(executionStore.getSnapshot().openPositions).toHaveLength(1);
++    expect(executionStore.getSnapshot().openPositions[0].predictionId).toBe('pred-snap');
++    // The closed table is delta-fed; the snapshot does not rewrite it.
++    expect(executionStore.getSnapshot().closed).toHaveLength(1);
++
++    sockets[0].message(envelope('model.reset', { reason: 'replay_reset' }));
++    expect(executionStore.getSnapshot()).toEqual({ openPositions: [], closed: [] });
++  });
++
+   it('converts provider warning metadata into blotter code, source, and safe details only', () => {
+     client.start();
+ 
+diff --git a/frontend/src/realtime/client.ts b/frontend/src/realtime/client.ts
+index 6961a3d..1dd44ec 100644
+--- a/frontend/src/realtime/client.ts
++++ b/frontend/src/realtime/client.ts
+@@ -1,9 +1,9 @@
+ import { config } from '../config';
+ import { MAX_BARS_PER_TIMEFRAME, barKey, isSupportedTimeframe } from '../chart/viewModels';
+-import { addBlotterEvent, addDropped, addOutcome, addPrediction, clearPredictions, connectionStore, intelligenceStore, liveStore, marketStore, predictionStore, replayStore, runtimeStore, setModelStatus } from '../state/stores';
+-import { normalizeBar, normalizeDropped, normalizeLevel, normalizeModelStatus, normalizeObservation, normalizeOutcome, normalizePrediction, normalizeTouch, normalizeWarning } from '../domain/normalize';
++import { addBlotterEvent, addDropped, addOpenPosition, addOutcome, addPrediction, clearExecutions, clearPredictions, closeOpenPosition, connectionStore, intelligenceStore, liveStore, marketStore, predictionStore, replayStore, runtimeStore, setModelStatus, setOpenPositions } from '../state/stores';
++import { normalizeBar, normalizeClosedExecution, normalizeDropped, normalizeLevel, normalizeModelStatus, normalizeObservation, normalizeOpenPosition, normalizeOutcome, normalizePrediction, normalizeTouch, normalizeWarning } from '../domain/normalize';
+ import type { MarketBar } from '../domain/models';
+-import type { BarDTO, DataQualityWarningDTO, DisplayLevelDTO, DroppedPredictionDTO, Envelope, FeedStatusDTO, ModelStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, SnapshotPayloadDTO, TouchDTO } from './types';
++import type { BarDTO, ClosedExecutionDTO, DataQualityWarningDTO, DisplayLevelDTO, DroppedPredictionDTO, Envelope, FeedStatusDTO, ModelStatusDTO, ObservationDTO, OpenPositionDTO, OutcomeDTO, PredictionDTO, SnapshotPayloadDTO, TouchDTO } from './types';
+ 
+ type WebSocketFactory = (url: string) => WebSocket;
+ 
+@@ -144,6 +144,18 @@ export class RealtimeClient {
+         addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'observation', severity: 'info', message: `Prediction dropped (${dropped.reason})`, sequence: envelope.sequence });
+         break;
+       }
++      case 'position.opened': {
++        const position = normalizeOpenPosition((envelope.payload as { position: OpenPositionDTO }).position);
++        addOpenPosition(position);
++        addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'execution', severity: 'info', message: `Paper position opened (${position.direction} @ ${position.entryPrice.toFixed(2)})`, sequence: envelope.sequence });
++        break;
++      }
++      case 'position.closed': {
++        const execution = normalizeClosedExecution((envelope.payload as { execution: ClosedExecutionDTO }).execution);
++        closeOpenPosition(execution);
++        addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'execution', severity: 'info', message: `Paper position closed (${execution.reason}, ${execution.points >= 0 ? '+' : ''}${execution.points.toFixed(2)} pts)`, sequence: envelope.sequence });
++        break;
++      }
+       case 'model.status':
+         setModelStatus(normalizeModelStatus(envelope.payload as ModelStatusDTO));
+         addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'system', severity: 'info', message: 'Model status updated', sequence: envelope.sequence });
+@@ -159,6 +171,9 @@ export class RealtimeClient {
+           intelligenceStore.setState({ levels: [], touches: [], observations: [] });
+         }
+         clearPredictions();
++        // EXEC P3: the backend tracker clears its positions on every reset
++        // reason (activation included); mirror it so no phantom cards linger.
++        clearExecutions();
+         addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'system', severity: 'info', message: `Model reset (${reason})`, sequence: envelope.sequence });
+         break;
+       }
+@@ -198,6 +213,10 @@ export class RealtimeClient {
+       dropped,
+       modelStatus: payload.model_status ? normalizeModelStatus(payload.model_status) : current.modelStatus,
+     }));
++    // EXEC P3: the snapshot's open-position block replaces the open set; the
++    // closed table is delta-fed only (durable history lives in the executions
++    // journal, surfaced on the Performance page).
++    setOpenPositions((payload.open_positions ?? []).map(normalizeOpenPosition));
+     runtimeStore.setState((current) => ({ ...current, session: payload.session ?? null, tradingDay: payload.trading_day ?? null }));
+     this.applyFeedStatus(payload.feed_status);
+   }
+diff --git a/frontend/src/realtime/types.ts b/frontend/src/realtime/types.ts
+index c29465d..d2b1713 100644
+--- a/frontend/src/realtime/types.ts
++++ b/frontend/src/realtime/types.ts
+@@ -11,6 +11,8 @@ export type MessageType =
+   | 'prediction.created'
+   | 'prediction.resolved'
+   | 'prediction.dropped'
++  | 'position.opened'
++  | 'position.closed'
+   | 'model.status'
+   | 'model.reset';
+ 
+@@ -130,6 +132,47 @@ export type DroppedPredictionDTO = {
+   entry_price: number | null;
+ };
+ 
++export type OpenPositionDTO = {
++  prediction_id: string;
++  touch_id: string;
++  direction: string;
++  contracts: number;
++  entry_ts_utc: string;
++  entry_price: number;
++  entry_price_conservative: number;
++  tp_price: number;
++  sl_price: number;
++  session: string;
++  level_kind: string;
++  bundle_id: string;
++  mode: string;
++  point_value: number;
++  last_price: number | null;
++  unrealized_points: number | null;
++  unrealized_points_conservative: number | null;
++};
++
++export type ClosedExecutionDTO = {
++  prediction_id: string;
++  touch_id: string;
++  direction: string;
++  contracts: number;
++  entry_ts_utc: string;
++  exit_ts_utc: string | null;
++  reason: string;
++  entry_price: number;
++  entry_price_conservative: number;
++  exit_price: number;
++  exit_price_conservative: number;
++  points: number;
++  points_conservative: number;
++  dollars: number;
++  dollars_conservative: number;
++  point_value: number;
++  session: string;
++  level_kind: string;
++};
++
+ export type ModelStatusDTO = {
+   loaded: boolean;
+   model_id: string | null;
+@@ -152,6 +195,7 @@ export type SnapshotPayloadDTO = {
+   predictions: PredictionDTO[];
+   outcomes: OutcomeDTO[];
+   dropped?: DroppedPredictionDTO[];
++  open_positions?: OpenPositionDTO[];
+   model_status: ModelStatusDTO;
+   session: string | null;
+   trading_day: string | null;
+diff --git a/frontend/src/state/stores.test.ts b/frontend/src/state/stores.test.ts
+index c148d80..e1a513b 100644
+--- a/frontend/src/state/stores.test.ts
++++ b/frontend/src/state/stores.test.ts
+@@ -1,6 +1,6 @@
+ import { afterEach, describe, expect, it } from 'vitest';
+-import { addBlotterEvent, addDropped, addOutcome, addPrediction, blotterStore, clearPredictions, connectionStore, intelligenceStore, marketStore, predictionStore, runtimeStore, setModelStatus } from './stores';
+-import type { DroppedPrediction, Outcome, Prediction } from '../domain/models';
++import { addBlotterEvent, addDropped, addOpenPosition, addOutcome, addPrediction, blotterStore, clearExecutions, clearPredictions, closeOpenPosition, connectionStore, executionStore, intelligenceStore, marketStore, predictionStore, runtimeStore, setModelStatus, setOpenPositions } from './stores';
++import type { ClosedExecution, DroppedPrediction, OpenPosition, Outcome, Prediction } from '../domain/models';
+ 
+ const resetStores = () => {
+   runtimeStore.reset();
+@@ -9,6 +9,7 @@ const resetStores = () => {
+   intelligenceStore.reset();
+   blotterStore.reset();
+   predictionStore.reset();
++  executionStore.reset();
+ };
+ 
+ const makePrediction = (id: string): Prediction => ({
+@@ -177,6 +178,61 @@ describe('workstation stores', () => {
+     expect(predictionStore.getSnapshot().modelStatus).toMatchObject({ loaded: true, modelId: 'model-a' });
+   });
+ 
++  it('tracks paper executions: upsert opens, close moves to the bounded table, reset clears', () => {
++    const position: OpenPosition = {
++      predictionId: 'pred-1',
++      touchId: 'touch-1',
++      direction: 'long',
++      contracts: 1,
++      entryTsUtc: '2026-05-21T14:00:05Z',
++      entryPrice: 23000,
++      entryPriceConservative: 23000.25,
++      tpPrice: 23015,
++      slPrice: 22970,
++      session: 'ny',
++      levelKind: 'pdl',
++      bundleId: 'bundle-a',
++      mode: 'replay',
++      pointValue: 20,
++      lastPrice: null,
++      unrealizedPoints: null,
++      unrealizedPointsConservative: null,
++    };
++    addOpenPosition(position);
++    addOpenPosition({ ...position, entryPrice: 23001 }); // upsert by prediction id
++    expect(executionStore.getSnapshot().openPositions).toHaveLength(1);
++    expect(executionStore.getSnapshot().openPositions[0].entryPrice).toBe(23001);
++
++    const execution: ClosedExecution = {
++      predictionId: 'pred-1',
++      touchId: 'touch-1',
++      direction: 'long',
++      contracts: 1,
++      entryTsUtc: '2026-05-21T14:00:05Z',
++      exitTsUtc: '2026-05-21T14:10:00Z',
++      reason: 'tp_hit',
++      entryPrice: 23000,
++      entryPriceConservative: 23000.25,
++      exitPrice: 23015,
++      exitPriceConservative: 23015,
++      points: 15,
++      pointsConservative: 14.75,
++      dollars: 300,
++      dollarsConservative: 295,
++      pointValue: 20,
++      session: 'ny',
++      levelKind: 'pdl',
++    };
++    closeOpenPosition(execution);
++    expect(executionStore.getSnapshot().openPositions).toEqual([]);
++    expect(executionStore.getSnapshot().closed).toHaveLength(1);
++
++    setOpenPositions([position]);
++    expect(executionStore.getSnapshot().openPositions).toHaveLength(1);
++    clearExecutions();
++    expect(executionStore.getSnapshot()).toEqual({ openPositions: [], closed: [] });
++  });
++
+   it('stores backend offline state without requiring chart or intelligence data', () => {
+     runtimeStore.setState((current) => ({ ...current, apiOnline: false, feedReady: false, lastError: 'Backend unavailable: connect ECONNREFUSED' }));
+     connectionStore.setState({ wsStatus: 'offline', error: 'socket closed' });
+diff --git a/frontend/src/state/stores.ts b/frontend/src/state/stores.ts
+index 558234e..a77a10a 100644
+--- a/frontend/src/state/stores.ts
++++ b/frontend/src/state/stores.ts
+@@ -1,9 +1,10 @@
+ import { createStore, useStore } from './createStore';
+-import type { BlotterEvent, DroppedPrediction, LiveStatus, MarketBar, MarketLevel, MarketTouch, ModelBundle, ModelStatus, Observation, Outcome, Prediction, ReplaySource, ReplayStatus, RuntimeSummary, Timeframe, Warning } from '../domain/models';
++import type { BlotterEvent, ClosedExecution, DroppedPrediction, LiveStatus, MarketBar, MarketLevel, MarketTouch, ModelBundle, ModelStatus, Observation, OpenPosition, Outcome, Prediction, ReplaySource, ReplayStatus, RuntimeSummary, Timeframe, Warning } from '../domain/models';
+ 
+ const MAX_PREDICTIONS = 100;
+ const MAX_OUTCOMES = 100;
+ const MAX_DROPPED = 100;
++const MAX_CLOSED_EXECUTIONS = 100;
+ 
+ export type PredictionState = {
+   predictions: Prediction[];
+@@ -116,6 +117,48 @@ export const predictionStore = createStore<PredictionState>({
+   bundles: [],
+ });
+ 
++// EXEC P3: paper-execution state. Open positions mirror the backend tracker
++// (upsert by prediction id; the snapshot replaces the set); closed executions
++// are a newest-first bounded ring fed by position.closed frames only — the
++// snapshot does not carry them, so the table clears on a delivered
++// model.reset frame or a page reload (a reset missed while disconnected
++// leaves prior rows in place — reported verify minor); the executions
++// journal keeps durable history for the Performance page.
++export type ExecutionState = {
++  openPositions: OpenPosition[];
++  closed: ClosedExecution[];
++};
++
++export const executionStore = createStore<ExecutionState>({
++  openPositions: [],
++  closed: [],
++});
++
++export const addOpenPosition = (position: OpenPosition) => {
++  executionStore.setState((current) => ({
++    ...current,
++    openPositions: [position, ...current.openPositions.filter((entry) => entry.predictionId !== position.predictionId)],
++  }));
++};
++
++export const closeOpenPosition = (execution: ClosedExecution) => {
++  executionStore.setState((current) => ({
++    openPositions: current.openPositions.filter((entry) => entry.predictionId !== execution.predictionId),
++    closed: [execution, ...current.closed.filter((entry) => entry.predictionId !== execution.predictionId)].slice(0, MAX_CLOSED_EXECUTIONS),
++  }));
++};
++
++export const setOpenPositions = (openPositions: OpenPosition[]) => {
++  executionStore.setState((current) => ({ ...current, openPositions }));
++};
++
++// Mirrors the backend tracker's reset semantics: cleared positions vanish (no
++// phantom carry, no synthetic closes) and the session-scoped closed table
++// clears with the prediction panes.
++export const clearExecutions = () => {
++  executionStore.setState({ openPositions: [], closed: [] });
++};
++
+ // Newest-first, bounded prediction history; the matching prediction is annotated
+ // with its outcome (or drop) by prediction_id when one arrives so the UI can
+ // render the resolved/dropped state without a second lookup.
+@@ -173,6 +216,7 @@ export const useLive = <T = ReturnType<typeof liveStore.getSnapshot>>(selector?:
+ export const usePredictions = <T = Prediction[]>(selector?: (predictions: Prediction[]) => T) => useStore(predictionStore, (state) => (selector ? selector(state.predictions) : (state.predictions as T)));
+ export const useOutcomes = <T = Outcome[]>(selector?: (outcomes: Outcome[]) => T) => useStore(predictionStore, (state) => (selector ? selector(state.outcomes) : (state.outcomes as T)));
+ export const useDropped = <T = DroppedPrediction[]>(selector?: (dropped: DroppedPrediction[]) => T) => useStore(predictionStore, (state) => (selector ? selector(state.dropped) : (state.dropped as T)));
++export const useExecutions = <T = ExecutionState>(selector?: (state: ExecutionState) => T) => useStore(executionStore, selector ?? ((state) => state as T));
+ export const useModelStatus = <T = ModelStatus | null>(selector?: (modelStatus: ModelStatus | null) => T) => useStore(predictionStore, (state) => (selector ? selector(state.modelStatus) : (state.modelStatus as T)));
+ export const useBundles = <T = ModelBundle[]>(selector?: (bundles: ModelBundle[]) => T) => useStore(predictionStore, (state) => (selector ? selector(state.bundles) : (state.bundles as T)));
+ 
+diff --git a/frontend/src/styles.css b/frontend/src/styles.css
+index 229f948..63dd402 100644
+--- a/frontend/src/styles.css
++++ b/frontend/src/styles.css
+@@ -15,7 +15,7 @@
+ * { box-sizing: border-box; }
+ body { margin: 0; background: radial-gradient(circle at top left, #102033 0, var(--bg) 45%); color: var(--text); }
+ button { font: inherit; }
+-.workstation-shell { min-height: 100vh; display: grid; grid-template-rows: auto auto auto auto 1fr 210px; gap: 12px; padding: 12px; }
++.workstation-shell { min-height: 100vh; display: grid; grid-template-rows: auto auto auto auto 1fr auto 210px; gap: 12px; padding: 12px; }
+ .workstation-shell.performance-view { grid-template-rows: auto auto 1fr; }
+ .view-tabs { display: flex; }
+ .control-row { display:grid; grid-template-columns:minmax(0, 1.25fr) minmax(360px, .75fr); gap:12px; }
+@@ -178,4 +178,19 @@ button { font: inherit; }
+ .perf-quality-row { display: flex; flex-wrap: wrap; gap: 8px 16px; color: var(--muted); font-size: 11px; }
+ .perf-quality-row .quality-flag { color: var(--amber); }
+ 
+-@media (max-width: 1050px) { .workstation-shell { grid-template-rows:auto auto auto auto auto 220px; } .control-row, .workspace-grid { grid-template-columns: 1fr; } .intelligence-panel { max-height: 420px; } .replay-controls-grid, .live-grid, .model-controls-grid, .model-bundle-meta { grid-template-columns:1fr 1fr; } .perf-cards { grid-template-columns: repeat(2, 1fr); } .perf-charts, .perf-tables { grid-template-columns: 1fr; } }
++/* EXEC P3c: paper-execution panel (open-position cards + closed table). */
++.executions-panel { display: flex; flex-direction: column; }
++.exec-note { margin-left: auto; color: var(--muted); font-size: 11px; }
++.exec-body { display: grid; grid-template-columns: minmax(280px, .9fr) minmax(0, 1.6fr); gap: 16px; padding: 12px 18px; }
++.exec-body h3 { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin-bottom: 6px; }
++.exec-card { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; display: flex; flex-direction: column; gap: 6px; }
++.exec-card-head { display: flex; gap: 10px; align-items: center; font-size: 13px; }
++.exec-unrealized { font-weight: 700; font-variant-numeric: tabular-nums; }
++.exec-unrealized.pos, .pnl-pos { color: var(--green); }
++.exec-unrealized.neg, .pnl-neg { color: var(--red); }
++.exec-meta { color: var(--muted); font-size: 11px; }
++.exec-closed { min-width: 0; overflow-x: auto; }
++.perf-exec-panel { padding: 14px 16px; border-radius: 14px; }
++.perf-exec-columns { display: flex; flex-wrap: wrap; gap: 8px 20px; font-size: 12px; font-variant-numeric: tabular-nums; }
++
++@media (max-width: 1050px) { .workstation-shell { grid-template-rows:auto auto auto auto auto auto 220px; } .control-row, .workspace-grid, .exec-body { grid-template-columns: 1fr; } .intelligence-panel { max-height: 420px; } .replay-controls-grid, .live-grid, .model-controls-grid, .model-bundle-meta { grid-template-columns:1fr 1fr; } .perf-cards { grid-template-columns: repeat(2, 1fr); } .perf-charts, .perf-tables { grid-template-columns: 1fr; } }

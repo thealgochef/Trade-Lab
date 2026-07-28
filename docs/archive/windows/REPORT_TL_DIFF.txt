@@ -1,0 +1,3425 @@
+diff --git a/backend/src/trade_lab/api/app.py b/backend/src/trade_lab/api/app.py
+index 6c71a0a..39c7187 100644
+--- a/backend/src/trade_lab/api/app.py
++++ b/backend/src/trade_lab/api/app.py
+@@ -4,11 +4,11 @@ import hmac
+ import ipaddress
+ import re
+ from contextlib import asynccontextmanager
+-from datetime import timedelta
++from datetime import date, timedelta
+ from pathlib import Path
+ from urllib.parse import urlsplit
+ 
+-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
++from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+ from fastapi.middleware.cors import CORSMiddleware
+ from pydantic import BaseModel, ConfigDict, Field
+ 
+@@ -35,6 +35,12 @@ from trade_lab.services.model_registry import (
+     ServingCapabilities,
+     is_safe_model_id,
+ )
++from trade_lab.services.performance import (
++    InvalidPerformanceFilter,
++    JournalDirectoryNotFound,
++    PerformanceFilters,
++    aggregate_performance,
++)
+ from trade_lab.services.replay import HistoricalReplayService, ReplayConfig, ReplayState
+ from trade_lab.services.runtime import ApplicationRuntime, RuntimeUpdate
+ 
+@@ -489,6 +495,66 @@ def create_app(
+         )
+         return model_status_to_dto(runtime.model_status()).model_dump(mode="json")
+ 
++    @app.get("/api/v1/performance")
++    def performance(
++        mode: str = "all",
++        from_day: str | None = Query(default=None, alias="from"),
++        to_day: str | None = Query(default=None, alias="to"),
++        bundle: str | None = None,
++        session: str | None = None,
++        eligibility: str = "all",
++    ) -> dict[str, object]:
++        # REPORT P3: read-only reporting surface — the trader dashboard AND the
++        # D-P-12 soak adjudication artifact. No runtime/engine/registry access;
++        # journal + bundle files are re-opened on every request because the
++        # journal appends between calls. Sync handler -> threadpool, so the file
++        # reads never block the event loop.
++        def _parse_day(value: str | None, name: str) -> date | None:
++            if value is None:
++                return None
++            try:
++                return date.fromisoformat(value)
++            except ValueError as exc:
++                raise HTTPException(
++                    status_code=400, detail=f"invalid {name} date (expected YYYY-MM-DD)"
++                ) from exc
++
++        bundle_dir: Path | None = None
++        if bundle is not None:
++            # Same id hygiene as activation: path-like ids are a 400, unknown
++            # (but well-formed) ids a 404 — never a filesystem probe.
++            if not is_safe_model_id(bundle):
++                raise HTTPException(status_code=400, detail="invalid model id")
++            candidate = None if settings.models_path is None else settings.models_path / bundle
++            try:
++                if candidate is None or not candidate.is_dir() or candidate.is_symlink():
++                    raise HTTPException(status_code=404, detail="unknown model id")
++            except OSError as exc:
++                raise HTTPException(status_code=404, detail="unknown model id") from exc
++            bundle_dir = candidate
++        try:
++            filters = PerformanceFilters(
++                mode=mode,
++                from_day=_parse_day(from_day, "from"),
++                to_day=_parse_day(to_day, "to"),
++                bundle_id=bundle,
++                session=session,
++                eligibility=eligibility,
++            )
++            report = aggregate_performance(
++                settings.journal_path,
++                filters=filters,
++                models_root=settings.models_path,
++                bundle_dir=bundle_dir,
++            )
++        except InvalidPerformanceFilter as exc:
++            raise HTTPException(status_code=400, detail=str(exc)) from exc
++        except JournalDirectoryNotFound as exc:
++            raise HTTPException(
++                status_code=404, detail="journal directory not found"
++            ) from exc
++        return report.to_payload()
++
+     @app.get("/api/v1/replay/status")
+     async def replay_status() -> dict[str, object]:
+         return _replay_status_payload(app.state.replay)
+diff --git a/backend/src/trade_lab/services/performance.py b/backend/src/trade_lab/services/performance.py
+new file mode 100644
+index 0000000..4a650d8
+--- /dev/null
++++ b/backend/src/trade_lab/services/performance.py
+@@ -0,0 +1,940 @@
++"""Read-only performance aggregation over the prediction journal (REPORT P2).
++
++Pure module: stdlib + ``trade_lab.domain.trading_day`` (the writer's own 18:00 ET
++clock) + a lazy pyarrow import for the optional OOS parquet. No engine, runtime,
++registry, or strategy_core imports — this file must stay importable and correct
++with nothing running.
++
++Dual consumer: the trader's Performance page and the D-P-12 soak adjudication
++artifact (one implementation, two readers).
++
++Honesty rules (REPORT_RECON.md):
++
++- Only ``tp_hit``/``sl_hit`` outcomes exist (D1b retired force-labels) and only
++  they are priced: ``tp_hit -> +tp_points``, ``sl_hit -> -sl_points`` from the
++  row's own ``tp_points``/``sl_points`` if ever present, else the row's
++  ``bundle_id`` contract under ``models_root``, else the explicitly supplied
++  fallback bundle contract. Trades priced no other way land in an ``unpriced``
++  bucket — never silently dropped, never guessed.
++- Drops (flatten/cutoff/no_fill/no_forward/no_resolution) carry no exit price;
++  they are excluded from net and counted by reason.
++- Outcome rows carry no session/direction/eligibility — those come from the
++  prediction join (``prediction_id``) across the WHOLE directory, because a
++  prediction and its outcome can land in different trading-day files.
++- Every rate carries its numerator/denominator; every mean carries its n.
++- Trades are dated by the OUTCOME's trading day (P&L realization); predictions
++  and drops by their own timestamp. The funnel is prediction-cohort based: it
++  follows in-scope predictions to their eventual fate even outside the window.
++- Journal-quality anomalies (malformed lines, duplicate ids, orphans, conflicts)
++  are counted over the whole directory read, before filtering.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++from dataclasses import dataclass, field
++from datetime import UTC, date, datetime
++from pathlib import Path
++from statistics import median
++from typing import Any
++
++from trade_lab.domain.trading_day import trading_day_for
++
++logger = logging.getLogger(__name__)
++
++RESOLUTION_TP = "tp_hit"
++RESOLUTION_SL = "sl_hit"
++KNOWN_RESOLUTIONS = frozenset({RESOLUTION_TP, RESOLUTION_SL})
++
++MODES = frozenset({"replay", "live", "all"})
++ELIGIBILITY_FILTERS = frozenset({"all", "eligible", "ineligible"})
++
++_STRATEGY_FILE = "strategy.json"
++_EVALUATION_FILE = "evaluation.json"
++_OOS_PREDICTIONS_FILE = "oos_predictions.parquet"
++
++
++class JournalDirectoryNotFound(FileNotFoundError):
++    """The journal directory does not exist (endpoint maps this to 404)."""
++
++
++class InvalidPerformanceFilter(ValueError):
++    """A filter value is outside its allowed domain (endpoint maps this to 400)."""
++
++
++@dataclass(frozen=True, slots=True)
++class PerformanceFilters:
++    """Row filters. ``from_day``/``to_day`` are inclusive TRADING days (18:00 ET roll)."""
++
++    mode: str = "all"
++    from_day: date | None = None
++    to_day: date | None = None
++    bundle_id: str | None = None
++    session: str | None = None
++    eligibility: str = "all"
++
++    def validate(self) -> None:
++        if self.mode not in MODES:
++            raise InvalidPerformanceFilter(f"mode must be one of {sorted(MODES)}")
++        if self.eligibility not in ELIGIBILITY_FILTERS:
++            raise InvalidPerformanceFilter(
++                f"eligibility must be one of {sorted(ELIGIBILITY_FILTERS)}"
++            )
++        if (
++            self.from_day is not None
++            and self.to_day is not None
++            and self.from_day > self.to_day
++        ):
++            raise InvalidPerformanceFilter("from_day is after to_day")
++
++
++@dataclass(frozen=True, slots=True)
++class PerformanceReport:
++    """The aggregate. Sections are JSON-safe dicts; shape is pinned by tests."""
++
++    applied_filters: dict[str, Any]
++    headline: dict[str, Any]
++    series: list[dict[str, Any]]
++    breakdowns: dict[str, Any]
++    funnel: dict[str, Any]
++    anomalies: dict[str, Any]
++    pricing: dict[str, Any]
++    oos_comparison: dict[str, Any] | None
++
++    def to_payload(self) -> dict[str, Any]:
++        return {
++            "applied_filters": self.applied_filters,
++            "headline": self.headline,
++            "series": self.series,
++            "breakdowns": self.breakdowns,
++            "funnel": self.funnel,
++            "anomalies": self.anomalies,
++            "pricing": self.pricing,
++            "oos_comparison": self.oos_comparison,
++        }
++
++
++# ---------------------------------------------------------------------------
++# Denominator-carrying shapes
++# ---------------------------------------------------------------------------
++
++
++def _ratio(numerator: int, denominator: int) -> dict[str, Any]:
++    return {
++        "value": None if denominator == 0 else numerator / denominator,
++        "numerator": numerator,
++        "denominator": denominator,
++    }
++
++
++def _mean_stat(values: list[float]) -> dict[str, Any]:
++    return {"value": None if not values else sum(values) / len(values), "n": len(values)}
++
++
++def _dist_stat(values: list[float]) -> dict[str, Any]:
++    if not values:
++        return {"mean": None, "median": None, "max": None, "n": 0}
++    return {
++        "mean": sum(values) / len(values),
++        "median": median(values),
++        "max": max(values),
++        "n": len(values),
++    }
++
++
++# ---------------------------------------------------------------------------
++# Journal reading
++# ---------------------------------------------------------------------------
++
++
++@dataclass(slots=True)
++class _RawJournal:
++    predictions: dict[str, dict[str, Any]] = field(default_factory=dict)
++    outcomes: dict[str, dict[str, Any]] = field(default_factory=dict)
++    drops: dict[str, dict[str, Any]] = field(default_factory=dict)
++    files_scanned: int = 0
++    unreadable_files: int = 0
++    decode_error_files: int = 0
++    lines_total: int = 0
++    malformed_lines: int = 0
++    unknown_type_rows: int = 0
++    rows_missing_ids: int = 0
++    undated_rows: int = 0
++    duplicate_prediction_rows: int = 0
++    duplicate_outcome_rows: int = 0
++    duplicate_drop_rows: int = 0
++
++
++def _parse_ts(value: Any) -> datetime | None:
++    if not isinstance(value, str) or not value:
++        return None
++    try:
++        parsed = datetime.fromisoformat(value)
++    except ValueError:
++        return None
++    if parsed.tzinfo is None:
++        parsed = parsed.replace(tzinfo=UTC)
++    return parsed
++
++
++def _read_journal(journal_dir: Path) -> _RawJournal:
++    """Read every ``*.jsonl`` in the directory (the writer's flat layout).
++
++    First occurrence wins on duplicate ids; repeats are counted, never merged.
++    Malformed lines are skipped and counted (the writer is line-buffered without
++    fsync, so a torn tail line is a legal state, not an error).
++    """
++
++    raw = _RawJournal()
++    for file in sorted(journal_dir.glob("*.jsonl"), key=lambda p: p.name):
++        raw.files_scanned += 1
++        try:
++            data = file.read_bytes()
++        except OSError:
++            # Verify fix (major): an unreadable file must be VISIBLE in the
++            # payload, not just a server log line — a traded day silently
++            # reporting as empty would corrupt the adjudication artifact.
++            raw.unreadable_files += 1
++            logger.warning("performance: journal file is unreadable: %s", file.name)
++            continue
++        try:
++            text = data.decode("utf-8")
++        except UnicodeDecodeError:
++            # Verify fix (major): a single bad byte previously 500'd every
++            # request. Salvage what decodes; the corrupted line(s) then fail
++            # json.loads and land in malformed_lines, and the file is flagged.
++            raw.decode_error_files += 1
++            logger.warning("performance: journal file has undecodable bytes: %s", file.name)
++            text = data.decode("utf-8", errors="replace")
++        for line in text.splitlines():
++            if not line.strip():
++                continue
++            raw.lines_total += 1
++            try:
++                row = json.loads(line)
++            except json.JSONDecodeError:
++                raw.malformed_lines += 1
++                continue
++            if not isinstance(row, dict):
++                raw.malformed_lines += 1
++                continue
++            row_type = row.get("type")
++            if row_type == "prediction":
++                _ingest(raw, raw.predictions, row, "duplicate_prediction_rows")
++            elif row_type == "outcome":
++                _ingest(raw, raw.outcomes, row, "duplicate_outcome_rows")
++            elif row_type == "drop":
++                _ingest(raw, raw.drops, row, "duplicate_drop_rows")
++            else:
++                raw.unknown_type_rows += 1
++    return raw
++
++
++def _ingest(
++    raw: _RawJournal,
++    bucket: dict[str, dict[str, Any]],
++    row: dict[str, Any],
++    duplicate_counter: str,
++) -> None:
++    prediction_id = row.get("prediction_id")
++    if not isinstance(prediction_id, str) or not prediction_id:
++        raw.rows_missing_ids += 1
++        return
++    ts = _parse_ts(row.get("ts_utc"))
++    if ts is None:
++        raw.undated_rows += 1
++        return
++    row["_ts"] = ts
++    row["_day"] = trading_day_for(ts)
++    if prediction_id in bucket:
++        setattr(raw, duplicate_counter, getattr(raw, duplicate_counter) + 1)
++        return
++    bucket[prediction_id] = row
++
++
++# ---------------------------------------------------------------------------
++# Contract pricing (tp/sl proxy sources)
++# ---------------------------------------------------------------------------
++
++
++def _is_safe_bundle_id(bundle_id: str) -> bool:
++    # Mirrors model_registry.is_safe_model_id without importing it (that module
++    # imports strategy_core at module scope; this one must stay pure).
++    if not bundle_id or len(bundle_id) > 128:
++        return False
++    if "/" in bundle_id or "\\" in bundle_id or ".." in bundle_id:
++        return False
++    return all(ch.isalnum() or ch in "_.:-" for ch in bundle_id)
++
++
++@dataclass(frozen=True, slots=True)
++class _ContractPricing:
++    tp_points: float
++    sl_points: float
++    point_value: float | None
++    eligible_class: str | None
++
++
++def _load_contract_pricing(bundle_dir: Path) -> _ContractPricing | None:
++    try:
++        payload = json.loads((bundle_dir / _STRATEGY_FILE).read_text(encoding="utf-8"))
++    except (OSError, json.JSONDecodeError):
++        return None
++    if not isinstance(payload, dict):
++        return None
++    policy = payload.get("label_policy")
++    if not isinstance(policy, dict):
++        return None
++    tp = policy.get("tp_points")
++    sl = policy.get("sl_points")
++    if not isinstance(tp, int | float) or not isinstance(sl, int | float):
++        return None
++    point_value = payload.get("point_value")
++    inference = payload.get("inference")
++    eligible_class = inference.get("eligible_class") if isinstance(inference, dict) else None
++    return _ContractPricing(
++        tp_points=float(tp),
++        sl_points=float(sl),
++        point_value=float(point_value) if isinstance(point_value, int | float) else None,
++        eligible_class=eligible_class if isinstance(eligible_class, str) else None,
++    )
++
++
++class _PricingResolver:
++    """Resolve (tp, sl) for one trade row: row fields > row bundle contract > fallback."""
++
++    def __init__(self, models_root: Path | None, fallback: _ContractPricing | None) -> None:
++        self._models_root = models_root
++        self._fallback = fallback
++        self._cache: dict[str, _ContractPricing | None] = {}
++        self.source_counts = {"row": 0, "bundle_contract": 0, "fallback_contract": 0}
++
++    def resolve(self, row: dict[str, Any], *, count: bool = True) -> tuple[float, float] | None:
++        # ``count=False`` for fate lookups (the cohort funnel) so ``source_counts``
++        # stays a per-trade tally of the headline trade set, not doubled.
++        tp = row.get("tp_points")
++        sl = row.get("sl_points")
++        if isinstance(tp, int | float) and isinstance(sl, int | float):
++            if count:
++                self.source_counts["row"] += 1
++            return float(tp), float(sl)
++        bundle_id = row.get("bundle_id")
++        if isinstance(bundle_id, str):
++            pricing = self._bundle_pricing(bundle_id)
++            if pricing is not None:
++                if count:
++                    self.source_counts["bundle_contract"] += 1
++                return pricing.tp_points, pricing.sl_points
++        if self._fallback is not None:
++            if count:
++                self.source_counts["fallback_contract"] += 1
++            return self._fallback.tp_points, self._fallback.sl_points
++        return None
++
++    def _bundle_pricing(self, bundle_id: str) -> _ContractPricing | None:
++        if bundle_id in self._cache:
++            return self._cache[bundle_id]
++        pricing: _ContractPricing | None = None
++        if self._models_root is not None and _is_safe_bundle_id(bundle_id):
++            candidate = self._models_root / bundle_id
++            try:
++                if candidate.is_dir():
++                    pricing = _load_contract_pricing(candidate)
++            except OSError:
++                pricing = None
++        self._cache[bundle_id] = pricing
++        return pricing
++
++
++# ---------------------------------------------------------------------------
++# Aggregation
++# ---------------------------------------------------------------------------
++
++
++@dataclass(slots=True)
++class _Trade:
++    """One outcome row joined (best effort) to its prediction row."""
++
++    outcome: dict[str, Any]
++    prediction: dict[str, Any] | None
++    day: date
++    resolution: str
++    points: float | None  # None => unpriced
++
++
++def aggregate_performance(
++    journal_dir: Path,
++    *,
++    filters: PerformanceFilters | None = None,
++    models_root: Path | None = None,
++    bundle_dir: Path | None = None,
++) -> PerformanceReport:
++    """Aggregate the journal directory into a :class:`PerformanceReport`.
++
++    ``models_root`` enables per-row pricing from each row's own ``bundle_id``
++    contract; ``bundle_dir`` supplies the fallback ("active") contract AND
++    enables the OOS comparison section. Raises :class:`JournalDirectoryNotFound`
++    when the directory is absent and :class:`InvalidPerformanceFilter` on
++    out-of-domain filter values.
++    """
++
++    filters = filters or PerformanceFilters()
++    filters.validate()
++    if not journal_dir.is_dir():
++        raise JournalDirectoryNotFound(str(journal_dir))
++
++    raw = _read_journal(journal_dir)
++    fallback_pricing = _load_contract_pricing(bundle_dir) if bundle_dir is not None else None
++    resolver = _PricingResolver(models_root, fallback_pricing)
++
++    # --- journal-global anomalies (pre-filter data quality) -----------------
++    orphan_outcomes = sum(1 for pid in raw.outcomes if pid not in raw.predictions)
++    orphan_drops = sum(1 for pid in raw.drops if pid not in raw.predictions)
++    outcome_drop_conflicts = sum(1 for pid in raw.drops if pid in raw.outcomes)
++
++    def _in_window(day: date) -> bool:
++        if filters.from_day is not None and day < filters.from_day:
++            return False
++        return not (filters.to_day is not None and day > filters.to_day)
++
++    def _mode_ok(row: dict[str, Any]) -> bool:
++        return filters.mode == "all" or row.get("mode") == filters.mode
++
++    def _bundle_ok(row: dict[str, Any]) -> bool:
++        return filters.bundle_id is None or row.get("bundle_id") == filters.bundle_id
++
++    def _prediction_session_eligibility_ok(pred: dict[str, Any] | None) -> tuple[bool, str]:
++        """(passes, reason) — reason distinguishes a real mismatch from unknowable."""
++
++        if filters.session is not None:
++            if pred is None:
++                return False, "unknown_session"
++            if pred.get("session") != filters.session:
++                return False, "mismatch"
++        if filters.eligibility != "all":
++            if pred is None or not isinstance(pred.get("is_eligible"), bool):
++                return False, "unknown_eligibility"
++            wanted = filters.eligibility == "eligible"
++            if pred["is_eligible"] is not wanted:
++                return False, "mismatch"
++        return True, ""
++
++    # --- filtered predictions (prediction-dated) ----------------------------
++    scoped_predictions: list[dict[str, Any]] = []
++    for pred in raw.predictions.values():
++        if not (_mode_ok(pred) and _bundle_ok(pred) and _in_window(pred["_day"])):
++            continue
++        passes, _ = _prediction_session_eligibility_ok(pred)
++        if passes:
++            scoped_predictions.append(pred)
++
++    # --- filtered trades (outcome-dated; session/eligibility via the join) --
++    trades: list[_Trade] = []
++    unknown_resolution_trades = 0
++    excluded_unknown_session = 0
++    excluded_unknown_eligibility = 0
++    for pid, outcome in raw.outcomes.items():
++        if not (_mode_ok(outcome) and _bundle_ok(outcome) and _in_window(outcome["_day"])):
++            continue
++        pred = raw.predictions.get(pid)
++        passes, reason = _prediction_session_eligibility_ok(pred)
++        if not passes:
++            if reason == "unknown_session":
++                excluded_unknown_session += 1
++            elif reason == "unknown_eligibility":
++                excluded_unknown_eligibility += 1
++            continue
++        resolution = outcome.get("resolution_type")
++        if resolution not in KNOWN_RESOLUTIONS:
++            unknown_resolution_trades += 1
++            continue
++        pricing = resolver.resolve(outcome)
++        points: float | None = None
++        if pricing is not None:
++            tp_points, sl_points = pricing
++            points = tp_points if resolution == RESOLUTION_TP else -sl_points
++        trades.append(
++            _Trade(
++                outcome=outcome,
++                prediction=pred,
++                day=outcome["_day"],
++                resolution=resolution,
++                points=points,
++            )
++        )
++
++    # --- filtered drops (drop-dated; enrichment via the join) ---------------
++    scoped_drops: list[dict[str, Any]] = []
++    for pid, drop in raw.drops.items():
++        if pid in raw.outcomes:
++            continue  # conflict rows counted globally, excluded from drop stats
++        if not (_mode_ok(drop) and _bundle_ok(drop) and _in_window(drop["_day"])):
++            continue
++        passes, _ = _prediction_session_eligibility_ok(raw.predictions.get(pid))
++        if passes:
++            scoped_drops.append(drop)
++
++    # --- headline ------------------------------------------------------------
++    priced = [t for t in trades if t.points is not None]
++    unpriced = len(trades) - len(priced)
++    wins = [t for t in trades if t.resolution == RESOLUTION_TP]
++    priced_wins = [t for t in priced if t.points is not None and t.points > 0]
++    priced_losses = [t for t in priced if t.points is not None and t.points <= 0]
++    correct_flags = [
++        bool(t.outcome["correct"])
++        for t in trades
++        if isinstance(t.outcome.get("correct"), bool)
++    ]
++    eligible_trades = [
++        t
++        for t in trades
++        if t.prediction is not None and t.prediction.get("is_eligible") is True
++    ]
++
++    gross_win = sum(t.points for t in priced_wins if t.points is not None)
++    gross_loss = -sum(t.points for t in priced_losses if t.points is not None)
++    net_points = gross_win - gross_loss
++
++    resolution_seconds = [
++        (t.outcome["_ts"] - t.prediction["_ts"]).total_seconds()
++        for t in trades
++        if t.prediction is not None
++    ]
++    bars_to_resolution = [
++        float(t.outcome["bars_to_resolution"])
++        for t in trades
++        if isinstance(t.outcome.get("bars_to_resolution"), int | float)
++    ]
++
++    per_day: dict[date, dict[str, Any]] = {}
++
++    def _day_bucket(day: date) -> dict[str, Any]:
++        return per_day.setdefault(
++            day,
++            {
++                "net_points": 0.0,
++                "resolved": 0,
++                "priced": 0,
++                "wins": 0,
++                "losses": 0,
++                "unpriced": 0,
++                "predictions": 0,
++                "eligible_predictions": 0,
++                "drops": 0,
++            },
++        )
++
++    for t in trades:
++        bucket = _day_bucket(t.day)
++        bucket["resolved"] += 1
++        if t.points is None:
++            bucket["unpriced"] += 1
++            continue
++        bucket["priced"] += 1
++        bucket["net_points"] += t.points
++        if t.points > 0:
++            bucket["wins"] += 1
++        else:
++            bucket["losses"] += 1
++    for pred in scoped_predictions:
++        bucket = _day_bucket(pred["_day"])
++        bucket["predictions"] += 1
++        if pred.get("is_eligible") is True:
++            bucket["eligible_predictions"] += 1
++    for drop in scoped_drops:
++        _day_bucket(drop["_day"])["drops"] += 1
++
++    series: list[dict[str, Any]] = []
++    cumulative = 0.0
++    for day in sorted(per_day):
++        bucket = per_day[day]
++        cumulative += bucket["net_points"]
++        series.append(
++            {"trading_day": day.isoformat(), **bucket, "cumulative_net_points": cumulative}
++        )
++
++    days_with_priced = [d for d, b in per_day.items() if b["priced"] > 0]
++    winning_days = sum(1 for d in days_with_priced if per_day[d]["net_points"] > 0)
++
++    direction_split: dict[str, dict[str, Any]] = {}
++    for t in trades:
++        direction = "unknown"
++        if t.prediction is not None and isinstance(t.prediction.get("direction"), str):
++            direction = t.prediction["direction"]
++        bucket = direction_split.setdefault(
++            direction,
++            {"resolved": 0, "wins": 0, "priced": 0, "net_points": 0.0},
++        )
++        bucket["resolved"] += 1
++        if t.resolution == RESOLUTION_TP:
++            bucket["wins"] += 1
++        if t.points is not None:
++            bucket["priced"] += 1
++            bucket["net_points"] += t.points
++    for bucket in direction_split.values():
++        bucket["win_rate"] = _ratio(bucket["wins"], bucket["resolved"])
++        bucket["expectancy_pts"] = {
++            "value": None if bucket["priced"] == 0 else bucket["net_points"] / bucket["priced"],
++            "n": bucket["priced"],
++        }
++
++    mfe_values = [
++        float(t.outcome["max_mfe_pts"])
++        for t in trades
++        if isinstance(t.outcome.get("max_mfe_pts"), int | float)
++    ]
++    mae_values = [
++        float(t.outcome["max_mae_pts"])
++        for t in trades
++        if isinstance(t.outcome.get("max_mae_pts"), int | float)
++    ]
++
++    headline = {
++        "predictions": len(scoped_predictions),
++        "eligible_predictions": sum(
++            1 for p in scoped_predictions if p.get("is_eligible") is True
++        ),
++        "resolved_trades": len(trades),
++        "eligible_trades": len(eligible_trades),
++        "priced_trades": len(priced),
++        "unpriced_trades": unpriced,
++        "win_rate": _ratio(len(wins), len(trades)),
++        "class_accuracy": _ratio(sum(correct_flags), len(correct_flags)),
++        "net_points": {"value": net_points, "n_priced": len(priced)},
++        "gross_win_points": gross_win,
++        "gross_loss_points": gross_loss,
++        "profit_factor": {
++            "value": None if gross_loss == 0 else gross_win / gross_loss,
++            "gross_win": gross_win,
++            "gross_loss": gross_loss,
++        },
++        "avg_win_pts": _mean_stat([t.points for t in priced_wins if t.points is not None]),
++        "avg_loss_pts": _mean_stat(
++            [-t.points for t in priced_losses if t.points is not None]
++        ),
++        "avg_time_to_resolution_seconds": _mean_stat(resolution_seconds),
++        "avg_bars_to_resolution": _mean_stat(bars_to_resolution),
++        "direction": direction_split,
++        "day_win_pct": _ratio(winning_days, len(days_with_priced)),
++        "mfe_pts": _dist_stat(mfe_values),
++        "mae_pts": _dist_stat(mae_values),
++        "point_value": fallback_pricing.point_value if fallback_pricing else None,
++    }
++
++    # --- breakdowns ----------------------------------------------------------
++    per_class: dict[str, dict[str, Any]] = {}
++    class_names = {
++        str(t.outcome.get("predicted_class")) for t in trades
++    } | {str(t.outcome.get("actual_class")) for t in trades}
++    for name in sorted(class_names - {"None"}):
++        predicted = [t for t in trades if t.outcome.get("predicted_class") == name]
++        actual = [t for t in trades if t.outcome.get("actual_class") == name]
++        true_positive = sum(1 for t in predicted if t.outcome.get("actual_class") == name)
++        predicted_priced = [t for t in predicted if t.points is not None]
++        per_class[name] = {
++            "predicted": len(predicted),
++            "actual": len(actual),
++            "precision": _ratio(true_positive, len(predicted)),
++            "recall": _ratio(true_positive, len(actual)),
++            "win_rate": _ratio(
++                sum(1 for t in predicted if t.resolution == RESOLUTION_TP), len(predicted)
++            ),
++            "net_points": {
++                "value": sum(t.points for t in predicted_priced if t.points is not None),
++                "n_priced": len(predicted_priced),
++            },
++        }
++
++    def _keyed_breakdown(key: str) -> dict[str, dict[str, Any]]:
++        result: dict[str, dict[str, Any]] = {}
++        for t in trades:
++            value = "unknown"
++            if t.prediction is not None and isinstance(t.prediction.get(key), str):
++                value = t.prediction[key]
++            bucket = result.setdefault(
++                value, {"resolved": 0, "wins": 0, "priced": 0, "net_points": 0.0}
++            )
++            bucket["resolved"] += 1
++            if t.resolution == RESOLUTION_TP:
++                bucket["wins"] += 1
++            if t.points is not None:
++                bucket["priced"] += 1
++                bucket["net_points"] += t.points
++        for pred in scoped_predictions:
++            value = pred.get(key) if isinstance(pred.get(key), str) else "unknown"
++            bucket = result.setdefault(
++                value, {"resolved": 0, "wins": 0, "priced": 0, "net_points": 0.0}
++            )
++            bucket["predictions"] = bucket.get("predictions", 0) + 1
++        for bucket in result.values():
++            bucket.setdefault("predictions", 0)
++            bucket["win_rate"] = _ratio(bucket["wins"], bucket["resolved"])
++        return result
++
++    drop_reasons: dict[str, int] = {}
++    for drop in scoped_drops:
++        reason = drop.get("reason") if isinstance(drop.get("reason"), str) else "unknown"
++        drop_reasons[reason] = drop_reasons.get(reason, 0) + 1
++
++    breakdowns = {
++        "per_class": per_class,
++        "per_level_kind": _keyed_breakdown("level_kind"),
++        "per_session": _keyed_breakdown("session"),
++        "drop_reasons": drop_reasons,
++    }
++
++    # --- funnel (prediction cohort: in-scope predictions -> eventual fate) ---
++    cohort_resolved = 0
++    cohort_priced = 0
++    cohort_dropped = 0
++    cohort_pending = 0
++    for pred in scoped_predictions:
++        pid = pred["prediction_id"]
++        outcome = raw.outcomes.get(pid)
++        if outcome is not None:
++            cohort_resolved += 1
++            if (
++                outcome.get("resolution_type") in KNOWN_RESOLUTIONS
++                and resolver.resolve(outcome, count=False) is not None
++            ):
++                cohort_priced += 1
++        elif pid in raw.drops:
++            cohort_dropped += 1
++        else:
++            cohort_pending += 1
++    funnel = {
++        "note": "prediction cohort in the filter window, followed to its eventual fate",
++        "predictions": len(scoped_predictions),
++        "eligible": headline["eligible_predictions"],
++        "resolved": cohort_resolved,
++        "dropped": cohort_dropped,
++        "pending": cohort_pending,
++        "priced": cohort_priced,
++    }
++
++    anomalies = {
++        "note": "whole-directory data quality, counted before filtering",
++        "files_scanned": raw.files_scanned,
++        "unreadable_files": raw.unreadable_files,
++        "decode_error_files": raw.decode_error_files,
++        "lines_total": raw.lines_total,
++        "malformed_lines": raw.malformed_lines,
++        "unknown_type_rows": raw.unknown_type_rows,
++        "rows_missing_ids": raw.rows_missing_ids,
++        "undated_rows": raw.undated_rows,
++        "duplicate_prediction_rows": raw.duplicate_prediction_rows,
++        "duplicate_outcome_rows": raw.duplicate_outcome_rows,
++        "duplicate_drop_rows": raw.duplicate_drop_rows,
++        "orphan_outcomes": orphan_outcomes,
++        "orphan_drops": orphan_drops,
++        "outcome_drop_conflicts": outcome_drop_conflicts,
++        "scoped": {
++            "unknown_resolution_trades": unknown_resolution_trades,
++            "unpriced_trades": unpriced,
++            "excluded_unknown_session": excluded_unknown_session,
++            "excluded_unknown_eligibility": excluded_unknown_eligibility,
++        },
++    }
++
++    pricing_section = {
++        "rule": (
++            "tp_hit -> +tp_points, sl_hit -> -sl_points; drops and unknown resolutions "
++            "are never priced"
++        ),
++        "sources": resolver.source_counts,
++        "fallback_contract": None
++        if fallback_pricing is None
++        else {
++            "tp_points": fallback_pricing.tp_points,
++            "sl_points": fallback_pricing.sl_points,
++            "point_value": fallback_pricing.point_value,
++        },
++    }
++
++    oos_comparison = (
++        _oos_comparison(bundle_dir, fallback_pricing, trades, eligible_trades, priced)
++        if bundle_dir is not None
++        else None
++    )
++
++    applied_filters = {
++        "mode": filters.mode,
++        "from": None if filters.from_day is None else filters.from_day.isoformat(),
++        "to": None if filters.to_day is None else filters.to_day.isoformat(),
++        "bundle_id": filters.bundle_id,
++        "session": filters.session,
++        "eligibility": filters.eligibility,
++    }
++
++    return PerformanceReport(
++        applied_filters=applied_filters,
++        headline=headline,
++        series=series,
++        breakdowns=breakdowns,
++        funnel=funnel,
++        anomalies=anomalies,
++        pricing=pricing_section,
++        oos_comparison=oos_comparison,
++    )
++
++
++# ---------------------------------------------------------------------------
++# OOS comparison (bundle artifacts vs the filtered journal)
++# ---------------------------------------------------------------------------
++
++
++def _oos_comparison(
++    bundle_dir: Path,
++    pricing: _ContractPricing | None,
++    trades: list[_Trade],
++    eligible_trades: list[_Trade],
++    priced: list[_Trade],
++) -> dict[str, Any]:
++    """Side-by-side OOS artifacts vs the same stats over the filtered journal.
++
++    REPORT_RECON.md (c): the OOS artifacts carry NO MFE/MAE — that side is
++    explicitly null. Pricing rules differ (OOS gated expectancy is a tp15/sl30
++    simulation; the journal proxy prices the contract's own tp/sl) and each side
++    is labeled with its rule rather than pretending comparability.
++    """
++
++    oos: dict[str, Any] = {
++        "available": False,
++        "gated": None,
++        "quality_gates": None,
++        "class_distribution": None,
++        "mfe_mae": None,
++        "mfe_mae_note": "not recorded in the OOS artifacts",
++    }
++    evaluation = _load_json(bundle_dir / _EVALUATION_FILE)
++    if evaluation is not None:
++        oos["available"] = True
++        gated = evaluation.get("gated_oos")
++        if isinstance(gated, dict):
++            oos["gated"] = {
++                "trade_count": gated.get("trade_count"),
++                "precision": gated.get("precision"),
++                "expectancy_pts": gated.get("expectancy_15_30_pts"),
++                "profit_factor": gated.get("profit_factor_15_30"),
++                "coverage": gated.get("coverage"),
++                "confidence_gate": gated.get("confidence_gate"),
++                "eligible_sessions": gated.get("eligible_sessions"),
++                "n_samples": gated.get("n_samples"),
++                "pricing_rule": "OOS simulation at tp15/sl30 (expectancy_15_30_pts)",
++            }
++        gates = evaluation.get("quality_gates")
++        if isinstance(gates, dict):
++            # Verify fix (major): the gates container itself is untrusted too —
++            # a non-dict value must degrade this section, not 500 the report.
++            raw_gates = gates.get("gates")
++            oos["quality_gates"] = {
++                "all_passed": gates.get("all_passed"),
++                "gates": {
++                    name: {
++                        "passed": detail.get("passed"),
++                        "value": detail.get("value"),
++                        "threshold": detail.get("threshold"),
++                    }
++                    for name, detail in (
++                        raw_gates.items() if isinstance(raw_gates, dict) else ()
++                    )
++                    if isinstance(detail, dict)
++                },
++            }
++        three_class = evaluation.get("oos_three_class_balance")
++        if isinstance(three_class, dict):
++            oos["class_distribution"] = {"actual": three_class, "predicted": None}
++
++    parquet_distribution = _oos_parquet_distribution(bundle_dir / _OOS_PREDICTIONS_FILE)
++    if parquet_distribution is not None:
++        oos["available"] = True
++        oos["class_distribution"] = parquet_distribution
++
++    eligible_class = pricing.eligible_class if pricing is not None else None
++    eligible_hits = sum(
++        1 for t in eligible_trades if t.outcome.get("actual_class") == eligible_class
++    )
++    eligible_priced = [t for t in eligible_trades if t.points is not None]
++    eligible_net = sum(t.points for t in eligible_priced if t.points is not None)
++    journal = {
++        "resolved_trades": len(trades),
++        "eligible_trades": len(eligible_trades),
++        "gated_hit_rate": {
++            **_ratio(eligible_hits, len(eligible_trades)),
++            "definition": f"actual_class == {eligible_class!r} among eligible resolved trades",
++        },
++        "gated_win_rate": _ratio(
++            sum(1 for t in eligible_trades if t.resolution == RESOLUTION_TP),
++            len(eligible_trades),
++        ),
++        "gated_expectancy_pts": {
++            "value": None if not eligible_priced else eligible_net / len(eligible_priced),
++            "n": len(eligible_priced),
++            "pricing_rule": "journal proxy at the contract's own tp/sl",
++        },
++        "class_distribution": {
++            "predicted": _count_by(trades, "predicted_class"),
++            "actual": _count_by(trades, "actual_class"),
++            "n": len(trades),
++        },
++        "mfe_mae": {
++            "mfe_pts": _dist_stat(
++                [
++                    float(t.outcome["max_mfe_pts"])
++                    for t in trades
++                    if isinstance(t.outcome.get("max_mfe_pts"), int | float)
++                ]
++            ),
++            "mae_pts": _dist_stat(
++                [
++                    float(t.outcome["max_mae_pts"])
++                    for t in trades
++                    if isinstance(t.outcome.get("max_mae_pts"), int | float)
++                ]
++            ),
++        },
++        "priced_trades": len(priced),
++    }
++    return {"bundle_id": bundle_dir.name, "oos": oos, "journal": journal}
++
++
++def _count_by(trades: list[_Trade], key: str) -> dict[str, int]:
++    counts: dict[str, int] = {}
++    for t in trades:
++        value = t.outcome.get(key)
++        name = value if isinstance(value, str) else "unknown"
++        counts[name] = counts.get(name, 0) + 1
++    return counts
++
++
++def _load_json(path: Path) -> dict[str, Any] | None:
++    try:
++        payload = json.loads(path.read_text(encoding="utf-8"))
++    except (OSError, json.JSONDecodeError):
++        return None
++    return payload if isinstance(payload, dict) else None
++
++
++def _oos_parquet_distribution(path: Path) -> dict[str, Any] | None:
++    try:
++        if not path.is_file():
++            return None
++    except OSError:
++        return None
++    try:
++        import pyarrow.parquet as pq  # lazy: only the OOS section needs it
++
++        table = pq.read_table(path, columns=["label", "pred_label"])
++    except Exception:
++        logger.warning("performance: OOS parquet is unreadable: %s", path.name)
++        return None
++    actual: dict[str, int] = {}
++    predicted: dict[str, int] = {}
++    for value in table.column("label").to_pylist():
++        name = value if isinstance(value, str) else "unknown"
++        actual[name] = actual.get(name, 0) + 1
++    for value in table.column("pred_label").to_pylist():
++        name = value if isinstance(value, str) else "unknown"
++        predicted[name] = predicted.get(name, 0) + 1
++    return {"actual": actual, "predicted": predicted, "n": table.num_rows}
+diff --git a/backend/tests/test_performance.py b/backend/tests/test_performance.py
+new file mode 100644
+index 0000000..1f0811f
+--- /dev/null
++++ b/backend/tests/test_performance.py
+@@ -0,0 +1,506 @@
++"""Unit tests for the REPORT P2 performance aggregator (synthetic journals).
++
++Coverage per the window spec: all resolution types, drops, mode mixing,
++multi-day (incl. the 18:00 ET boundary), empty dir, malformed lines (skip +
++count), plus the pricing-source ladder, duplicate/orphan/conflict buckets,
++filters, the cohort funnel, and the OOS comparison section.
++"""
++
++import json
++from datetime import date
++from pathlib import Path
++
++import pytest
++
++from trade_lab.services.performance import (
++    InvalidPerformanceFilter,
++    JournalDirectoryNotFound,
++    PerformanceFilters,
++    aggregate_performance,
++)
++
++BUNDLE = "NQ_TEST_BUNDLE"
++
++
++def _prediction(pid: str, **over) -> dict:
++    row = {
++        "type": "prediction",
++        "mode": "live",
++        "bundle_id": BUNDLE,
++        "ts_utc": "2026-06-18T08:00:00+00:00",
++        "prediction_id": pid,
++        "touch_id": f"touch-{pid}",
++        "observation_id": f"obs-{pid}",
++        "predicted_class": "tradeable_reversal",
++        "probabilities": {"tradeable_reversal": 0.8},
++        "feature_values": {"f": 1.0},
++        "is_eligible": True,
++        "direction": "long",
++        "session": "ny",
++        "level_kind": "pdl",
++        "level_price_ticks": 100_000,
++        "contract_id": BUNDLE,
++        "nan_count": 0,
++    }
++    row.update(over)
++    return row
++
++
++def _outcome(pid: str, **over) -> dict:
++    row = {
++        "type": "outcome",
++        "mode": "live",
++        "bundle_id": BUNDLE,
++        "ts_utc": "2026-06-18T08:10:00+00:00",
++        "outcome_id": f"out-{pid}",
++        "prediction_id": pid,
++        "touch_id": f"touch-{pid}",
++        "resolution_type": "tp_hit",
++        "actual_class": "tradeable_reversal",
++        "predicted_class": "tradeable_reversal",
++        "correct": True,
++        "max_mfe_pts": 16.0,
++        "max_mae_pts": 4.0,
++        "bars_to_resolution": 3,
++        "entry_price": 20000.0,
++    }
++    row.update(over)
++    return row
++
++
++def _drop(pid: str, **over) -> dict:
++    row = {
++        "type": "drop",
++        "mode": "live",
++        "bundle_id": BUNDLE,
++        "ts_utc": "2026-06-18T08:05:00+00:00",
++        "prediction_id": pid,
++        "touch_id": f"touch-{pid}",
++        "reason": "no_fill",
++        "entry_price": None,
++    }
++    row.update(over)
++    return row
++
++
++def _write(journal: Path, name: str, rows: list) -> None:
++    journal.mkdir(parents=True, exist_ok=True)
++    lines = [row if isinstance(row, str) else json.dumps(row) for row in rows]
++    (journal / name).write_text("\n".join(lines) + "\n", encoding="utf-8")
++
++
++def _bundle_dir(root: Path, name: str = BUNDLE, tp: float = 15.0, sl: float = 15.0) -> Path:
++    bundle = root / name
++    bundle.mkdir(parents=True, exist_ok=True)
++    (bundle / "strategy.json").write_text(
++        json.dumps(
++            {
++                "label_policy": {"tp_points": tp, "sl_points": sl},
++                "point_value": 20.0,
++                "inference": {"eligible_class": "tradeable_reversal"},
++            }
++        ),
++        encoding="utf-8",
++    )
++    return bundle
++
++
++def test_missing_journal_dir_raises(tmp_path: Path) -> None:
++    with pytest.raises(JournalDirectoryNotFound):
++        aggregate_performance(tmp_path / "absent")
++
++
++def test_invalid_filters_raise() -> None:
++    with pytest.raises(InvalidPerformanceFilter):
++        PerformanceFilters(mode="bogus").validate()
++    with pytest.raises(InvalidPerformanceFilter):
++        PerformanceFilters(eligibility="bogus").validate()
++    with pytest.raises(InvalidPerformanceFilter):
++        PerformanceFilters(from_day=date(2026, 6, 19), to_day=date(2026, 6, 18)).validate()
++
++
++def test_empty_dir_yields_zeroed_report(tmp_path: Path) -> None:
++    journal = tmp_path / "journal"
++    journal.mkdir()
++    report = aggregate_performance(journal)
++    assert report.headline["predictions"] == 0
++    assert report.headline["resolved_trades"] == 0
++    assert report.headline["win_rate"] == {"value": None, "numerator": 0, "denominator": 0}
++    assert report.series == []
++    assert report.funnel["predictions"] == 0
++    assert report.anomalies["files_scanned"] == 0
++    assert report.oos_comparison is None
++
++
++def test_resolutions_pricing_and_headline(tmp_path: Path) -> None:
++    journal = tmp_path / "journal"
++    bundle = _bundle_dir(tmp_path / "models")
++    _write(
++        journal,
++        "2026-06-18.jsonl",
++        [
++            _prediction("p1"),
++            _outcome("p1", resolution_type="tp_hit", correct=True),
++            _prediction("p2", predicted_class="trap_reversal", direction="short"),
++            _outcome(
++                "p2",
++                resolution_type="sl_hit",
++                predicted_class="trap_reversal",
++                actual_class="aggressive_blowthrough",
++                correct=False,
++                ts_utc="2026-06-18T09:00:00+00:00",
++            ),
++            _prediction("p3"),
++            _outcome("p3", resolution_type="session_end"),  # retired type -> bucketed
++            _prediction("p4"),
++            _drop("p4", reason="flatten"),
++        ],
++    )
++    report = aggregate_performance(journal, bundle_dir=bundle)
++    headline = report.headline
++    assert headline["predictions"] == 4
++    assert headline["resolved_trades"] == 2  # session_end excluded, counted below
++    assert report.anomalies["scoped"]["unknown_resolution_trades"] == 1
++    assert headline["win_rate"] == {"value": 0.5, "numerator": 1, "denominator": 2}
++    assert headline["class_accuracy"] == {"value": 0.5, "numerator": 1, "denominator": 2}
++    # +15 (tp) - 15 (sl) at the fallback contract's tp/sl
++    assert headline["net_points"] == {"value": 0.0, "n_priced": 2}
++    assert headline["profit_factor"]["value"] == 1.0
++    assert headline["avg_win_pts"] == {"value": 15.0, "n": 1}
++    assert headline["avg_loss_pts"] == {"value": 15.0, "n": 1}
++    assert headline["point_value"] == 20.0
++    assert headline["direction"]["long"]["wins"] == 1
++    assert headline["direction"]["short"]["expectancy_pts"] == {"value": -15.0, "n": 1}
++    assert report.breakdowns["drop_reasons"] == {"flatten": 1}
++    assert report.pricing["sources"]["fallback_contract"] >= 2
++    # per-class precision/recall carry denominators
++    trap = report.breakdowns["per_class"]["trap_reversal"]
++    assert trap["precision"] == {"value": 0.0, "numerator": 0, "denominator": 1}
++    tradeable = report.breakdowns["per_class"]["tradeable_reversal"]
++    assert tradeable["precision"] == {"value": 1.0, "numerator": 1, "denominator": 1}
++    assert tradeable["recall"]["denominator"] == 1
++
++
++def test_pricing_source_ladder(tmp_path: Path) -> None:
++    journal = tmp_path / "journal"
++    models_root = tmp_path / "models"
++    _bundle_dir(models_root, name=BUNDLE, tp=10.0, sl=5.0)
++    fallback = _bundle_dir(tmp_path / "fallback_bundle", name="FALLBACK", tp=15.0, sl=15.0)
++    _write(
++        journal,
++        "2026-06-18.jsonl",
++        [
++            # row-level values win over everything
++            _prediction("p1"),
++            _outcome("p1", tp_points=7.0, sl_points=3.0, resolution_type="tp_hit"),
++            # bundle contract from models_root (tp 10)
++            _prediction("p2"),
++            _outcome("p2", ts_utc="2026-06-18T09:00:00+00:00"),
++            # unknown bundle + fallback contract (tp 15)
++            _prediction("p3", bundle_id="GHOST"),
++            _outcome("p3", bundle_id="GHOST", ts_utc="2026-06-18T10:00:00+00:00"),
++        ],
++    )
++    with_fallback = aggregate_performance(journal, models_root=models_root, bundle_dir=fallback)
++    assert with_fallback.headline["net_points"] == {"value": 7.0 + 10.0 + 15.0, "n_priced": 3}
++    assert with_fallback.pricing["sources"] == {
++        "row": 1,
++        "bundle_contract": 1,
++        "fallback_contract": 1,
++    }
++    # without any contract source, unknown-bundle rows land in the unpriced bucket
++    without = aggregate_performance(journal, models_root=models_root)
++    assert without.headline["priced_trades"] == 2
++    assert without.headline["unpriced_trades"] == 1
++    assert without.anomalies["scoped"]["unpriced_trades"] == 1
++    assert without.headline["resolved_trades"] == 3  # bucketed, not dropped
++
++
++def test_mode_mixing_and_filters(tmp_path: Path) -> None:
++    journal = tmp_path / "journal"
++    _write(
++        journal,
++        "2026-06-18.jsonl",
++        [
++            _prediction("p1", mode="replay"),
++            _outcome("p1", mode="replay"),
++            _prediction("p2", mode="live", session="london", is_eligible=False),
++            _outcome("p2", mode="live", ts_utc="2026-06-18T09:00:00+00:00"),
++        ],
++    )
++    replay = aggregate_performance(journal, filters=PerformanceFilters(mode="replay"))
++    assert replay.headline["predictions"] == 1
++    assert replay.headline["resolved_trades"] == 1
++    london = aggregate_performance(journal, filters=PerformanceFilters(session="london"))
++    assert london.headline["resolved_trades"] == 1
++    assert london.breakdowns["per_session"].keys() == {"london"}
++    eligible = aggregate_performance(journal, filters=PerformanceFilters(eligibility="eligible"))
++    assert eligible.headline["predictions"] == 1
++    assert eligible.headline["resolved_trades"] == 1
++    ineligible = aggregate_performance(
++        journal, filters=PerformanceFilters(eligibility="ineligible")
++    )
++    assert ineligible.headline["resolved_trades"] == 1
++    assert ineligible.headline["eligible_trades"] == 0
++    bundled = aggregate_performance(journal, filters=PerformanceFilters(bundle_id="OTHER"))
++    assert bundled.headline["predictions"] == 0
++    assert bundled.headline["resolved_trades"] == 0
++
++
++def test_multi_day_series_boundary_and_day_win_pct(tmp_path: Path) -> None:
++    journal = tmp_path / "journal"
++    bundle = _bundle_dir(tmp_path / "models")
++    # 17:59 ET prediction belongs to trading day 06-17; its 18:05 ET outcome to 06-18.
++    _write(
++        journal,
++        "2026-06-17.jsonl",
++        [
++            _prediction("p1", ts_utc="2026-06-17T21:59:00+00:00"),
++            _prediction("p0", ts_utc="2026-06-17T15:00:00+00:00"),
++            _outcome("p0", ts_utc="2026-06-17T15:30:00+00:00", resolution_type="sl_hit"),
++        ],
++    )
++    _write(
++        journal,
++        "2026-06-18.jsonl",
++        [_outcome("p1", ts_utc="2026-06-17T22:05:00+00:00", resolution_type="tp_hit")],
++    )
++    report = aggregate_performance(journal, bundle_dir=bundle)
++    days = {row["trading_day"]: row for row in report.series}
++    assert set(days) == {"2026-06-17", "2026-06-18"}
++    assert days["2026-06-17"]["net_points"] == -15.0
++    assert days["2026-06-17"]["predictions"] == 2
++    assert days["2026-06-18"]["net_points"] == 15.0
++    assert days["2026-06-18"]["predictions"] == 0
++    assert days["2026-06-18"]["cumulative_net_points"] == 0.0
++    assert report.headline["day_win_pct"] == {"value": 0.5, "numerator": 1, "denominator": 2}
++    # date filter on the boundary: only the outcome's trading day selects the trade
++    later = aggregate_performance(
++        journal,
++        bundle_dir=bundle,
++        filters=PerformanceFilters(from_day=date(2026, 6, 18)),
++    )
++    assert later.headline["resolved_trades"] == 1
++    assert later.headline["predictions"] == 0
++    # cohort funnel still follows the 06-17 prediction to its 06-18 fate
++    earlier = aggregate_performance(
++        journal,
++        bundle_dir=bundle,
++        filters=PerformanceFilters(to_day=date(2026, 6, 17)),
++    )
++    assert earlier.headline["resolved_trades"] == 1  # p0 only
++    assert earlier.funnel["predictions"] == 2
++    assert earlier.funnel["resolved"] == 2  # p1's out-of-window outcome counts as its fate
++
++
++def test_malformed_duplicates_orphans_conflicts(tmp_path: Path) -> None:
++    journal = tmp_path / "journal"
++    _write(
++        journal,
++        "2026-06-18.jsonl",
++        [
++            '{"type":"prediction","prediction_id":"p1",',  # torn tail line
++            '"just a string"',  # valid JSON, not an object
++            json.dumps(
++                {"type": "mystery", "prediction_id": "px", "ts_utc": "2026-06-18T08:00:00+00:00"}
++            ),
++            json.dumps({"type": "prediction", "ts_utc": "2026-06-18T08:00:00+00:00"}),  # no id
++            json.dumps({"type": "prediction", "prediction_id": "p2"}),  # no ts -> undated
++            _prediction("p3"),
++            _prediction("p3"),  # duplicate prediction id
++            _outcome("p3"),
++            _outcome("p3", resolution_type="sl_hit"),  # duplicate outcome; first wins
++            _outcome("orphan-1"),  # no prediction row
++            _drop("orphan-2"),  # no prediction row
++            _prediction("p4"),
++            _outcome("p4", ts_utc="2026-06-18T09:00:00+00:00"),
++            _drop("p4"),  # conflict: outcome AND drop
++        ],
++    )
++    report = aggregate_performance(journal)
++    anomalies = report.anomalies
++    assert anomalies["malformed_lines"] == 2
++    assert anomalies["unknown_type_rows"] == 1
++    assert anomalies["rows_missing_ids"] == 1
++    assert anomalies["undated_rows"] == 1
++    assert anomalies["duplicate_prediction_rows"] == 1
++    assert anomalies["duplicate_outcome_rows"] == 1
++    assert anomalies["orphan_outcomes"] == 1
++    assert anomalies["orphan_drops"] == 1
++    assert anomalies["outcome_drop_conflicts"] == 1
++    # first outcome wins: p3 stays tp_hit; conflict drop is excluded from reasons
++    assert report.headline["win_rate"]["numerator"] == 3  # p3, orphan-1, p4
++    assert report.breakdowns["drop_reasons"] == {"no_fill": 1}  # orphan-2 only
++    # orphan outcome surfaces under unknown session/direction, never dropped
++    assert report.breakdowns["per_session"]["unknown"]["resolved"] == 1
++    # session/eligibility filters cannot classify orphans; they are excluded + counted
++    gated = aggregate_performance(journal, filters=PerformanceFilters(eligibility="eligible"))
++    assert gated.anomalies["scoped"]["excluded_unknown_eligibility"] == 1
++
++
++def test_profit_factor_none_when_no_losses(tmp_path: Path) -> None:
++    journal = tmp_path / "journal"
++    bundle = _bundle_dir(tmp_path / "models")
++    _write(journal, "2026-06-18.jsonl", [_prediction("p1"), _outcome("p1")])
++    report = aggregate_performance(journal, bundle_dir=bundle)
++    assert report.headline["profit_factor"]["value"] is None
++    assert report.headline["profit_factor"]["gross_loss"] == 0.0
++    assert report.headline["day_win_pct"] == {"value": 1.0, "numerator": 1, "denominator": 1}
++
++
++def test_oos_comparison_section(tmp_path: Path) -> None:
++    journal = tmp_path / "journal"
++    bundle = _bundle_dir(tmp_path / "models")
++    (bundle / "evaluation.json").write_text(
++        json.dumps(
++            {
++                "gated_oos": {
++                    "trade_count": 3,
++                    "precision": 0.333,
++                    "expectancy_15_30_pts": -5.0,
++                    "profit_factor_15_30": 0.5,
++                    "coverage": 0.073,
++                    "confidence_gate": 0.7,
++                    "eligible_sessions": ["ny"],
++                    "n_samples": 41,
++                },
++                "quality_gates": {
++                    "all_passed": False,
++                    "gates": {
++                        "Precision >= 0.55": {
++                            "passed": False,
++                            "value": 0.31,
++                            "threshold": 0.55,
++                            "operator": ">=",
++                        }
++                    },
++                },
++                "oos_three_class_balance": {"tradeable_reversal": 17},
++            }
++        ),
++        encoding="utf-8",
++    )
++    pa = pytest.importorskip("pyarrow")
++    import pyarrow.parquet as pq
++
++    pq.write_table(
++        pa.table(
++            {
++                "label": ["tradeable_reversal", "trap_reversal"],
++                "pred_label": ["trap_reversal", "trap_reversal"],
++            }
++        ),
++        bundle / "oos_predictions.parquet",
++    )
++    _write(
++        journal,
++        "2026-06-18.jsonl",
++        [
++            _prediction("p1"),
++            _outcome("p1", actual_class="tradeable_reversal"),
++            _prediction("p2", is_eligible=False),
++            _outcome(
++                "p2",
++                resolution_type="sl_hit",
++                actual_class="trap_reversal",
++                correct=False,
++                ts_utc="2026-06-18T09:00:00+00:00",
++            ),
++        ],
++    )
++    report = aggregate_performance(journal, bundle_dir=bundle)
++    comparison = report.oos_comparison
++    assert comparison is not None
++    assert comparison["bundle_id"] == bundle.name
++    assert comparison["oos"]["available"] is True
++    assert comparison["oos"]["gated"]["trade_count"] == 3
++    assert comparison["oos"]["gated"]["expectancy_pts"] == -5.0
++    assert comparison["oos"]["quality_gates"]["all_passed"] is False
++    assert comparison["oos"]["class_distribution"] == {
++        "actual": {"tradeable_reversal": 1, "trap_reversal": 1},
++        "predicted": {"trap_reversal": 2},
++        "n": 2,
++    }
++    assert comparison["oos"]["mfe_mae"] is None  # not recorded in OOS artifacts
++    journal_side = comparison["journal"]
++    assert journal_side["eligible_trades"] == 1
++    assert journal_side["gated_hit_rate"]["numerator"] == 1
++    assert journal_side["gated_hit_rate"]["denominator"] == 1
++    assert journal_side["gated_expectancy_pts"] == {
++        "value": 15.0,
++        "n": 1,
++        "pricing_rule": "journal proxy at the contract's own tp/sl",
++    }
++    assert journal_side["class_distribution"]["n"] == 2
++    assert journal_side["mfe_mae"]["mfe_pts"]["n"] == 2
++
++
++def test_undecodable_bytes_are_salvaged_and_counted(tmp_path: Path) -> None:
++    # Verify fix (major): a single non-UTF-8 byte previously raised
++    # UnicodeDecodeError out of the aggregator (a permanent 500 at the
++    # endpoint). Bad bytes must degrade to malformed lines + a flagged file,
++    # and healthy rows in the same file stay readable.
++    journal = tmp_path / "journal"
++    _write(journal, "2026-06-18.jsonl", [_prediction("p1"), _outcome("p1")])
++    with (journal / "2026-06-18.jsonl").open("ab") as handle:
++        handle.write(b"\xff\xfe garbage line\n")
++    report = aggregate_performance(journal)
++    assert report.anomalies["decode_error_files"] == 1
++    assert report.anomalies["malformed_lines"] == 1
++    assert report.headline["resolved_trades"] == 1  # healthy rows salvaged
++
++
++def test_unreadable_file_is_counted_not_silent(tmp_path: Path) -> None:
++    # Verify fix (major): an OSError-unreadable file previously vanished with
++    # only a server log line while files_scanned claimed it was read. A
++    # directory named *.jsonl matches the glob and raises OSError on read.
++    journal = tmp_path / "journal"
++    _write(journal, "2026-06-18.jsonl", [_prediction("p1"), _outcome("p1")])
++    (journal / "2026-06-19.jsonl").mkdir()
++    report = aggregate_performance(journal)
++    assert report.anomalies["files_scanned"] == 2
++    assert report.anomalies["unreadable_files"] == 1
++    assert report.headline["resolved_trades"] == 1
++
++
++def test_malformed_quality_gates_degrades_not_crashes(tmp_path: Path) -> None:
++    # Verify fix (major): a non-dict quality_gates.gates in evaluation.json
++    # previously raised AttributeError out of aggregate_performance, turning
++    # the WHOLE report into a 500. It must degrade the OOS section only.
++    journal = tmp_path / "journal"
++    bundle = _bundle_dir(tmp_path / "models")
++    _write(journal, "2026-06-18.jsonl", [_prediction("p1"), _outcome("p1")])
++    for bad_gates in (["oops"], None, "oops"):
++        (bundle / "evaluation.json").write_text(
++            json.dumps({"quality_gates": {"all_passed": False, "gates": bad_gates}}),
++            encoding="utf-8",
++        )
++        report = aggregate_performance(journal, bundle_dir=bundle)
++        assert report.headline["resolved_trades"] == 1
++        comparison = report.oos_comparison
++        assert comparison is not None
++        assert comparison["oos"]["quality_gates"] == {"all_passed": False, "gates": {}}
++
++
++def test_payload_shape(tmp_path: Path) -> None:
++    journal = tmp_path / "journal"
++    journal.mkdir()
++    payload = aggregate_performance(journal).to_payload()
++    assert set(payload) == {
++        "applied_filters",
++        "headline",
++        "series",
++        "breakdowns",
++        "funnel",
++        "anomalies",
++        "pricing",
++        "oos_comparison",
++    }
++    assert set(payload["applied_filters"]) == {
++        "mode",
++        "from",
++        "to",
++        "bundle_id",
++        "session",
++        "eligibility",
++    }
+diff --git a/backend/tests/test_performance_api.py b/backend/tests/test_performance_api.py
+new file mode 100644
+index 0000000..2294ca7
+--- /dev/null
++++ b/backend/tests/test_performance_api.py
+@@ -0,0 +1,210 @@
++"""Contract tests for GET /api/v1/performance (REPORT P3).
++
++Read-only endpoint over the journal directory + model store: 404 clean on a
++missing journal dir, 400 on out-of-domain filters/path-like bundle ids, 404 on
++unknown bundle ids, per-request file opens (a row appended between calls shows
++up on the next call), torn-tail-line tolerance, and a pinned payload shape with
++no path/secret leakage.
++"""
++
++import json
++from pathlib import Path
++
++from fastapi.testclient import TestClient
++
++from trade_lab.api.app import create_app
++from trade_lab.config import Settings
++
++BUNDLE = "NQ_TEST_BUNDLE"
++
++
++def _prediction(pid: str, **over) -> dict:
++    row = {
++        "type": "prediction",
++        "mode": "live",
++        "bundle_id": BUNDLE,
++        "ts_utc": "2026-06-18T08:00:00+00:00",
++        "prediction_id": pid,
++        "touch_id": f"touch-{pid}",
++        "observation_id": f"obs-{pid}",
++        "predicted_class": "tradeable_reversal",
++        "probabilities": {"tradeable_reversal": 0.8},
++        "feature_values": {"f": 1.0},
++        "is_eligible": True,
++        "direction": "long",
++        "session": "ny",
++        "level_kind": "pdl",
++        "level_price_ticks": 100_000,
++        "contract_id": BUNDLE,
++        "nan_count": 0,
++    }
++    row.update(over)
++    return row
++
++
++def _outcome(pid: str, **over) -> dict:
++    row = {
++        "type": "outcome",
++        "mode": "live",
++        "bundle_id": BUNDLE,
++        "ts_utc": "2026-06-18T08:10:00+00:00",
++        "outcome_id": f"out-{pid}",
++        "prediction_id": pid,
++        "touch_id": f"touch-{pid}",
++        "resolution_type": "tp_hit",
++        "actual_class": "tradeable_reversal",
++        "predicted_class": "tradeable_reversal",
++        "correct": True,
++        "max_mfe_pts": 16.0,
++        "max_mae_pts": 4.0,
++        "bars_to_resolution": 3,
++        "entry_price": 20000.0,
++    }
++    row.update(over)
++    return row
++
++
++def _make_bundle(models_root: Path, name: str = BUNDLE) -> Path:
++    bundle = models_root / name
++    bundle.mkdir(parents=True, exist_ok=True)
++    (bundle / "strategy.json").write_text(
++        json.dumps(
++            {
++                "label_policy": {"tp_points": 15.0, "sl_points": 15.0},
++                "point_value": 20.0,
++                "inference": {"eligible_class": "tradeable_reversal"},
++            }
++        ),
++        encoding="utf-8",
++    )
++    return bundle
++
++
++def _client(tmp_path: Path, *, create_journal: bool = True) -> tuple[TestClient, Path]:
++    journal = tmp_path / "journal"
++    if create_journal:
++        journal.mkdir(parents=True, exist_ok=True)
++    models_root = tmp_path / "models"
++    _make_bundle(models_root)
++    settings = Settings(_env_file=None, journal_path=journal, models_path=models_root)
++    return TestClient(create_app(settings)), journal
++
++
++def _append(journal: Path, rows: list) -> None:
++    lines = [row if isinstance(row, str) else json.dumps(row) for row in rows]
++    with (journal / "2026-06-18.jsonl").open("a", encoding="utf-8") as handle:
++        for line in lines:
++            handle.write(line + "\n")
++
++
++def test_404_when_journal_dir_missing(tmp_path: Path) -> None:
++    client, _ = _client(tmp_path, create_journal=False)
++    response = client.get("/api/v1/performance")
++    assert response.status_code == 404
++    assert response.json()["detail"] == "journal directory not found"
++
++
++def test_empty_journal_returns_zeroed_payload(tmp_path: Path) -> None:
++    client, _ = _client(tmp_path)
++    response = client.get("/api/v1/performance")
++    assert response.status_code == 200
++    payload = response.json()
++    assert payload["headline"]["resolved_trades"] == 0
++    assert payload["series"] == []
++    assert payload["oos_comparison"] is None
++
++
++def test_payload_shape_and_no_path_leakage(tmp_path: Path) -> None:
++    client, journal = _client(tmp_path)
++    _append(journal, [_prediction("p1"), _outcome("p1")])
++    response = client.get("/api/v1/performance", params={"bundle": BUNDLE})
++    assert response.status_code == 200
++    payload = response.json()
++    assert set(payload) == {
++        "applied_filters",
++        "headline",
++        "series",
++        "breakdowns",
++        "funnel",
++        "anomalies",
++        "pricing",
++        "oos_comparison",
++    }
++    assert payload["applied_filters"] == {
++        "mode": "all",
++        "from": None,
++        "to": None,
++        "bundle_id": BUNDLE,
++        "session": None,
++        "eligibility": "all",
++    }
++    win_rate = payload["headline"]["win_rate"]
++    assert set(win_rate) == {"value", "numerator", "denominator"}
++    assert payload["oos_comparison"]["bundle_id"] == BUNDLE
++    text = json.dumps(payload).lower()
++    assert "c:\\" not in text
++    assert "/users/" not in text
++
++
++def test_filters_flow_through(tmp_path: Path) -> None:
++    client, journal = _client(tmp_path)
++    _append(
++        journal,
++        [
++            _prediction("p1", mode="replay"),
++            _outcome("p1", mode="replay"),
++            _prediction("p2"),
++            _outcome("p2", ts_utc="2026-06-18T09:00:00+00:00"),
++        ],
++    )
++    live = client.get("/api/v1/performance", params={"mode": "live"}).json()
++    assert live["headline"]["resolved_trades"] == 1
++    windowed = client.get(
++        "/api/v1/performance", params={"from": "2026-06-19", "to": "2026-06-20"}
++    ).json()
++    assert windowed["headline"]["resolved_trades"] == 0
++    assert windowed["applied_filters"]["from"] == "2026-06-19"
++
++
++def test_appends_between_calls_are_visible(tmp_path: Path) -> None:
++    client, journal = _client(tmp_path)
++    _append(journal, [_prediction("p1"), _outcome("p1")])
++    first = client.get("/api/v1/performance").json()
++    assert first["headline"]["resolved_trades"] == 1
++    _append(journal, [_prediction("p2"), _outcome("p2", ts_utc="2026-06-18T09:00:00+00:00")])
++    second = client.get("/api/v1/performance").json()
++    assert second["headline"]["resolved_trades"] == 2
++
++
++def test_torn_tail_line_is_counted_not_fatal(tmp_path: Path) -> None:
++    client, journal = _client(tmp_path)
++    _append(journal, [_prediction("p1"), _outcome("p1"), '{"type":"outcome","predi'])
++    response = client.get("/api/v1/performance")
++    assert response.status_code == 200
++    payload = response.json()
++    assert payload["headline"]["resolved_trades"] == 1
++    assert payload["anomalies"]["malformed_lines"] == 1
++
++
++def test_400_on_bad_filters(tmp_path: Path) -> None:
++    client, _ = _client(tmp_path)
++    assert client.get("/api/v1/performance", params={"mode": "bogus"}).status_code == 400
++    assert client.get("/api/v1/performance", params={"from": "not-a-date"}).status_code == 400
++    assert client.get("/api/v1/performance", params={"eligibility": "maybe"}).status_code == 400
++    assert (
++        client.get(
++            "/api/v1/performance", params={"from": "2026-06-19", "to": "2026-06-18"}
++        ).status_code
++        == 400
++    )
++
++
++def test_bundle_id_hygiene(tmp_path: Path) -> None:
++    client, _ = _client(tmp_path)
++    # Path-like ids are a 400 before any filesystem access.
++    assert (
++        client.get("/api/v1/performance", params={"bundle": "..\\escape"}).status_code == 400
++    )
++    assert client.get("/api/v1/performance", params={"bundle": "a/b"}).status_code == 400
++    # Well-formed but unknown ids are a clean 404.
++    assert client.get("/api/v1/performance", params={"bundle": "NO_SUCH"}).status_code == 404
+diff --git a/frontend/src/App.tsx b/frontend/src/App.tsx
+index d61f6c8..db23963 100644
+--- a/frontend/src/App.tsx
++++ b/frontend/src/App.tsx
+@@ -1,4 +1,4 @@
+-import { useEffect } from 'react';
++import { useEffect, useState } from 'react';
+ import { apiClient } from './api/client';
+ import { normalizeLiveStatus, normalizeReplayStatus, normalizeRuntimeStatus } from './domain/normalize';
+ import { realtimeClient } from './realtime/client';
+@@ -10,8 +10,12 @@ import { EventBlotter } from './components/EventBlotter';
+ import { ReplayControls } from './components/ReplayControls';
+ import { LiveDataPanel } from './components/LiveDataPanel';
+ import { ModelPanel } from './components/ModelPanel';
++import { PerformancePage } from './components/PerformancePage';
++
++type WorkspaceView = 'workstation' | 'performance';
+ 
+ export function App() {
++  const [view, setView] = useState<WorkspaceView>('workstation');
+   useEffect(() => {
+     let cancelled = false;
+     const refreshStatus = async () => {
+@@ -38,20 +42,36 @@ export function App() {
+   }, []);
+ 
+   return (
+-    <main className="workstation-shell">
++    <main className={view === 'workstation' ? 'workstation-shell' : 'workstation-shell performance-view'}>
+       <TopStatusBar />
+-      <section className="control-row">
+-        <ReplayControls />
+-        <LiveDataPanel />
+-      </section>
+-      <section className="control-row model-row">
+-        <ModelPanel />
+-      </section>
+-      <section className="workspace-grid">
+-        <ChartWorkspace />
+-        <IntelligencePanel />
+-      </section>
+-      <EventBlotter />
++      <nav className="view-tabs" aria-label="Workspace view">
++        <div className="segmented-control">
++          <button className={view === 'workstation' ? 'active' : ''} onClick={() => setView('workstation')}>
++            Workstation
++          </button>
++          <button className={view === 'performance' ? 'active' : ''} onClick={() => setView('performance')}>
++            Performance
++          </button>
++        </div>
++      </nav>
++      {view === 'workstation' ? (
++        <>
++          <section className="control-row">
++            <ReplayControls />
++            <LiveDataPanel />
++          </section>
++          <section className="control-row model-row">
++            <ModelPanel />
++          </section>
++          <section className="workspace-grid">
++            <ChartWorkspace />
++            <IntelligencePanel />
++          </section>
++          <EventBlotter />
++        </>
++      ) : (
++        <PerformancePage />
++      )}
+     </main>
+   );
+ }
+diff --git a/frontend/src/api/client.ts b/frontend/src/api/client.ts
+index b4dbde8..67fcb9d 100644
+--- a/frontend/src/api/client.ts
++++ b/frontend/src/api/client.ts
+@@ -1,5 +1,5 @@
+ import { config } from '../config';
+-import type { ApiResult, HealthDTO, LiveStatusDTO, ModelsResponseDTO, ReplaySourcesResponseDTO, ReplayStartRequestDTO, ReplayStatusDTO, RuntimeStatusDTO } from './types';
++import type { ApiResult, HealthDTO, LiveStatusDTO, ModelsResponseDTO, PerformanceQuery, PerformanceReportDTO, ReplaySourcesResponseDTO, ReplayStartRequestDTO, ReplayStatusDTO, RuntimeStatusDTO } from './types';
+ import type { ModelStatusDTO } from '../realtime/types';
+ 
+ type FetchLike = typeof fetch;
+@@ -58,6 +58,18 @@ export class ApiClient {
+     return this.post<ModelStatusDTO>('/api/v1/models/deactivate');
+   }
+ 
++  // Read-only reporting aggregate (REPORT P3); the backend re-reads the journal
++  // files on every call, so polling this endpoint always sees fresh appends.
++  performance(query: PerformanceQuery = {}): Promise<ApiResult<PerformanceReportDTO>> {
++    const params = new URLSearchParams();
++    if (query.mode) params.set('mode', query.mode);
++    if (query.from) params.set('from', query.from);
++    if (query.to) params.set('to', query.to);
++    if (query.bundle) params.set('bundle', query.bundle);
++    const suffix = params.toString();
++    return this.get<PerformanceReportDTO>(`/api/v1/performance${suffix ? `?${suffix}` : ''}`);
++  }
++
+   startReplay(request: ReplayStartRequestDTO): Promise<ApiResult<ReplayStatusDTO>> {
+     return this.post<ReplayStatusDTO>('/api/v1/replay/start', request);
+   }
+diff --git a/frontend/src/api/types.ts b/frontend/src/api/types.ts
+index 44f5906..ffe3ff1 100644
+--- a/frontend/src/api/types.ts
++++ b/frontend/src/api/types.ts
+@@ -95,3 +95,187 @@ export type LiveStatusDTO = {
+ export type ApiResult<T> =
+   | { ok: true; data: T }
+   | { ok: false; error: string; status?: number };
++
++// --- GET /api/v1/performance (REPORT P3) -----------------------------------
++// Every rate carries numerator/denominator and every mean carries its n — the
++// backend never emits a bare percentage.
++
++export type RatioDTO = { value: number | null; numerator: number; denominator: number };
++export type MeanStatDTO = { value: number | null; n: number };
++export type DistStatDTO = { mean: number | null; median: number | null; max: number | null; n: number };
++
++export type PerformanceDayDTO = {
++  trading_day: string;
++  net_points: number;
++  cumulative_net_points: number;
++  resolved: number;
++  priced: number;
++  wins: number;
++  losses: number;
++  unpriced: number;
++  predictions: number;
++  eligible_predictions: number;
++  drops: number;
++};
++
++export type PerformanceDirectionDTO = {
++  resolved: number;
++  wins: number;
++  priced: number;
++  net_points: number;
++  win_rate: RatioDTO;
++  expectancy_pts: MeanStatDTO;
++};
++
++export type PerformanceHeadlineDTO = {
++  predictions: number;
++  eligible_predictions: number;
++  resolved_trades: number;
++  eligible_trades: number;
++  priced_trades: number;
++  unpriced_trades: number;
++  win_rate: RatioDTO;
++  class_accuracy: RatioDTO;
++  net_points: { value: number; n_priced: number };
++  gross_win_points: number;
++  gross_loss_points: number;
++  profit_factor: { value: number | null; gross_win: number; gross_loss: number };
++  avg_win_pts: MeanStatDTO;
++  avg_loss_pts: MeanStatDTO;
++  avg_time_to_resolution_seconds: MeanStatDTO;
++  avg_bars_to_resolution: MeanStatDTO;
++  direction: Record<string, PerformanceDirectionDTO>;
++  day_win_pct: RatioDTO;
++  mfe_pts: DistStatDTO;
++  mae_pts: DistStatDTO;
++  point_value: number | null;
++};
++
++export type PerformanceClassRowDTO = {
++  predicted: number;
++  actual: number;
++  precision: RatioDTO;
++  recall: RatioDTO;
++  win_rate: RatioDTO;
++  net_points: { value: number; n_priced: number };
++};
++
++export type PerformanceKeyRowDTO = {
++  resolved: number;
++  wins: number;
++  priced: number;
++  net_points: number;
++  predictions: number;
++  win_rate: RatioDTO;
++};
++
++export type PerformanceBreakdownsDTO = {
++  per_class: Record<string, PerformanceClassRowDTO>;
++  per_level_kind: Record<string, PerformanceKeyRowDTO>;
++  per_session: Record<string, PerformanceKeyRowDTO>;
++  drop_reasons: Record<string, number>;
++};
++
++export type PerformanceFunnelDTO = {
++  note: string;
++  predictions: number;
++  eligible: number;
++  resolved: number;
++  dropped: number;
++  pending: number;
++  priced: number;
++};
++
++export type PerformanceAnomaliesDTO = {
++  note: string;
++  files_scanned: number;
++  unreadable_files: number;
++  decode_error_files: number;
++  lines_total: number;
++  malformed_lines: number;
++  unknown_type_rows: number;
++  rows_missing_ids: number;
++  undated_rows: number;
++  duplicate_prediction_rows: number;
++  duplicate_outcome_rows: number;
++  duplicate_drop_rows: number;
++  orphan_outcomes: number;
++  orphan_drops: number;
++  outcome_drop_conflicts: number;
++  scoped: {
++    unknown_resolution_trades: number;
++    unpriced_trades: number;
++    excluded_unknown_session: number;
++    excluded_unknown_eligibility: number;
++  };
++};
++
++export type PerformanceOOSGatedDTO = {
++  trade_count: number | null;
++  precision: number | null;
++  expectancy_pts: number | null;
++  profit_factor: number | null;
++  coverage: number | null;
++  confidence_gate: number | null;
++  eligible_sessions: string[] | null;
++  n_samples: number | null;
++  pricing_rule: string;
++};
++
++export type PerformanceOOSComparisonDTO = {
++  bundle_id: string;
++  oos: {
++    available: boolean;
++    gated: PerformanceOOSGatedDTO | null;
++    quality_gates: {
++      all_passed: boolean | null;
++      gates: Record<string, { passed: boolean | null; value: number | null; threshold: number | null }>;
++    } | null;
++    class_distribution: {
++      actual: Record<string, number> | null;
++      predicted: Record<string, number> | null;
++      n?: number;
++    } | null;
++    mfe_mae: null;
++    mfe_mae_note: string;
++  };
++  journal: {
++    resolved_trades: number;
++    eligible_trades: number;
++    gated_hit_rate: RatioDTO & { definition: string };
++    gated_win_rate: RatioDTO;
++    gated_expectancy_pts: { value: number | null; n: number; pricing_rule: string };
++    class_distribution: { predicted: Record<string, number>; actual: Record<string, number>; n: number };
++    mfe_mae: { mfe_pts: DistStatDTO; mae_pts: DistStatDTO };
++    priced_trades: number;
++  };
++};
++
++export type PerformanceReportDTO = {
++  applied_filters: {
++    mode: string;
++    from: string | null;
++    to: string | null;
++    bundle_id: string | null;
++    session: string | null;
++    eligibility: string;
++  };
++  headline: PerformanceHeadlineDTO;
++  series: PerformanceDayDTO[];
++  breakdowns: PerformanceBreakdownsDTO;
++  funnel: PerformanceFunnelDTO;
++  anomalies: PerformanceAnomaliesDTO;
++  pricing: {
++    rule: string;
++    sources: Record<string, number>;
++    fallback_contract: { tp_points: number; sl_points: number; point_value: number | null } | null;
++  };
++  oos_comparison: PerformanceOOSComparisonDTO | null;
++};
++
++export type PerformanceQuery = {
++  mode?: string;
++  from?: string;
++  to?: string;
++  bundle?: string;
++};
+diff --git a/frontend/src/components/PerformancePage.tsx b/frontend/src/components/PerformancePage.tsx
+new file mode 100644
+index 0000000..a9e7112
+--- /dev/null
++++ b/frontend/src/components/PerformancePage.tsx
+@@ -0,0 +1,633 @@
++import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
++import { apiClient } from '../api/client';
++import type { PerformanceKeyRowDTO, PerformanceReportDTO } from '../api/types';
++import {
++  DEFAULT_DOLLARS_PER_POINT,
++  buildCumulativeCurve,
++  buildDailyBars,
++  buildMonthCalendar,
++  buildStatCards,
++  calendarCellColor,
++  formatDuration,
++  formatPoints,
++  formatRatio,
++  monthsWithData,
++  parseMonthKey,
++  seriesByDay,
++  shiftMonth,
++} from '../performance/viewModels';
++
++type Mode = 'all' | 'replay' | 'live';
++type BundleScope = 'active' | 'all';
++
++export function PerformancePage() {
++  const [report, setReport] = useState<PerformanceReportDTO | null>(null);
++  const [error, setError] = useState<string | null>(null);
++  const [noJournal, setNoJournal] = useState(false);
++  const [loading, setLoading] = useState(true);
++  const [mode, setMode] = useState<Mode>('all');
++  const [fromDay, setFromDay] = useState('');
++  const [toDay, setToDay] = useState('');
++  const [showDollars, setShowDollars] = useState(false);
++  const [activeBundleId, setActiveBundleId] = useState<string | null>(null);
++  const [bundleScope, setBundleScope] = useState<BundleScope>('active');
++  const [monthCursor, setMonthCursor] = useState<string | null>(null);
++
++  useEffect(() => {
++    let cancelled = false;
++    void apiClient.activeModel().then((result) => {
++      if (cancelled) return;
++      if (result.ok && result.data.loaded && result.data.model_id) {
++        setActiveBundleId(result.data.model_id);
++      } else {
++        setActiveBundleId(null);
++      }
++    });
++    return () => {
++      cancelled = true;
++    };
++  }, []);
++
++  const bundleParam = bundleScope === 'active' && activeBundleId ? activeBundleId : undefined;
++
++  // Verify fix (major): filter changes can spawn overlapping requests (mount
++  // fires before activeModel resolves, then again after). Without sequencing,
++  // an older all-bundle response could land last and overwrite the newer
++  // scoped one. Only the latest request may write state.
++  const requestSeq = useRef(0);
++
++  const refresh = useCallback(async () => {
++    const seq = ++requestSeq.current;
++    setLoading(true);
++    const result = await apiClient.performance({
++      mode: mode === 'all' ? undefined : mode,
++      from: fromDay || undefined,
++      to: toDay || undefined,
++      bundle: bundleParam,
++    });
++    if (seq !== requestSeq.current) return; // superseded by a newer request
++    setLoading(false);
++    if (result.ok) {
++      setReport(result.data);
++      setError(null);
++      setNoJournal(false);
++      return;
++    }
++    if (result.status === 404 && result.error.includes('journal directory')) {
++      setReport(null);
++      setError(null);
++      setNoJournal(true);
++      return;
++    }
++    setError(result.error);
++  }, [mode, fromDay, toDay, bundleParam]);
++
++  useEffect(() => {
++    void refresh();
++  }, [refresh]);
++
++  const months = useMemo(() => (report ? monthsWithData(report.series) : []), [report]);
++  const effectiveMonth = monthCursor ?? months[months.length - 1] ?? null;
++  const calendar = useMemo(() => {
++    if (!report || !effectiveMonth) return null;
++    const { year, month } = parseMonthKey(effectiveMonth);
++    return buildMonthCalendar(year, month, seriesByDay(report.series));
++  }, [report, effectiveMonth]);
++
++  const cards = useMemo(
++    () =>
++      report
++        ? buildStatCards(report.headline, {
++            showDollars,
++            dollarsPerPoint: report.headline.point_value ?? DEFAULT_DOLLARS_PER_POINT,
++          })
++        : [],
++    [report, showDollars],
++  );
++
++  const curve = useMemo(
++    () => (report ? buildCumulativeCurve(report.series, 640, 220) : null),
++    [report],
++  );
++  const bars = useMemo(() => (report ? buildDailyBars(report.series, 640, 220) : null), [report]);
++
++  const hasRows = report !== null && (report.series.length > 0 || report.headline.predictions > 0);
++
++  return (
++    <div className="performance-page">
++      <section className="panel perf-filters" aria-label="Performance filters">
++        <div className="perf-filter-group">
++          <span className="eyebrow">Mode</span>
++          <div className="segmented-control" role="group" aria-label="Mode filter">
++            {(['all', 'replay', 'live'] as Mode[]).map((value) => (
++              <button
++                key={value}
++                className={mode === value ? 'active' : ''}
++                onClick={() => setMode(value)}
++              >
++                {value}
++              </button>
++            ))}
++          </div>
++        </div>
++        <label className="perf-filter-group">
++          <span className="eyebrow">From (trading day)</span>
++          <input type="date" value={fromDay} onChange={(event) => setFromDay(event.target.value)} />
++        </label>
++        <label className="perf-filter-group">
++          <span className="eyebrow">To (trading day)</span>
++          <input type="date" value={toDay} onChange={(event) => setToDay(event.target.value)} />
++        </label>
++        {activeBundleId && (
++          <div className="perf-filter-group">
++            <span className="eyebrow">Bundle</span>
++            <div className="segmented-control" role="group" aria-label="Bundle scope">
++              <button
++                className={bundleScope === 'active' ? 'active' : ''}
++                onClick={() => setBundleScope('active')}
++                title={activeBundleId}
++              >
++                active
++              </button>
++              <button
++                className={bundleScope === 'all' ? 'active' : ''}
++                onClick={() => setBundleScope('all')}
++              >
++                all
++              </button>
++            </div>
++          </div>
++        )}
++        <div className="perf-filter-group perf-filter-actions">
++          <button className="perf-refresh" onClick={() => void refresh()} disabled={loading}>
++            {loading ? 'Loading…' : 'Refresh'}
++          </button>
++          <button
++            className={`perf-toggle ${showDollars ? 'active' : ''}`}
++            onClick={() => setShowDollars((current) => !current)}
++            aria-pressed={showDollars}
++          >
++            $ view
++          </button>
++        </div>
++      </section>
++
++      {error && (
++        <section className="panel perf-empty" role="status">
++          <strong>Performance data unavailable</strong>
++          <span>{error}</span>
++        </section>
++      )}
++
++      {noJournal && (
++        <section className="panel perf-empty" role="status">
++          <strong>No journal yet</strong>
++          <span>
++            The prediction journal directory does not exist. Run a replay or live session with an
++            active model; predictions, outcomes, and drops will be journaled automatically.
++          </span>
++        </section>
++      )}
++
++      {report && !hasRows && (
++        <section className="panel perf-empty" role="status">
++          <strong>No journal rows for these filters</strong>
++          <span>
++            {report.anomalies.lines_total === 0
++              ? 'The journal directory exists but has no rows yet.'
++              : 'Rows exist outside the current mode/date/bundle filters.'}
++          </span>
++        </section>
++      )}
++
++      {report && hasRows && (
++        <>
++          <section className="perf-cards" aria-label="Headline performance">
++            {cards.map((card) => (
++              <div key={card.key} className={`panel perf-card tone-${card.tone}`}>
++                <span className="eyebrow">{card.label}</span>
++                <strong>{card.value}</strong>
++                <small>{card.detail}</small>
++              </div>
++            ))}
++          </section>
++
++          <section className="perf-charts">
++            <div className="panel perf-chart-panel" aria-label="Cumulative net points">
++              <div className="perf-section-head">
++                <h3>Cumulative net points</h3>
++                <span>
++                  proxy pricing · {report.headline.priced_trades} priced /{' '}
++                  {report.headline.resolved_trades} resolved
++                </span>
++              </div>
++              {curve && curve.points.length > 0 ? (
++                <svg
++                  viewBox="0 0 640 220"
++                  className="perf-svg"
++                  role="img"
++                  aria-label="Cumulative net points by trading day"
++                >
++                  {curve.zeroY !== null && (
++                    <line x1="8" x2="632" y1={curve.zeroY} y2={curve.zeroY} className="perf-zero" />
++                  )}
++                  <path d={curve.path} className="perf-curve" />
++                  {curve.points.map((point) => (
++                    <circle key={point.day} cx={point.x} cy={point.y} r="4" className="perf-dot">
++                      <title>{`${point.day}: ${formatPoints(point.cumulative)} pts cumulative`}</title>
++                    </circle>
++                  ))}
++                </svg>
++              ) : (
++                <div className="perf-chart-empty">No priced trading days in range.</div>
++              )}
++            </div>
++            <div className="panel perf-chart-panel" aria-label="Daily net points">
++              <div className="perf-section-head">
++                <h3>Daily net points</h3>
++                <span>one bar per trading day (18:00 ET roll)</span>
++              </div>
++              {bars && bars.bars.length > 0 ? (
++                <svg
++                  viewBox="0 0 640 220"
++                  className="perf-svg"
++                  role="img"
++                  aria-label="Daily net points by trading day"
++                >
++                  <line x1="8" x2="632" y1={bars.zeroY} y2={bars.zeroY} className="perf-zero" />
++                  {bars.bars.map((bar) => (
++                    <rect
++                      key={bar.day}
++                      x={bar.x}
++                      y={bar.y}
++                      width={bar.width}
++                      height={Math.max(bar.height, 1)}
++                      rx="2"
++                      className={bar.positive ? 'perf-bar-pos' : 'perf-bar-neg'}
++                    >
++                      <title>{`${bar.day}: ${formatPoints(bar.net)} pts`}</title>
++                    </rect>
++                  ))}
++                </svg>
++              ) : (
++                <div className="perf-chart-empty">No priced trading days in range.</div>
++              )}
++            </div>
++          </section>
++
++          {calendar && (
++            <section className="panel perf-calendar-panel" aria-label="Trading-day calendar">
++              <div className="perf-section-head">
++                <h3>Trading-day calendar</h3>
++                <div className="perf-month-nav">
++                  <button
++                    onClick={() => setMonthCursor(shiftMonth(effectiveMonth!, -1))}
++                    aria-label="Previous month"
++                  >
++                    ‹
++                  </button>
++                  <strong>{calendar.label}</strong>
++                  <button
++                    onClick={() => setMonthCursor(shiftMonth(effectiveMonth!, 1))}
++                    aria-label="Next month"
++                  >
++                    ›
++                  </button>
++                  <span>
++                    month: {formatPoints(calendar.monthNet)} pts · {calendar.monthResolved} trades
++                  </span>
++                </div>
++              </div>
++              <div className="perf-calendar" role="table" aria-label={`Calendar ${calendar.label}`}>
++                <div className="perf-cal-head" role="row">
++                  {['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Week'].map((label) => (
++                    <span key={label} role="columnheader">
++                      {label}
++                    </span>
++                  ))}
++                </div>
++                {calendar.weeks.map((week, weekIndex) => (
++                  <div className="perf-cal-week" role="row" key={weekIndex}>
++                    {week.cells.map((cell, cellIndex) =>
++                      cell ? (
++                        <div
++                          key={cell.iso}
++                          role="cell"
++                          className="perf-cal-cell"
++                          style={{ background: calendarCellColor(cell.intensity, cell.hasData) }}
++                          title={
++                            cell.hasData
++                              ? `${cell.iso}: ${formatPoints(cell.net)} pts · ${cell.resolved} trades (${cell.priced} priced) · ${cell.predictions} predictions · ${cell.drops} drops`
++                              : `${cell.iso}: no journal rows`
++                          }
++                        >
++                          <span className="perf-cal-day">{cell.dayOfMonth}</span>
++                          {cell.hasData && (
++                            <>
++                              <strong>{formatPoints(cell.net, 1)}</strong>
++                              <small>{cell.resolved} trades</small>
++                            </>
++                          )}
++                        </div>
++                      ) : (
++                        <div key={`empty-${weekIndex}-${cellIndex}`} role="cell" className="perf-cal-cell empty" />
++                      ),
++                    )}
++                    <div role="cell" className={`perf-cal-cell week-total ${week.hasData ? '' : 'empty'}`}>
++                      {week.hasData && (
++                        <>
++                          <strong>{formatPoints(week.weekNet)}</strong>
++                          <small>{week.weekResolved} trades</small>
++                        </>
++                      )}
++                    </div>
++                  </div>
++                ))}
++              </div>
++              {calendar.offGrid.length > 0 && (
++                <div className="perf-note" role="status">
++                  Off-grid day keys (weekend-dated, should not occur on the 18:00 ET roll):{' '}
++                  {calendar.offGrid.join(', ')}
++                </div>
++              )}
++            </section>
++          )}
++
++          <section className="perf-tables">
++            <div className="panel perf-table-panel" aria-label="Per-class breakdown">
++              <h3>Per predicted class</h3>
++              <table className="perf-table">
++                <thead>
++                  <tr>
++                    <th>Class</th>
++                    <th>Predicted</th>
++                    <th>Precision</th>
++                    <th>Recall</th>
++                    <th>Win rate</th>
++                    <th>Net pts</th>
++                  </tr>
++                </thead>
++                <tbody>
++                  {Object.entries(report.breakdowns.per_class).map(([name, row]) => (
++                    <tr key={name}>
++                      <td>{name}</td>
++                      <td>{row.predicted}</td>
++                      <td>{formatRatio(row.precision)}</td>
++                      <td>{formatRatio(row.recall)}</td>
++                      <td>{formatRatio(row.win_rate)}</td>
++                      <td>{`${formatPoints(row.net_points.value)} (n=${row.net_points.n_priced})`}</td>
++                    </tr>
++                  ))}
++                </tbody>
++              </table>
++            </div>
++            <KeyedTable title="Per level kind" rows={report.breakdowns.per_level_kind} />
++            <KeyedTable title="Per session" rows={report.breakdowns.per_session} />
++            <div className="panel perf-table-panel" aria-label="Drops and funnel">
++              <h3>Drops &amp; funnel</h3>
++              <table className="perf-table">
++                <tbody>
++                  <tr>
++                    <td>Predictions (cohort)</td>
++                    <td>{report.funnel.predictions}</td>
++                  </tr>
++                  <tr>
++                    <td>Eligible</td>
++                    <td>{report.funnel.eligible}</td>
++                  </tr>
++                  <tr>
++                    <td>Resolved</td>
++                    <td>{report.funnel.resolved}</td>
++                  </tr>
++                  <tr>
++                    <td>Dropped</td>
++                    <td>{report.funnel.dropped}</td>
++                  </tr>
++                  <tr>
++                    <td>Pending</td>
++                    <td>{report.funnel.pending}</td>
++                  </tr>
++                  <tr>
++                    <td>Priced</td>
++                    <td>{report.funnel.priced}</td>
++                  </tr>
++                </tbody>
++              </table>
++              {Object.keys(report.breakdowns.drop_reasons).length > 0 && (
++                <>
++                  <h3>Drop reasons</h3>
++                  <table className="perf-table">
++                    <tbody>
++                      {Object.entries(report.breakdowns.drop_reasons).map(([reason, count]) => (
++                        <tr key={reason}>
++                          <td>{reason}</td>
++                          <td>{count}</td>
++                        </tr>
++                      ))}
++                    </tbody>
++                  </table>
++                </>
++              )}
++              <div className="perf-note">
++                Avg time to resolution:{' '}
++                {formatDuration(report.headline.avg_time_to_resolution_seconds.value)} (n=
++                {report.headline.avg_time_to_resolution_seconds.n}) · avg bars:{' '}
++                {report.headline.avg_bars_to_resolution.value?.toFixed(1) ?? '—'}
++              </div>
++            </div>
++          </section>
++
++          {report.oos_comparison && (
++            <section className="panel perf-oos-panel" aria-label="OOS vs live comparison">
++              <div className="perf-section-head">
++                <h3>OOS vs journal — {report.oos_comparison.bundle_id}</h3>
++                <span>
++                  pricing rules differ by side; each is labeled — they are not directly comparable
++                </span>
++              </div>
++              <table className="perf-table perf-oos-table">
++                <thead>
++                  <tr>
++                    <th></th>
++                    <th>Bundle OOS</th>
++                    <th>Journal (filtered)</th>
++                  </tr>
++                </thead>
++                <tbody>
++                  <tr>
++                    <td>Gated trades</td>
++                    <td>{report.oos_comparison.oos.gated?.trade_count ?? '—'}</td>
++                    <td>{report.oos_comparison.journal.eligible_trades}</td>
++                  </tr>
++                  <tr>
++                    <td>Gated hit rate</td>
++                    <td>
++                      {report.oos_comparison.oos.gated?.precision !== null &&
++                      report.oos_comparison.oos.gated !== null
++                        ? `${((report.oos_comparison.oos.gated.precision ?? 0) * 100).toFixed(1)}%`
++                        : '—'}
++                    </td>
++                    <td title={report.oos_comparison.journal.gated_hit_rate.definition}>
++                      {formatRatio(report.oos_comparison.journal.gated_hit_rate)}
++                    </td>
++                  </tr>
++                  <tr>
++                    <td>Gated win rate</td>
++                    <td>—</td>
++                    <td>{formatRatio(report.oos_comparison.journal.gated_win_rate)}</td>
++                  </tr>
++                  <tr>
++                    <td>Expectancy (pts)</td>
++                    <td title={report.oos_comparison.oos.gated?.pricing_rule ?? ''}>
++                      {report.oos_comparison.oos.gated?.expectancy_pts ?? '—'}
++                    </td>
++                    <td title={report.oos_comparison.journal.gated_expectancy_pts.pricing_rule}>
++                      {report.oos_comparison.journal.gated_expectancy_pts.value === null
++                        ? '—'
++                        : `${report.oos_comparison.journal.gated_expectancy_pts.value.toFixed(2)} (n=${report.oos_comparison.journal.gated_expectancy_pts.n})`}
++                    </td>
++                  </tr>
++                  <tr>
++                    <td>Profit factor</td>
++                    <td>{report.oos_comparison.oos.gated?.profit_factor ?? '—'}</td>
++                    <td>
++                      {report.headline.profit_factor.value === null
++                        ? '—'
++                        : report.headline.profit_factor.value.toFixed(2)}
++                    </td>
++                  </tr>
++                  <tr>
++                    <td>Class distribution (actual)</td>
++                    <td>{formatDistribution(report.oos_comparison.oos.class_distribution?.actual)}</td>
++                    <td>
++                      {formatDistribution(report.oos_comparison.journal.class_distribution.actual)} (n=
++                      {report.oos_comparison.journal.class_distribution.n})
++                    </td>
++                  </tr>
++                  <tr>
++                    <td>Class distribution (predicted)</td>
++                    <td>
++                      {formatDistribution(report.oos_comparison.oos.class_distribution?.predicted)}
++                    </td>
++                    <td>{formatDistribution(report.oos_comparison.journal.class_distribution.predicted)}</td>
++                  </tr>
++                  <tr>
++                    <td>MFE / MAE (pts)</td>
++                    <td>
++                      <em>{report.oos_comparison.oos.mfe_mae_note}</em>
++                    </td>
++                    <td>
++                      {formatDist(report.oos_comparison.journal.mfe_mae.mfe_pts)} /{' '}
++                      {formatDist(report.oos_comparison.journal.mfe_mae.mae_pts)}
++                    </td>
++                  </tr>
++                </tbody>
++              </table>
++              {report.oos_comparison.oos.quality_gates && (
++                <div className="perf-gates">
++                  <span className="eyebrow">
++                    Bundle quality gates —{' '}
++                    {report.oos_comparison.oos.quality_gates.all_passed ? 'all passed' : 'NOT all passed'}
++                  </span>
++                  <div className="perf-gate-chips">
++                    {Object.entries(report.oos_comparison.oos.quality_gates.gates).map(
++                      ([name, gate]) => (
++                        <span
++                          key={name}
++                          className={`perf-gate-chip ${gate.passed ? 'pass' : 'fail'}`}
++                          title={`value ${gate.value ?? '—'} vs threshold ${gate.threshold ?? '—'}`}
++                        >
++                          {gate.passed ? '✓' : '✗'} {name}
++                        </span>
++                      ),
++                    )}
++                  </div>
++                </div>
++              )}
++            </section>
++          )}
++
++          <section className="panel perf-quality" aria-label="Journal data quality">
++            <span className="eyebrow">Journal data quality (whole directory, pre-filter)</span>
++            <div className="perf-quality-row">
++              <span>{report.anomalies.files_scanned} files</span>
++              <span>{report.anomalies.lines_total} lines</span>
++              <QualityCount label="unreadable files" value={report.anomalies.unreadable_files} />
++              <QualityCount
++                label="decode-error files"
++                value={report.anomalies.decode_error_files}
++              />
++              <QualityCount label="malformed" value={report.anomalies.malformed_lines} />
++              <QualityCount label="unknown type" value={report.anomalies.unknown_type_rows} />
++              <QualityCount label="missing ids" value={report.anomalies.rows_missing_ids} />
++              <QualityCount label="undated" value={report.anomalies.undated_rows} />
++              <QualityCount
++                label="dup predictions"
++                value={report.anomalies.duplicate_prediction_rows}
++              />
++              <QualityCount label="dup outcomes" value={report.anomalies.duplicate_outcome_rows} />
++              <QualityCount label="orphan outcomes" value={report.anomalies.orphan_outcomes} />
++              <QualityCount label="orphan drops" value={report.anomalies.orphan_drops} />
++              <QualityCount
++                label="outcome+drop conflicts"
++                value={report.anomalies.outcome_drop_conflicts}
++              />
++              <QualityCount
++                label="unknown resolution"
++                value={report.anomalies.scoped.unknown_resolution_trades}
++              />
++              <QualityCount label="unpriced" value={report.anomalies.scoped.unpriced_trades} />
++            </div>
++          </section>
++        </>
++      )}
++    </div>
++  );
++}
++
++function KeyedTable({ title, rows }: { title: string; rows: Record<string, PerformanceKeyRowDTO> }) {
++  return (
++    <div className="panel perf-table-panel" aria-label={title}>
++      <h3>{title}</h3>
++      <table className="perf-table">
++        <thead>
++          <tr>
++            <th></th>
++            <th>Predictions</th>
++            <th>Resolved</th>
++            <th>Win rate</th>
++            <th>Net pts</th>
++          </tr>
++        </thead>
++        <tbody>
++          {Object.entries(rows).map(([name, row]) => (
++            <tr key={name}>
++              <td>{name}</td>
++              <td>{row.predictions}</td>
++              <td>{row.resolved}</td>
++              <td>{formatRatio(row.win_rate)}</td>
++              <td>{`${formatPoints(row.net_points)} (n=${row.priced})`}</td>
++            </tr>
++          ))}
++        </tbody>
++      </table>
++    </div>
++  );
++}
++
++function QualityCount({ label, value }: { label: string; value: number }) {
++  return <span className={value > 0 ? 'quality-flag' : ''}>{`${label}: ${value}`}</span>;
++}
++
++function formatDistribution(distribution: Record<string, number> | null | undefined): string {
++  if (!distribution) return '—';
++  return Object.entries(distribution)
++    .sort(([a], [b]) => a.localeCompare(b))
++    .map(([name, count]) => `${name}: ${count}`)
++    .join(' · ');
++}
++
++function formatDist(stat: { mean: number | null; n: number }): string {
++  if (stat.mean === null) return '—';
++  return `${stat.mean.toFixed(1)} avg (n=${stat.n})`;
++}
+diff --git a/frontend/src/performance/viewModels.test.ts b/frontend/src/performance/viewModels.test.ts
+new file mode 100644
+index 0000000..3a33808
+--- /dev/null
++++ b/frontend/src/performance/viewModels.test.ts
+@@ -0,0 +1,244 @@
++// Vitest coverage for the Performance page view-models (REPORT P4): stat cards
++// (incl. the simulated-$ toggle), SVG chart geometry, and — most importantly —
++// the trading-day calendar math. Day keys are TRADING days on the 18:00 ET roll
++// (the backend's trading_day_for already mapped a Sunday 19:00 ET trade to
++// Monday's key), so weeks here are Mon..Fri trading weeks, never calendar weeks.
++
++import { describe, expect, it } from 'vitest';
++import type { PerformanceDayDTO, PerformanceHeadlineDTO } from '../api/types';
++import {
++  DEFAULT_DOLLARS_PER_POINT,
++  SIMULATED_DOLLARS_LABEL,
++  buildCumulativeCurve,
++  buildDailyBars,
++  buildMonthCalendar,
++  buildStatCards,
++  calendarCellColor,
++  formatMoney,
++  formatPoints,
++  formatRatio,
++  monthsWithData,
++  parseMonthKey,
++  seriesByDay,
++  shiftMonth,
++} from './viewModels';
++
++const day = (trading_day: string, net: number, over: Partial<PerformanceDayDTO> = {}): PerformanceDayDTO => ({
++  trading_day,
++  net_points: net,
++  cumulative_net_points: net,
++  resolved: 2,
++  priced: 2,
++  wins: net > 0 ? 2 : 0,
++  losses: net > 0 ? 0 : 2,
++  unpriced: 0,
++  predictions: 3,
++  eligible_predictions: 1,
++  drops: 1,
++  ...over,
++});
++
++const headline = (over: Partial<PerformanceHeadlineDTO> = {}): PerformanceHeadlineDTO => ({
++  predictions: 10,
++  eligible_predictions: 4,
++  resolved_trades: 8,
++  eligible_trades: 3,
++  priced_trades: 8,
++  unpriced_trades: 0,
++  win_rate: { value: 0.625, numerator: 5, denominator: 8 },
++  class_accuracy: { value: 0.5, numerator: 4, denominator: 8 },
++  net_points: { value: 30, n_priced: 8 },
++  gross_win_points: 75,
++  gross_loss_points: 45,
++  profit_factor: { value: 75 / 45, gross_win: 75, gross_loss: 45 },
++  avg_win_pts: { value: 15, n: 5 },
++  avg_loss_pts: { value: 15, n: 3 },
++  avg_time_to_resolution_seconds: { value: 120, n: 8 },
++  avg_bars_to_resolution: { value: 4, n: 8 },
++  direction: {},
++  day_win_pct: { value: 0.5, numerator: 1, denominator: 2 },
++  mfe_pts: { mean: 10, median: 9, max: 20, n: 8 },
++  mae_pts: { mean: 5, median: 5, max: 9, n: 8 },
++  point_value: 20,
++  ...over,
++});
++
++describe('formatting', () => {
++  it('formats points with an explicit sign', () => {
++    expect(formatPoints(15)).toBe('+15.0');
++    expect(formatPoints(-7.25, 2)).toBe('-7.25');
++    expect(formatPoints(null)).toBe('—');
++  });
++
++  it('formats simulated dollars at the configured $/pt', () => {
++    expect(formatMoney(15, 20)).toBe('+$300');
++    expect(formatMoney(-2.5, 20)).toBe('-$50');
++    expect(formatMoney(0, 20)).toBe('$0');
++  });
++
++  it('always renders the denominator alongside a ratio', () => {
++    expect(formatRatio({ value: 0.5, numerator: 1, denominator: 2 })).toBe('50.0% (1/2)');
++    expect(formatRatio({ value: null, numerator: 0, denominator: 0 })).toBe('— (0/0)');
++  });
++});
++
++describe('stat cards', () => {
++  it('builds the six headline cards in points mode', () => {
++    const cards = buildStatCards(headline(), { showDollars: false, dollarsPerPoint: 20 });
++    expect(cards.map((card) => card.key)).toEqual([
++      'net',
++      'win_rate',
++      'class_accuracy',
++      'profit_factor',
++      'avg_win_loss',
++      'day_win_pct',
++    ]);
++    expect(cards[0].value).toBe('+30.0');
++    expect(cards[0].tone).toBe('positive');
++    expect(cards[1].detail).toBe('5/8 resolved');
++  });
++
++  it('the $ toggle converts at $/pt and carries the simulated label', () => {
++    const cards = buildStatCards(headline(), { showDollars: true, dollarsPerPoint: 20 });
++    expect(cards[0].value).toBe('+$600');
++    expect(cards[0].label).toContain('$20/pt');
++    expect(cards[0].detail).toContain(SIMULATED_DOLLARS_LABEL);
++    expect(DEFAULT_DOLLARS_PER_POINT).toBe(20);
++  });
++
++  it('profit factor with no losses renders as em dash, not Infinity', () => {
++    const cards = buildStatCards(
++      headline({ profit_factor: { value: null, gross_win: 75, gross_loss: 0 } }),
++      { showDollars: false, dollarsPerPoint: 20 },
++    );
++    const profitFactor = cards.find((card) => card.key === 'profit_factor')!;
++    expect(profitFactor.value).toBe('—');
++    expect(profitFactor.detail).toContain('no losses');
++  });
++});
++
++describe('cumulative curve geometry', () => {
++  it('maps days to evenly spaced x and cumulative values to y', () => {
++    const series = [
++      day('2026-06-15', 15, { cumulative_net_points: 15 }),
++      day('2026-06-16', -15, { cumulative_net_points: 0 }),
++      day('2026-06-17', 30, { cumulative_net_points: 30 }),
++    ];
++    const curve = buildCumulativeCurve(series, 640, 220, 8);
++    expect(curve.points).toHaveLength(3);
++    expect(curve.points[0].x).toBeCloseTo(8);
++    expect(curve.points[2].x).toBeCloseTo(632);
++    expect(curve.path.startsWith('M')).toBe(true);
++    // y decreases (moves up) as cumulative rises
++    expect(curve.points[2].y).toBeLessThan(curve.points[1].y);
++    // zero line sits inside the plot and matches the day-2 cumulative of 0
++    expect(curve.zeroY).not.toBeNull();
++    expect(curve.points[1].y).toBeCloseTo(curve.zeroY!);
++  });
++
++  it('handles empty and single-day series', () => {
++    expect(buildCumulativeCurve([], 640, 220).points).toHaveLength(0);
++    const single = buildCumulativeCurve([day('2026-06-15', 15, { cumulative_net_points: 15 })], 640, 220);
++    expect(single.points).toHaveLength(1);
++    expect(single.points[0].x).toBeCloseTo(320);
++  });
++});
++
++describe('daily bars geometry', () => {
++  it('draws positive bars above the zero line and negative below', () => {
++    const series = [day('2026-06-15', 15), day('2026-06-16', -30)];
++    const { bars, zeroY } = buildDailyBars(series, 640, 220, 8);
++    expect(bars).toHaveLength(2);
++    const positive = bars[0];
++    const negative = bars[1];
++    expect(positive.positive).toBe(true);
++    expect(positive.y + positive.height).toBeCloseTo(zeroY);
++    expect(negative.positive).toBe(false);
++    expect(negative.y).toBeCloseTo(zeroY);
++    // the -30 bar is twice the |15| bar and spans the full half-height
++    expect(negative.height).toBeCloseTo(positive.height * 2);
++  });
++});
++
++describe('trading-day calendar math', () => {
++  // June 2026 starts on a MONDAY; July 2026 starts on a WEDNESDAY.
++  it('June 2026: full trading weeks, Mon..Fri only, with week subtotals', () => {
++    const series = [
++      day('2026-06-15', 15), // Monday
++      day('2026-06-16', -30), // Tuesday
++      day('2026-06-19', 45), // Friday
++    ];
++    const calendar = buildMonthCalendar(2026, 6, seriesByDay(series));
++    expect(calendar.label).toBe('June 2026');
++    // June 1..30 with June 1 a Monday: 5 trading weeks (22 weekdays)
++    expect(calendar.weeks).toHaveLength(5);
++    for (const week of calendar.weeks) {
++      expect(week.cells).toHaveLength(5);
++    }
++    const week3 = calendar.weeks[2]; // June 15-19
++    expect(week3.cells.every((cell) => cell !== null)).toBe(true);
++    expect(week3.cells[0]!.iso).toBe('2026-06-15');
++    expect(week3.cells[0]!.net).toBe(15);
++    expect(week3.weekNet).toBe(15 - 30 + 45);
++    expect(week3.weekResolved).toBe(6);
++    expect(calendar.monthNet).toBe(30);
++    expect(calendar.monthResolved).toBe(6);
++    // weekend day keys never appear as cells
++    const isos = calendar.weeks.flatMap((week) => week.cells.filter(Boolean).map((cell) => cell!.iso));
++    expect(isos).not.toContain('2026-06-06');
++    expect(isos).not.toContain('2026-06-07');
++  });
++
++  it('July 2026 starts mid-week: leading slots are null placeholders', () => {
++    const calendar = buildMonthCalendar(2026, 7, seriesByDay([day('2026-07-01', 10)]));
++    const week1 = calendar.weeks[0];
++    // July 1 2026 is a Wednesday -> Mon+Tue empty, Wed holds day 1
++    expect(week1.cells[0]).toBeNull();
++    expect(week1.cells[1]).toBeNull();
++    expect(week1.cells[2]!.dayOfMonth).toBe(1);
++    expect(week1.cells[2]!.net).toBe(10);
++  });
++
++  it('a Sunday-dated trade key belongs to Monday upstream; a weekend key here is surfaced off-grid', () => {
++    // The backend's 18:00 ET roll can never emit a weekend trading day — if one
++    // ever appears it must be visible, not silently placed or dropped.
++    const calendar = buildMonthCalendar(2026, 6, seriesByDay([day('2026-06-07', 5)])); // a Sunday
++    const isos = calendar.weeks.flatMap((week) => week.cells.filter(Boolean).map((cell) => cell!.iso));
++    expect(isos).not.toContain('2026-06-07');
++    expect(calendar.offGrid).toEqual(['2026-06-07']);
++    expect(calendar.monthNet).toBe(0);
++  });
++
++  it('scales cell intensity to the month max |net| and keeps zero-data cells neutral', () => {
++    const series = [day('2026-06-15', 15), day('2026-06-16', -30)];
++    const calendar = buildMonthCalendar(2026, 6, seriesByDay(series));
++    const week3 = calendar.weeks[2];
++    expect(week3.cells[0]!.intensity).toBeCloseTo(0.5); // 15 / 30
++    expect(week3.cells[1]!.intensity).toBeCloseTo(-1); // -30 / 30
++    expect(week3.cells[2]!.intensity).toBe(0); // no data
++    expect(week3.cells[2]!.hasData).toBe(false);
++  });
++
++  it('cell colors: green positive, red negative, neutral otherwise', () => {
++    expect(calendarCellColor(0.5, true)).toContain('54,211,153');
++    expect(calendarCellColor(-0.5, true)).toContain('255,107,107');
++    expect(calendarCellColor(0, true)).toContain('124,139,155');
++    expect(calendarCellColor(0, false)).toBe('rgba(255,255,255,0.02)');
++  });
++
++  it('month navigation helpers cross year boundaries', () => {
++    expect(shiftMonth('2026-01', -1)).toBe('2025-12');
++    expect(shiftMonth('2025-12', 1)).toBe('2026-01');
++    expect(parseMonthKey('2026-06')).toEqual({ year: 2026, month: 6 });
++  });
++
++  it('monthsWithData is sorted and unique', () => {
++    const months = monthsWithData([
++      day('2026-06-15', 1),
++      day('2026-06-16', 1),
++      day('2026-05-04', 1),
++      day('2026-07-01', 1),
++    ]);
++    expect(months).toEqual(['2026-05', '2026-06', '2026-07']);
++  });
++});
+diff --git a/frontend/src/performance/viewModels.ts b/frontend/src/performance/viewModels.ts
+new file mode 100644
+index 0000000..4170c17
+--- /dev/null
++++ b/frontend/src/performance/viewModels.ts
+@@ -0,0 +1,378 @@
++// Pure view-model math for the Performance page (REPORT P4). No React, no IO —
++// everything here is exercised directly by vitest.
++//
++// Trading-day semantics: day keys arriving from the backend are TRADING days on
++// the 18:00 ET roll (a Sunday 19:00 ET trade already belongs to Monday's key by
++// the time it reaches us). Calendar weeks are therefore trading weeks — Monday
++// through Friday only; weekend keys cannot legitimately occur and are surfaced
++// via `offGrid` instead of being silently placed or dropped.
++
++import type {
++  MeanStatDTO,
++  PerformanceDayDTO,
++  PerformanceHeadlineDTO,
++  RatioDTO,
++} from '../api/types';
++
++export const DEFAULT_DOLLARS_PER_POINT = 20;
++export const SIMULATED_DOLLARS_LABEL = 'simulated, 1-contract, no costs';
++
++// --- formatting -------------------------------------------------------------
++
++export function formatPoints(value: number | null | undefined, digits = 1): string {
++  if (value === null || value === undefined || Number.isNaN(value)) return '—';
++  const sign = value > 0 ? '+' : '';
++  return `${sign}${value.toFixed(digits)}`;
++}
++
++export function formatMoney(points: number | null | undefined, dollarsPerPoint: number): string {
++  if (points === null || points === undefined || Number.isNaN(points)) return '—';
++  const dollars = points * dollarsPerPoint;
++  const sign = dollars > 0 ? '+' : dollars < 0 ? '-' : '';
++  return `${sign}$${Math.abs(dollars).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`;
++}
++
++export function formatRatio(ratio: RatioDTO | null | undefined): string {
++  if (!ratio || ratio.value === null) return `— (0/${ratio?.denominator ?? 0})`;
++  return `${(ratio.value * 100).toFixed(1)}% (${ratio.numerator}/${ratio.denominator})`;
++}
++
++export function formatMean(stat: MeanStatDTO | null | undefined, digits = 1): string {
++  if (!stat || stat.value === null) return '—';
++  return `${stat.value.toFixed(digits)} (n=${stat.n})`;
++}
++
++export function formatDuration(seconds: number | null): string {
++  if (seconds === null || Number.isNaN(seconds)) return '—';
++  if (seconds < 90) return `${Math.round(seconds)}s`;
++  return `${(seconds / 60).toFixed(1)}m`;
++}
++
++// --- headline cards ----------------------------------------------------------
++
++export type StatCard = {
++  key: string;
++  label: string;
++  value: string;
++  detail: string;
++  tone: 'positive' | 'negative' | 'neutral';
++};
++
++export function buildStatCards(
++  headline: PerformanceHeadlineDTO,
++  options: { showDollars: boolean; dollarsPerPoint: number },
++): StatCard[] {
++  const net = headline.net_points.value;
++  const netTone = net > 0 ? 'positive' : net < 0 ? 'negative' : 'neutral';
++  const netCard: StatCard = options.showDollars
++    ? {
++        key: 'net',
++        label: `Net ($${options.dollarsPerPoint}/pt)`,
++        value: formatMoney(net, options.dollarsPerPoint),
++        detail: `${SIMULATED_DOLLARS_LABEL} · ${headline.net_points.n_priced} priced trades`,
++        tone: netTone,
++      }
++    : {
++        key: 'net',
++        label: 'Net points',
++        value: formatPoints(net),
++        detail: `proxy over ${headline.net_points.n_priced} priced trades`,
++        tone: netTone,
++      };
++  const profitFactor = headline.profit_factor.value;
++  return [
++    netCard,
++    {
++      key: 'win_rate',
++      label: 'Win rate (tp before sl)',
++      value: headline.win_rate.value === null ? '—' : `${(headline.win_rate.value * 100).toFixed(1)}%`,
++      detail: `${headline.win_rate.numerator}/${headline.win_rate.denominator} resolved`,
++      tone: 'neutral',
++    },
++    {
++      key: 'class_accuracy',
++      label: 'Class accuracy',
++      value:
++        headline.class_accuracy.value === null
++          ? '—'
++          : `${(headline.class_accuracy.value * 100).toFixed(1)}%`,
++      detail: `${headline.class_accuracy.numerator}/${headline.class_accuracy.denominator} resolved`,
++      tone: 'neutral',
++    },
++    {
++      key: 'profit_factor',
++      label: 'Profit factor',
++      value: profitFactor === null ? '—' : profitFactor.toFixed(2),
++      detail:
++        profitFactor === null
++          ? `no losses (${formatPoints(headline.profit_factor.gross_win)} gross win)`
++          : `${formatPoints(headline.profit_factor.gross_win)} / ${formatPoints(-headline.profit_factor.gross_loss)}`,
++      tone: profitFactor === null ? 'neutral' : profitFactor >= 1 ? 'positive' : 'negative',
++    },
++    {
++      key: 'avg_win_loss',
++      label: 'Avg win / loss (pts)',
++      value: `${headline.avg_win_pts.value === null ? '—' : headline.avg_win_pts.value.toFixed(1)} / ${headline.avg_loss_pts.value === null ? '—' : headline.avg_loss_pts.value.toFixed(1)}`,
++      detail: `${headline.avg_win_pts.n} wins · ${headline.avg_loss_pts.n} losses`,
++      tone: 'neutral',
++    },
++    {
++      key: 'day_win_pct',
++      label: 'Day win %',
++      value:
++        headline.day_win_pct.value === null
++          ? '—'
++          : `${(headline.day_win_pct.value * 100).toFixed(0)}%`,
++      detail: `${headline.day_win_pct.numerator}/${headline.day_win_pct.denominator} trading days`,
++      tone: 'neutral',
++    },
++  ];
++}
++
++// --- charts (SVG geometry) ----------------------------------------------------
++
++export type CurvePoint = { x: number; y: number; day: string; cumulative: number };
++export type CumulativeCurve = {
++  path: string;
++  points: CurvePoint[];
++  zeroY: number | null;
++  min: number;
++  max: number;
++};
++
++// Days are plotted ordinally (one slot per trading day, gaps not to scale) —
++// standard for trading-day equity curves.
++export function buildCumulativeCurve(
++  series: PerformanceDayDTO[],
++  width: number,
++  height: number,
++  pad = 8,
++): CumulativeCurve {
++  if (series.length === 0) return { path: '', points: [], zeroY: null, min: 0, max: 0 };
++  const values = series.map((row) => row.cumulative_net_points);
++  const min = Math.min(0, ...values);
++  const max = Math.max(0, ...values);
++  const span = max - min || 1;
++  const innerW = width - pad * 2;
++  const innerH = height - pad * 2;
++  const step = series.length === 1 ? 0 : innerW / (series.length - 1);
++  const points = series.map((row, index) => ({
++    x: pad + (series.length === 1 ? innerW / 2 : step * index),
++    y: pad + innerH * (1 - (row.cumulative_net_points - min) / span),
++    day: row.trading_day,
++    cumulative: row.cumulative_net_points,
++  }));
++  const path = points
++    .map((point, index) => `${index === 0 ? 'M' : 'L'}${point.x.toFixed(2)},${point.y.toFixed(2)}`)
++    .join(' ');
++  const zeroY = pad + innerH * (1 - (0 - min) / span);
++  return { path, points, zeroY, min, max };
++}
++
++export type DailyBar = {
++  x: number;
++  y: number;
++  width: number;
++  height: number;
++  day: string;
++  net: number;
++  positive: boolean;
++};
++export type DailyBars = { bars: DailyBar[]; zeroY: number };
++
++export function buildDailyBars(
++  series: PerformanceDayDTO[],
++  width: number,
++  height: number,
++  pad = 8,
++): DailyBars {
++  const innerH = height - pad * 2;
++  if (series.length === 0) return { bars: [], zeroY: pad + innerH / 2 };
++  const maxAbs = Math.max(...series.map((row) => Math.abs(row.net_points)), 1e-9);
++  const innerW = width - pad * 2;
++  const slot = innerW / series.length;
++  const barWidth = Math.max(2, Math.min(28, slot * 0.7));
++  const zeroY = pad + innerH / 2;
++  const bars = series.map((row, index) => {
++    const magnitude = (Math.abs(row.net_points) / maxAbs) * (innerH / 2);
++    const positive = row.net_points >= 0;
++    return {
++      x: pad + slot * index + (slot - barWidth) / 2,
++      y: positive ? zeroY - magnitude : zeroY,
++      width: barWidth,
++      height: magnitude,
++      day: row.trading_day,
++      net: row.net_points,
++      positive,
++    };
++  });
++  return { bars, zeroY };
++}
++
++// --- trading-day calendar ------------------------------------------------------
++
++export type CalendarCell = {
++  iso: string;
++  dayOfMonth: number;
++  hasData: boolean;
++  net: number;
++  resolved: number;
++  priced: number;
++  predictions: number;
++  drops: number;
++  // -1..1, |net| scaled to the month's max |net|; drives green/red intensity.
++  intensity: number;
++};
++
++export type CalendarWeek = {
++  cells: (CalendarCell | null)[]; // exactly 5 slots, Monday..Friday
++  weekNet: number;
++  weekResolved: number;
++  weekPriced: number;
++  hasData: boolean;
++};
++
++export type MonthCalendar = {
++  year: number;
++  month: number; // 1-12
++  label: string;
++  weeks: CalendarWeek[];
++  monthNet: number;
++  monthResolved: number;
++  // Day keys that cannot sit on a trading-week grid (weekend-dated keys should
++  // never come out of the 18:00 ET roll; surfaced, never silently dropped).
++  offGrid: string[];
++};
++
++const MONTH_LABELS = [
++  'January', 'February', 'March', 'April', 'May', 'June',
++  'July', 'August', 'September', 'October', 'November', 'December',
++];
++
++function isoDate(year: number, month: number, day: number): string {
++  return `${year.toString().padStart(4, '0')}-${month.toString().padStart(2, '0')}-${day.toString().padStart(2, '0')}`;
++}
++
++// UTC-anchored so the developer's local timezone can never shift a trading-day
++// key onto a different weekday.
++function weekdayOf(iso: string): number {
++  return new Date(`${iso}T00:00:00Z`).getUTCDay(); // 0=Sun .. 6=Sat
++}
++
++function daysInMonth(year: number, month: number): number {
++  return new Date(Date.UTC(year, month, 0)).getUTCDate();
++}
++
++export function buildMonthCalendar(
++  year: number,
++  month: number,
++  days: Map<string, PerformanceDayDTO>,
++): MonthCalendar {
++  const totalDays = daysInMonth(year, month);
++  let maxAbs = 0;
++  for (let day = 1; day <= totalDays; day += 1) {
++    const row = days.get(isoDate(year, month, day));
++    if (row) maxAbs = Math.max(maxAbs, Math.abs(row.net_points));
++  }
++
++  const offGrid: string[] = [];
++  for (const iso of days.keys()) {
++    if (!iso.startsWith(`${isoDate(year, month, 1).slice(0, 8)}`)) continue;
++    const weekday = weekdayOf(iso);
++    if (weekday === 0 || weekday === 6) offGrid.push(iso);
++  }
++
++  const weeks: CalendarWeek[] = [];
++  let current: (CalendarCell | null)[] = [];
++  let monthNet = 0;
++  let monthResolved = 0;
++
++  const pushWeek = () => {
++    if (current.length === 0) return;
++    while (current.length < 5) current.push(null);
++    const filled = current.filter((cell): cell is CalendarCell => cell !== null);
++    weeks.push({
++      cells: current,
++      weekNet: filled.reduce((sum, cell) => sum + cell.net, 0),
++      weekResolved: filled.reduce((sum, cell) => sum + cell.resolved, 0),
++      weekPriced: filled.reduce((sum, cell) => sum + cell.priced, 0),
++      hasData: filled.some((cell) => cell.hasData),
++    });
++    current = [];
++  };
++
++  for (let day = 1; day <= totalDays; day += 1) {
++    const iso = isoDate(year, month, day);
++    const weekday = weekdayOf(iso);
++    if (weekday === 0 || weekday === 6) continue; // trading weeks are Mon..Fri
++    const slot = weekday - 1; // 0=Mon .. 4=Fri
++    if (day === 1 || weekday === 1) {
++      pushWeek();
++      // Leading placeholders when the month starts mid-week.
++      while (current.length < slot) current.push(null);
++    }
++    const row = days.get(iso) ?? null;
++    const net = row?.net_points ?? 0;
++    if (row) {
++      monthNet += net;
++      monthResolved += row.resolved;
++    }
++    current.push({
++      iso,
++      dayOfMonth: day,
++      hasData: row !== null,
++      net,
++      resolved: row?.resolved ?? 0,
++      priced: row?.priced ?? 0,
++      predictions: row?.predictions ?? 0,
++      drops: row?.drops ?? 0,
++      intensity: row === null || maxAbs === 0 ? 0 : net / maxAbs,
++    });
++    if (weekday === 5) pushWeek();
++  }
++  pushWeek();
++
++  return {
++    year,
++    month,
++    label: `${MONTH_LABELS[month - 1]} ${year}`,
++    weeks,
++    monthNet,
++    monthResolved,
++    offGrid,
++  };
++}
++
++export function seriesByDay(series: PerformanceDayDTO[]): Map<string, PerformanceDayDTO> {
++  return new Map(series.map((row) => [row.trading_day, row]));
++}
++
++export function monthsWithData(series: PerformanceDayDTO[]): string[] {
++  const months = new Set(series.map((row) => row.trading_day.slice(0, 7)));
++  return [...months].sort();
++}
++
++export function shiftMonth(monthKey: string, delta: number): string {
++  const [year, month] = monthKey.split('-').map(Number);
++  const index = year * 12 + (month - 1) + delta;
++  const newYear = Math.floor(index / 12);
++  const newMonth = (index % 12) + 1;
++  return `${newYear.toString().padStart(4, '0')}-${newMonth.toString().padStart(2, '0')}`;
++}
++
++export function parseMonthKey(monthKey: string): { year: number; month: number } {
++  const [year, month] = monthKey.split('-').map(Number);
++  return { year, month };
++}
++
++// Cell background for the calendar heat: the app's semantic green/red as the
++// diverging poles around a neutral panel tint (validated on the dark surface —
++// deutan ΔE 22 with sign + printed value as secondary encodings).
++export function calendarCellColor(intensity: number, hasData: boolean): string {
++  if (!hasData) return 'rgba(255,255,255,0.02)';
++  if (intensity === 0) return 'rgba(124,139,155,0.10)';
++  const alpha = 0.10 + Math.min(1, Math.abs(intensity)) * 0.45;
++  return intensity > 0
++    ? `rgba(54,211,153,${alpha.toFixed(3)})`
++    : `rgba(255,107,107,${alpha.toFixed(3)})`;
++}
+diff --git a/frontend/src/styles.css b/frontend/src/styles.css
+index ff3732b..229f948 100644
+--- a/frontend/src/styles.css
++++ b/frontend/src/styles.css
+@@ -15,7 +15,9 @@
+ * { box-sizing: border-box; }
+ body { margin: 0; background: radial-gradient(circle at top left, #102033 0, var(--bg) 45%); color: var(--text); }
+ button { font: inherit; }
+-.workstation-shell { min-height: 100vh; display: grid; grid-template-rows: auto auto auto 1fr 210px; gap: 12px; padding: 12px; }
++.workstation-shell { min-height: 100vh; display: grid; grid-template-rows: auto auto auto auto 1fr 210px; gap: 12px; padding: 12px; }
++.workstation-shell.performance-view { grid-template-rows: auto auto 1fr; }
++.view-tabs { display: flex; }
+ .control-row { display:grid; grid-template-columns:minmax(0, 1.25fr) minmax(360px, .75fr); gap:12px; }
+ .top-bar, .panel { border: 1px solid var(--line); background: linear-gradient(180deg, rgba(12,24,35,.96), rgba(7,16,23,.96)); box-shadow: 0 18px 60px rgba(0,0,0,.32); }
+ .top-bar { min-height: 72px; display: flex; align-items: center; gap: 10px; padding: 10px 12px; overflow-x: auto; }
+@@ -112,4 +114,68 @@ button { font: inherit; }
+ .intel-probs { display:flex; flex-wrap:wrap; gap:8px; margin-top:4px; color:var(--muted); font-size:11px; font-variant-numeric: tabular-nums; }
+ .intel-prediction-meta { margin-top:4px; color:var(--muted); font-size:11px; }
+ .intel-outcome { margin-top:4px; display:flex; flex-wrap:wrap; gap:8px; align-items:center; font-size:11px; color:var(--muted); }
+-@media (max-width: 1050px) { .workstation-shell { grid-template-rows:auto auto auto auto 220px; } .control-row, .workspace-grid { grid-template-columns: 1fr; } .intelligence-panel { max-height: 420px; } .replay-controls-grid, .live-grid, .model-controls-grid, .model-bundle-meta { grid-template-columns:1fr 1fr; } }
++/* --- Performance page (REPORT P4) --- */
++.performance-page { display: flex; flex-direction: column; gap: 12px; min-height: 0; overflow-y: auto; }
++.perf-filters { display: flex; flex-wrap: wrap; gap: 16px; align-items: end; padding: 12px 14px; border-radius: 14px; }
++.perf-filter-group { display: flex; flex-direction: column; gap: 6px; }
++.perf-filter-group input[type="date"] { border: 1px solid var(--line); border-radius: 10px; background: #071017; color: var(--text); padding: 8px 10px; font: inherit; }
++.perf-filter-actions { flex-direction: row; align-items: center; gap: 8px; margin-left: auto; }
++.perf-refresh, .perf-toggle { border: 1px solid var(--line); border-radius: 10px; background: rgba(78,161,255,.14); color: var(--text); padding: 8px 12px; cursor: pointer; }
++.perf-refresh:disabled { opacity: .45; cursor: wait; }
++.perf-toggle.active { background: var(--blue); color: #061018; font-weight: 700; }
++.perf-empty { padding: 26px; text-align: center; border-radius: 14px; }
++.perf-empty strong { display: block; font-size: 18px; margin-bottom: 8px; }
++.perf-empty span { color: var(--muted); }
++.perf-cards { display: grid; grid-template-columns: repeat(6, minmax(140px, 1fr)); gap: 12px; }
++.perf-card { padding: 14px 16px; border-radius: 14px; display: flex; flex-direction: column; gap: 6px; }
++.perf-card strong { font-size: 22px; font-variant-numeric: tabular-nums; }
++.perf-card small { color: var(--muted); }
++.perf-card.tone-positive strong { color: var(--green); }
++.perf-card.tone-negative strong { color: var(--red); }
++.perf-charts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
++.perf-chart-panel { padding: 14px 16px; border-radius: 14px; }
++.perf-section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
++.perf-section-head h3 { font-size: 14px; }
++.perf-section-head span { color: var(--muted); font-size: 11px; }
++.perf-svg { width: 100%; height: auto; display: block; }
++.perf-zero { stroke: var(--line); stroke-dasharray: 4 4; stroke-width: 1; }
++.perf-curve { fill: none; stroke: var(--blue); stroke-width: 2; }
++.perf-dot { fill: var(--blue); opacity: 0; }
++.perf-dot:hover { opacity: 1; }
++.perf-bar-pos { fill: var(--green); }
++.perf-bar-neg { fill: var(--red); }
++.perf-bar-pos:hover, .perf-bar-neg:hover { opacity: .8; }
++.perf-chart-empty { color: var(--muted); padding: 30px 0; text-align: center; }
++.perf-calendar-panel { padding: 14px 16px; border-radius: 14px; }
++.perf-month-nav { display: flex; align-items: center; gap: 10px; }
++.perf-month-nav button { border: 1px solid var(--line); border-radius: 8px; background: #071017; color: var(--text); padding: 4px 10px; cursor: pointer; }
++.perf-month-nav span { color: var(--muted); font-size: 11px; }
++.perf-calendar { display: flex; flex-direction: column; gap: 4px; }
++.perf-cal-head { display: grid; grid-template-columns: repeat(6, 1fr); gap: 4px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
++.perf-cal-head span:last-child { text-align: right; padding-right: 8px; }
++.perf-cal-week { display: grid; grid-template-columns: repeat(6, 1fr); gap: 4px; }
++.perf-cal-cell { min-height: 58px; border: 1px solid rgba(28,48,65,.6); border-radius: 8px; padding: 6px 8px; display: flex; flex-direction: column; gap: 2px; }
++.perf-cal-cell.empty { border-style: dashed; opacity: .35; }
++.perf-cal-cell strong { font-size: 13px; font-variant-numeric: tabular-nums; }
++.perf-cal-cell small { color: var(--muted); font-size: 10px; }
++.perf-cal-day { color: var(--muted); font-size: 10px; }
++.perf-cal-cell.week-total { align-items: flex-end; background: rgba(255,255,255,.03); }
++.perf-note { margin-top: 10px; color: var(--muted); font-size: 11px; }
++.perf-tables { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
++.perf-table-panel { padding: 14px 16px; border-radius: 14px; }
++.perf-table-panel h3 { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .1em; margin-bottom: 8px; }
++.perf-table { width: 100%; border-collapse: collapse; font-size: 12px; }
++.perf-table th { text-align: left; color: var(--muted); font-weight: 500; text-transform: uppercase; font-size: 10px; letter-spacing: .06em; padding: 4px 8px 6px 0; border-bottom: 1px solid var(--line); }
++.perf-table td { padding: 6px 8px 6px 0; border-bottom: 1px solid rgba(28,48,65,.45); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
++.perf-oos-panel { padding: 14px 16px; border-radius: 14px; }
++.perf-oos-table td em { color: var(--muted); font-style: italic; }
++.perf-gates { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
++.perf-gate-chips { display: flex; flex-wrap: wrap; gap: 6px; }
++.perf-gate-chip { border: 1px solid var(--line); border-radius: 999px; padding: 3px 9px; font-size: 11px; }
++.perf-gate-chip.pass { color: var(--green); border-color: rgba(54,211,153,.45); }
++.perf-gate-chip.fail { color: var(--amber); border-color: rgba(242,184,75,.45); }
++.perf-quality { padding: 12px 14px; border-radius: 14px; display: flex; flex-direction: column; gap: 8px; }
++.perf-quality-row { display: flex; flex-wrap: wrap; gap: 8px 16px; color: var(--muted); font-size: 11px; }
++.perf-quality-row .quality-flag { color: var(--amber); }
++
++@media (max-width: 1050px) { .workstation-shell { grid-template-rows:auto auto auto auto auto 220px; } .control-row, .workspace-grid { grid-template-columns: 1fr; } .intelligence-panel { max-height: 420px; } .replay-controls-grid, .live-grid, .model-controls-grid, .model-bundle-meta { grid-template-columns:1fr 1fr; } .perf-cards { grid-template-columns: repeat(2, 1fr); } .perf-charts, .perf-tables { grid-template-columns: 1fr; } }

@@ -1,0 +1,671 @@
+﻿diff --git a/backend/src/trade_lab/services/inference/features/feature_functions.py b/backend/src/trade_lab/services/inference/features/feature_functions.py
+index 83eeac2..7abe304 100644
+--- a/backend/src/trade_lab/services/inference/features/feature_functions.py
++++ b/backend/src/trade_lab/services/inference/features/feature_functions.py
+@@ -80,13 +80,19 @@ class LevelContext:
+     def from_contract(
+         cls,
+         contract: StrategyContract,
++        section,
+         *,
+         reference_price: Decimal,
+         direction: LevelDirection,
+     ) -> LevelContext:
+-        """Build a context from a touch level and the active contract's bands."""
++        """Build a context from a touch level and the active bundle's bands.
+ 
+-        windows = contract.feature_windows
++        E3: ``feature_windows`` is section-bound — the bands read the typed
++        ``section`` (duck-typed touch-section access; recorded coupling), while
++        ``tick_size`` stays an envelope read.
++        """
++
++        windows = section.feature_windows
+         return cls(
+             reference_price=reference_price,
+             direction=direction,
+@@ -337,6 +343,7 @@ def build_feature_vector(
+     buffer: MarketContextBuffer,
+     level_ctx: LevelContext,
+     contract: StrategyContract,
++    section,
+     *,
+     registry: FeatureFunctionRegistry = DEFAULT_FEATURE_REGISTRY,
+     touch_ts_utc: datetime | None = None,
+@@ -345,16 +352,18 @@ def build_feature_vector(
+     """Compute the contract's ordered feature vector and a name->value dict.
+ 
+     Values follow ``feature_set.names`` order exactly (the model's positional
+-    contract). Provide either an explicit ``window`` or a ``touch_ts_utc`` from
+-    which the interaction/approach windows are derived using the contract's
+-    ``feature_windows`` minutes. Missing approach data surfaces as ``np.nan``;
+-    only the absorption / interaction-time features may legitimately return 0.0.
++    contract — an ENVELOPE read). Provide either an explicit ``window`` or a
++    ``touch_ts_utc`` from which the interaction/approach windows are derived
++    using the active bundle's section ``feature_windows`` minutes (E3:
++    section-bound; duck-typed touch-section access, recorded coupling). Missing
++    approach data surfaces as ``np.nan``; only the absorption /
++    interaction-time features may legitimately return 0.0.
+     """
+ 
+     if window is None:
+         if touch_ts_utc is None:
+             raise ValueError("build_feature_vector requires either window or touch_ts_utc")
+-        windows = contract.feature_windows
++        windows = section.feature_windows
+         window = FeatureWindow.from_touch(
+             touch_ts_utc,
+             interaction_window=timedelta(minutes=windows.interaction_window_minutes),
+diff --git a/backend/src/trade_lab/services/inference/inference_engine.py b/backend/src/trade_lab/services/inference/inference_engine.py
+index 49a0524..fb661ff 100644
+--- a/backend/src/trade_lab/services/inference/inference_engine.py
++++ b/backend/src/trade_lab/services/inference/inference_engine.py
+@@ -74,11 +74,13 @@ def _level_side(level_kind: str) -> str:
+     raise ValueError(f"cannot derive a level side from level_kind {level_kind!r}")
+ 
+ 
+-def _direction_from_contract(contract: StrategyContract, level_kind: str) -> LevelDirection:
++def _direction_from_section(section, level_kind: str) -> LevelDirection:
++    """E3: ``touch_rule`` is section-bound — the direction map reads the ACTIVE
++    bundle's typed section (duck-typed touch-section access; recorded coupling)."""
+     side = _level_side(level_kind)
+-    mapped = contract.touch_rule.direction_from_side.get(side)
++    mapped = section.touch_rule.direction_from_side.get(side)
+     if mapped is None:
+-        raise ValueError(f"contract has no direction mapping for level side {side!r}")
++        raise ValueError(f"contract section has no direction mapping for level side {side!r}")
+     return LevelDirection(mapped.lower())
+ 
+ 
+@@ -156,24 +158,29 @@ class InferenceEngine:
+         buffer: MarketContextBuffer,
+     ) -> Prediction:
+         contract = active.contract
++        # E3: the plugin-consumed groups (touch_rule, feature_windows) live on the
++        # ACTIVE bundle's typed section; the envelope keeps tick_size/feature_set/
++        # inference, consumed exactly where they were consumed before.
++        section = active.section
+         reference_price = Decimal(observation.level_price_ticks) * Decimal(str(contract.tick_size))
+         # audit #NN-1: consume the authoritative direction carried from the Strategy-Core
+         # touch (observation.direction) rather than re-deriving it from level_kind
+         # (= zone.names[0]), which inverts for mixed-side merged zones. The domain and
+         # inference LevelDirection share the long/short value convention, so a by-value
+-        # rebuild lines the types up. Fall back to the contract-derived direction only for
++        # rebuild lines the types up. Fall back to the section-derived direction only for
+         # legacy observations that carry no direction.
+         if observation.direction is not None:
+             direction = LevelDirection(observation.direction.value)
+         else:
+-            direction = _direction_from_contract(contract, observation.level_kind.value)
++            direction = _direction_from_section(section, observation.level_kind.value)
+         level_ctx = LevelContext.from_contract(
+-            contract, reference_price=reference_price, direction=direction
++            contract, section, reference_price=reference_price, direction=direction
+         )
+         ordered, by_name = build_feature_vector(
+             buffer,
+             level_ctx,
+             contract,
++            section,
+             registry=self._feature_registry,
+             touch_ts_utc=observation.start_ts_utc,
+         )
+diff --git a/backend/src/trade_lab/services/model_registry.py b/backend/src/trade_lab/services/model_registry.py
+index fa5a0cf..715a07c 100644
+--- a/backend/src/trade_lab/services/model_registry.py
++++ b/backend/src/trade_lab/services/model_registry.py
+@@ -30,6 +30,11 @@ import strategy_core.strategies.touch_reversal  # noqa: F401
+ from strategy_core import PLATFORM_VERSION, ContractError, StrategyContract, load_strategy_contract
+ from strategy_core.strategies.registry import get_strategy
+ 
++# E3 KNOWN COUPLING (recorded): the feature-partition cross-check helper lives on
++# the touch section. Generic TL code duck-typing touch-section attributes is
++# acceptable single-strategy behavior; the F-era cleanup moves this into the plugin.
++from strategy_core.strategies.touch_reversal.section import validate_feature_partition
++
+ if TYPE_CHECKING:
+     from catboost import CatBoostClassifier
+ 
+@@ -137,7 +142,15 @@ def _describe_bundle(directory: Path, model_id: str) -> ModelBundle | None:
+         return None
+ 
+     try:
+-        contract = load_strategy_contract(strategy_file, expected_platform_version=PLATFORM_VERSION)
++        # E3: the section hook types the bundle's section subtree against the
++        # registered plugin's SectionModel at DISCOVERY too — a bundle whose
++        # section the plugin rejects is skipped with a warning, same pattern as
++        # every other discovery-time contract failure.
++        contract = load_strategy_contract(
++            strategy_file,
++            expected_platform_version=PLATFORM_VERSION,
++            validate_section_via_registry=True,
++        )
+     except ContractError as exc:
+         logger.warning("ignored model bundle with invalid strategy contract: %s", exc)
+         return None
+@@ -234,11 +247,21 @@ class ModelNotFoundError(ModelRegistryError):
+ 
+ @dataclass(frozen=True, slots=True)
+ class ActiveModel:
+-    """The currently loaded model + the contract it was validated against."""
++    """The currently loaded model + the contract it was validated against.
++
++    E3: also carries the TYPED, plugin-validated ``section`` instance (the
++    loader's ``section_model`` carrier, resolved at activation) and the REAL
++    metadata cross-check result (``validation_ok``/``validation_detail``) —
++    activation fails closed on a mismatch, so an active model's result is the
++    actual computed one, never a hardcoded True.
++    """
+ 
+     model_id: str
+     model: CatBoostClassifier
+     contract: StrategyContract
++    section: Any
++    validation_ok: bool
++    validation_detail: str
+ 
+ 
+ class ModelRegistry:
+@@ -306,8 +329,30 @@ class ModelRegistry:
+                 f"contract strategy_id {contract.strategy_id!r} does not match the "
+                 f"running service's plugin {self._serving_strategy_id!r}"
+             )
++        # E3: the typed section (populated by the loader's registry hook) + the
++        # envelope<->section feature-partition cross-check — the second of the
++        # two validation sites (QL emission is the first).
++        section = contract.section_model
++        try:
++            validate_feature_partition(contract.feature_set.names, section)
++        except ContractError as exc:
++            raise ModelValidationError(str(exc)) from exc
++        # E3 ledger (a): the metadata cross-check is FAIL-CLOSED at activation —
++        # discovery's flag is no longer ignorable here.
++        validation_ok, validation_detail = _validate_against_metadata(
++            directory / METADATA_FILE, contract
++        )
++        if not validation_ok:
++            raise ModelValidationError(validation_detail)
+         model = self._load_and_validate_model(directory, contract)
+-        active = ActiveModel(model_id=model_id, model=model, contract=contract)
++        active = ActiveModel(
++            model_id=model_id,
++            model=model,
++            contract=contract,
++            section=section,
++            validation_ok=validation_ok,
++            validation_detail=validation_detail,
++        )
+         with self._lock:
+             self._active = active
+         return active
+@@ -341,8 +386,13 @@ class ModelRegistry:
+     @staticmethod
+     def _load_contract(directory: Path) -> StrategyContract:
+         try:
++            # E3: activation loads with the section hook on, so the typed section
++            # rides the contract (.section_model) and a SectionModel-rejected
++            # subtree fails closed here, before any model bytes are read.
+             return load_strategy_contract(
+-                directory / STRATEGY_FILE, expected_platform_version=PLATFORM_VERSION
++                directory / STRATEGY_FILE,
++                expected_platform_version=PLATFORM_VERSION,
++                validate_section_via_registry=True,
+             )
+         except ContractError as exc:
+             raise ModelValidationError(f"invalid strategy contract: {exc}") from exc
+@@ -360,6 +410,12 @@ class ModelRegistry:
+     def _verify_checksum(directory: Path, model_file: Path) -> None:
+         checksum_file = directory / CHECKSUM_FILE
+         if not checksum_file.is_file():
++            # E3 ledger (b): an absent sidecar no longer skips SILENTLY — the gap
++            # is surfaced (path-free) so an unverified binary is a visible fact.
++            logger.warning(
++                "model bundle has no %s sidecar; binary integrity not verified",
++                CHECKSUM_FILE,
++            )
+             return
+         try:
+             declared = checksum_file.read_text(encoding="utf-8").split()[0].strip().lower()
+diff --git a/backend/src/trade_lab/services/runtime.py b/backend/src/trade_lab/services/runtime.py
+index cb0db4b..50a1101 100644
+--- a/backend/src/trade_lab/services/runtime.py
++++ b/backend/src/trade_lab/services/runtime.py
+@@ -391,8 +391,10 @@ class ApplicationRuntime:
+             instrument=contract.instrument,
+             feature_names=tuple(contract.feature_set.names),
+             class_map=MappingProxyType(dict(contract.class_map.mapping)),
+-            validation_ok=True,
+-            validation_detail="active model validated against its contract",
++            # E3 ledger (c): the REAL activation-time metadata cross-check result
++            # carried on the active bundle — no longer hardcoded True.
++            validation_ok=active.validation_ok,
++            validation_detail=active.validation_detail,
+         )
+ 
+     def session_state(self) -> tuple[str | None, date | None]:
+diff --git a/backend/tests/fixtures/strategy.json b/backend/tests/fixtures/strategy.json
+index 64938ba..b5b4c19 100644
+--- a/backend/tests/fixtures/strategy.json
++++ b/backend/tests/fixtures/strategy.json
+@@ -1,5 +1,5 @@
+ {
+-  "contract_version": "trade_lab_contract_v2",
++  "contract_version": "trade_lab_contract_v3",
+   "platform_version": "strategy_core_platform_v1",
+   "strategy_id": "touch_reversal",
+   "strategy_version": "1",
+@@ -23,16 +23,6 @@
+       "app_max_spread"
+     ],
+     "order_is_contractual": true,
+-    "interaction_features": [
+-      "int_time_beyond_level",
+-      "int_time_within_2pts",
+-      "int_absorption_ratio"
+-    ],
+-    "approach_features": [
+-      "app_large_trade_vol_pct",
+-      "app_avg_trade_size",
+-      "app_max_spread"
+-    ],
+     "nan_policy": "model_native"
+   },
+   "class_map": {
+@@ -40,58 +30,9 @@
+     "1": "trap_reversal",
+     "2": "aggressive_blowthrough"
+   },
+-  "session_scheme": {
+-    "timezone": "US/Eastern",
+-    "trading_day_boundary": "18:00",
+-    "sessions": {
+-      "asia": {
+-        "start": "18:00",
+-        "end": "01:00",
+-        "crosses_midnight": true
+-      },
+-      "london": {
+-        "start": "01:00",
+-        "end": "08:00"
+-      },
+-      "ny_rth": {
+-        "start": "09:30",
+-        "end": "16:15"
+-      }
+-    }
+-  },
+-  "level_scheme": {
+-    "pdh_pdl_source": "prior_day_ny_rth",
+-    "session_levels": [
+-      "asia_high",
+-      "asia_low",
+-      "london_high",
+-      "london_low",
+-      "pdh",
+-      "pdl"
+-    ],
+-    "available_from_guard": true
+-  },
+-  "touch_rule": {
+-    "type": "bar_intersect",
+-    "bar_type": "147t",
+-    "zone_proximity_pts": 3.0,
+-    "zone_representative_price": "mean_of_constituent_levels",
+-    "scope": "first_touch_per_zone_per_day",
+-    "direction_from_side": {
+-      "low": "long",
+-      "high": "short"
+-    }
+-  },
+-  "feature_windows": {
+-    "interaction_window_minutes": 5,
+-    "approach_window_minutes": 30,
+-    "within_band_pts": 2.0,
+-    "level_proximity_pts": 0.5,
+-    "large_trade_threshold": 10,
+-    "mid_price_source": "trade_price"
+-  },
+   "label_policy": {
+     "resolution": "mae_first",
++    "barrier_mode": "fixed_points",
+     "entry_reference": "level_representative_price",
+     "decision_offset_minutes": 5,
+     "tp_points": 15.0,
+@@ -127,5 +68,67 @@
+       "learning_rate": 0.03,
+       "auto_class_weights": "Balanced"
+     }
++  },
++  "section": {
++    "session_scheme": {
++      "timezone": "US/Eastern",
++      "trading_day_boundary": "18:00",
++      "sessions": {
++        "asia": {
++          "start": "18:00",
++          "end": "01:00",
++          "crosses_midnight": true
++        },
++        "london": {
++          "start": "01:00",
++          "end": "08:00"
++        },
++        "ny_rth": {
++          "start": "09:30",
++          "end": "16:15"
++        }
++      }
++    },
++    "level_scheme": {
++      "pdh_pdl_source": "prior_day_ny_rth",
++      "session_levels": [
++        "asia_high",
++        "asia_low",
++        "london_high",
++        "london_low",
++        "pdh",
++        "pdl"
++      ],
++      "available_from_guard": true
++    },
++    "touch_rule": {
++      "type": "bar_intersect",
++      "bar_type": "147t",
++      "zone_proximity_pts": 3.0,
++      "zone_representative_price": "mean_of_constituent_levels",
++      "scope": "first_touch_per_zone_per_day",
++      "direction_from_side": {
++        "low": "long",
++        "high": "short"
++      }
++    },
++    "feature_windows": {
++      "interaction_window_minutes": 5,
++      "approach_window_minutes": 30,
++      "within_band_pts": 2.0,
++      "level_proximity_pts": 0.5,
++      "large_trade_threshold": 10,
++      "mid_price_source": "trade_price"
++    },
++    "interaction_features": [
++      "int_time_beyond_level",
++      "int_time_within_2pts",
++      "int_absorption_ratio"
++    ],
++    "approach_features": [
++      "app_large_trade_vol_pct",
++      "app_avg_trade_size",
++      "app_max_spread"
++    ]
+   }
+ }
+diff --git a/backend/tests/test_feature_functions.py b/backend/tests/test_feature_functions.py
+index b2308f7..68aa6f8 100644
+--- a/backend/tests/test_feature_functions.py
++++ b/backend/tests/test_feature_functions.py
+@@ -14,6 +14,9 @@ from pathlib import Path
+ 
+ import numpy as np
+ import pytest
++
++# Registration import: the v3 section hook resolves the plugin's SectionModel.
++import strategy_core.strategies.touch_reversal  # noqa: F401
+ from strategy_core import load_strategy_contract
+ 
+ from trade_lab.domain.events import TradeSide
+@@ -43,6 +46,11 @@ TOUCH = datetime(2026, 2, 20, 15, 0, tzinfo=UTC)
+ FIXTURE_CONTRACT = Path(__file__).parent / "fixtures" / "strategy.json"
+ 
+ 
++def _load_fixture_contract():
++    """The v3 fixture loaded with the section hook (feature_windows is section-bound)."""
++    return load_strategy_contract(FIXTURE_CONTRACT, validate_section_via_registry=True)
++
++
+ def _ts(seconds: float) -> datetime:
+     return TOUCH + timedelta(seconds=seconds)
+ 
+@@ -253,14 +261,17 @@ def _combined_buffer() -> MarketContextBuffer:
+ 
+ 
+ def test_build_feature_vector_orders_by_contract_names() -> None:
+-    contract = load_strategy_contract(FIXTURE_CONTRACT)
++    contract = _load_fixture_contract()
+     buffer = _combined_buffer()
+     ctx = LevelContext.from_contract(
+-        contract, reference_price=LEVEL_PRICE, direction=LevelDirection.LONG
++        contract,
++        contract.section_model,
++        reference_price=LEVEL_PRICE,
++        direction=LevelDirection.LONG,
+     )
+ 
+     ordered, by_name = build_feature_vector(
+-        buffer, ctx, contract, touch_ts_utc=TOUCH
++        buffer, ctx, contract, contract.section_model, touch_ts_utc=TOUCH
+     )
+ 
+     assert list(by_name) == list(contract.feature_set.names)
+@@ -279,14 +290,17 @@ def test_build_feature_vector_orders_by_contract_names() -> None:
+ 
+ 
+ def test_build_feature_vector_uses_nan_for_missing_approach() -> None:
+-    contract = load_strategy_contract(FIXTURE_CONTRACT)
++    contract = _load_fixture_contract()
+     buffer = _empty_buffer()  # no events at all
+     ctx = LevelContext.from_contract(
+-        contract, reference_price=LEVEL_PRICE, direction=LevelDirection.LONG
++        contract,
++        contract.section_model,
++        reference_price=LEVEL_PRICE,
++        direction=LevelDirection.LONG,
+     )
+ 
+     _ordered, by_name = build_feature_vector(
+-        buffer, ctx, contract, touch_ts_utc=TOUCH
++        buffer, ctx, contract, contract.section_model, touch_ts_utc=TOUCH
+     )
+ 
+     # Interaction features fall to their 0.0 rule; approach features to NaN.
+@@ -305,22 +319,23 @@ def test_build_feature_vector_uses_nan_for_missing_approach() -> None:
+ 
+ 
+ def test_build_feature_vector_is_deterministic() -> None:
+-    contract = load_strategy_contract(FIXTURE_CONTRACT)
++    contract = _load_fixture_contract()
++    section = contract.section_model
+     buffer = _combined_buffer()
+     ctx = LevelContext.from_contract(
+-        contract, reference_price=LEVEL_PRICE, direction=LevelDirection.LONG
++        contract, section, reference_price=LEVEL_PRICE, direction=LevelDirection.LONG
+     )
+ 
+-    first, _ = build_feature_vector(buffer, ctx, contract, touch_ts_utc=TOUCH)
+-    second, _ = build_feature_vector(buffer, ctx, contract, touch_ts_utc=TOUCH)
++    first, _ = build_feature_vector(buffer, ctx, contract, section, touch_ts_utc=TOUCH)
++    second, _ = build_feature_vector(buffer, ctx, contract, section, touch_ts_utc=TOUCH)
+     assert first == second
+ 
+ 
+ def test_build_feature_vector_requires_window_or_touch() -> None:
+-    contract = load_strategy_contract(FIXTURE_CONTRACT)
++    contract = _load_fixture_contract()
+     ctx = _long_ctx()
+     with pytest.raises(ValueError, match="window or touch_ts_utc"):
+-        build_feature_vector(_empty_buffer(), ctx, contract)
++        build_feature_vector(_empty_buffer(), ctx, contract, contract.section_model)
+ 
+ 
+ def test_registry_exposes_six_contract_features_in_order() -> None:
+@@ -341,9 +356,9 @@ def test_registry_rejects_unknown_feature() -> None:
+ 
+ def test_feature_values_are_native_floats_not_numpy() -> None:
+     # build_feature_vector should yield plain floats so DTO serialization is clean.
+-    contract = load_strategy_contract(FIXTURE_CONTRACT)
++    contract = _load_fixture_contract()
+     ordered, _ = build_feature_vector(
+-        _empty_buffer(), _long_ctx(), contract, touch_ts_utc=TOUCH
++        _empty_buffer(), _long_ctx(), contract, contract.section_model, touch_ts_utc=TOUCH
+     )
+     assert all(isinstance(value, float) and not isinstance(value, np.floating)
+                for value in ordered)
+diff --git a/backend/tests/test_inference_engine.py b/backend/tests/test_inference_engine.py
+index 99bbbdf..9dd4fc4 100644
+--- a/backend/tests/test_inference_engine.py
++++ b/backend/tests/test_inference_engine.py
+@@ -245,6 +245,20 @@ def _active_registry(tmp_path: Path, model_id: str = "good-model") -> ModelRegis
+     return registry
+ 
+ 
++def test_activation_carries_typed_section_and_real_validation_result(tmp_path: Path) -> None:
++    """E3: the ActiveModel carries the plugin-typed section + the REAL metadata
++    cross-check result (ledger c — no longer hardcoded True downstream)."""
++    from strategy_core.strategies.touch_reversal.section import TouchReversalSection
++
++    registry = _active_registry(tmp_path)
++    active = registry.active()
++    assert active is not None
++    assert isinstance(active.section, TouchReversalSection)
++    assert active.section.feature_windows.interaction_window_minutes == 5
++    assert active.validation_ok is True
++    assert active.validation_detail == "contract matches metadata feature set"
++
++
+ def test_prediction_is_deterministic_and_well_formed(tmp_path: Path) -> None:
+     registry = _active_registry(tmp_path)
+     engine = InferenceEngine(registry)
+diff --git a/backend/tests/test_platform_version_binding.py b/backend/tests/test_platform_version_binding.py
+index 06f043a..6197f03 100644
+--- a/backend/tests/test_platform_version_binding.py
++++ b/backend/tests/test_platform_version_binding.py
+@@ -163,3 +163,67 @@ def test_serving_strategy_id_guard_rejects_foreign_routing(tmp_path: Path) -> No
+     registry = ModelRegistry(tmp_path, serving_strategy_id="some_other_plugin")
+     with pytest.raises(ModelValidationError, match="does not match the"):
+         registry.activate("bundle-x")
++
++
++# ── E3: the section hook (both entries) + the activation ledger fixes ───────
++
++
++def test_invalid_section_rejected_at_discovery_and_activation(
++    tmp_path: Path, caplog: pytest.LogCaptureFixture
++) -> None:
++    # A section subtree the plugin's SectionModel rejects (unknown key) is skipped
++    # with a warning at discovery and raises fail-closed at activation.
++    payload = _load_real_payload()
++    payload["section"]["bogus_key"] = 1  # type: ignore[index]
++    _write_bundle_dir(tmp_path, "bundle-x", payload)
++
++    with caplog.at_level(logging.WARNING):
++        assert discover_model_bundles(tmp_path) == []
++    assert any("invalid strategy section" in r.getMessage() for r in caplog.records)
++
++    with pytest.raises(ModelValidationError, match="invalid strategy section"):
++        ModelRegistry(tmp_path).activate("bundle-x")
++
++
++def test_partition_cross_check_mismatch_rejected_at_activation(tmp_path: Path) -> None:
++    # The envelope<->section feature-partition cross-check (the TL validation
++    # site): a section whose partition does not cover feature_set.names fails
++    # activation closed. (The section itself is SectionModel-valid — only the
++    # cross-check trips.)
++    payload = _load_real_payload()
++    payload["section"]["approach_features"] = ["app_large_trade_vol_pct"]  # type: ignore[index]
++    _write_bundle_dir(tmp_path, "bundle-x", payload)
++
++    with pytest.raises(ModelValidationError, match="exactly the union"):
++        ModelRegistry(tmp_path).activate("bundle-x")
++
++
++def test_metadata_mismatch_rejected_at_activation(tmp_path: Path) -> None:
++    # E3 ledger (a): the metadata cross-check is FAIL-CLOSED at activation — a
++    # bundle whose metadata selected_features disagree with the contract can no
++    # longer activate (discovery's flag is no longer ignorable).
++    payload = _load_real_payload()
++    bundle = _write_bundle_dir(tmp_path, "bundle-x", payload)
++    (bundle / "metadata.json").write_text(
++        json.dumps({"selected_features": ["int_time_beyond_level"]}), encoding="utf-8"
++    )
++
++    with pytest.raises(ModelValidationError, match="selected_features"):
++        ModelRegistry(tmp_path).activate("bundle-x")
++
++
++def test_missing_checksum_sidecar_warns_at_activation(
++    tmp_path: Path, caplog: pytest.LogCaptureFixture
++) -> None:
++    # E3 ledger (b): an absent sidecar surfaces a warning instead of a silent
++    # skip. The stub binary then fails the CatBoost load — asserting AFTER the
++    # checksum step proves the warning fired on the real activation path.
++    payload = _load_real_payload()
++    _write_bundle_dir(tmp_path, "bundle-x", payload)  # no model.cbm.sha256 written
++
++    with (
++        caplog.at_level(logging.WARNING),
++        pytest.raises(ModelValidationError, match="loadable CatBoost"),
++    ):
++        ModelRegistry(tmp_path).activate("bundle-x")
++    assert any("no model.cbm.sha256 sidecar" in r.getMessage() for r in caplog.records)
+diff --git a/backend/tests/test_strategy_contract.py b/backend/tests/test_strategy_contract.py
+index 137609d..25b2ab9 100644
+--- a/backend/tests/test_strategy_contract.py
++++ b/backend/tests/test_strategy_contract.py
+@@ -49,7 +49,9 @@ def _write_bundle(
+ 
+ 
+ def test_load_real_strategy_contract_parses_all_sections() -> None:
+-    contract = load_strategy_contract(_FIXTURE_STRATEGY)
++    # v3: the section hook types the strategy-owned subtree (touch_rule /
++    # feature_windows now live there); envelope reads are unchanged.
++    contract = load_strategy_contract(_FIXTURE_STRATEGY, validate_section_via_registry=True)
+ 
+     assert isinstance(contract, StrategyContract)
+     assert contract.contract_version == CONTRACT_VERSION
+@@ -71,18 +73,20 @@ def test_load_real_strategy_contract_parses_all_sections() -> None:
+         "aggressive_blowthrough",
+     )
+     assert len(contract.class_map) == 3
+-    assert contract.touch_rule.bar_type == "147t"
+-    assert contract.feature_windows.interaction_window_minutes == 5
+-    assert contract.feature_windows.approach_window_minutes == 30
++    section = contract.section_model
++    assert section.touch_rule.bar_type == "147t"
++    assert section.feature_windows.interaction_window_minutes == 5
++    assert section.feature_windows.approach_window_minutes == 30
+     assert contract.label_policy.resolution == "mae_first"
++    assert contract.label_policy.barrier_mode == "fixed_points"
+     assert contract.inference.confidence_gate == 0.7
+     assert contract.data_requirements.depth_usage == "top_of_book_only"
+ 
+ 
+ def test_load_rejects_unsupported_contract_version(tmp_path: Path) -> None:
+-    # E1: v1 is now the UNSUPPORTED version (the shape break migrated v1 -> v2).
++    # E3: v2 is now the UNSUPPORTED version (the shape break #2 migrated v2 -> v3).
+     payload = _load_real_payload()
+-    payload["contract_version"] = "trade_lab_contract_v1"
++    payload["contract_version"] = "trade_lab_contract_v2"
+     target = tmp_path / "strategy.json"
+     _write_strategy(target, payload)
+ 
+@@ -100,15 +104,16 @@ def test_load_rejects_missing_required_section(tmp_path: Path) -> None:
+         load_strategy_contract(target)
+ 
+ 
+-def test_load_rejects_feature_set_partition_mismatch(tmp_path: Path) -> None:
++def test_load_rejects_section_failing_the_plugin_model(tmp_path: Path) -> None:
++    # v3: the partition moved into the section; a section subtree the plugin's
++    # SectionModel rejects (unknown key) dies at the hook.
+     payload = _load_real_payload()
+-    # Drop one name from the interaction split so names != interaction + approach.
+-    payload["feature_set"]["interaction_features"] = ["int_time_beyond_level"]  # type: ignore[index]
++    payload["section"]["bogus_key"] = 1  # type: ignore[index]
+     target = tmp_path / "strategy.json"
+     _write_strategy(target, payload)
+ 
+-    with pytest.raises(ContractError, match="invalid strategy contract"):
+-        load_strategy_contract(target)
++    with pytest.raises(ContractError, match="invalid strategy section"):
++        load_strategy_contract(target, validate_section_via_registry=True)
+ 
+ 
+ def test_load_rejects_non_contiguous_class_map(tmp_path: Path) -> None:

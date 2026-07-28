@@ -1,0 +1,766 @@
+diff --git a/frontend/src/blotter/viewModels.ts b/frontend/src/blotter/viewModels.ts
+index b87ee48..6eba895 100644
+--- a/frontend/src/blotter/viewModels.ts
++++ b/frontend/src/blotter/viewModels.ts
+@@ -5,25 +5,34 @@ export type TapeFilter = 'all' | 'predictions' | 'executions' | 'drops';
+ 
+ export const TAPE_FILTERS: TapeFilter[] = ['all', 'predictions', 'executions', 'drops'];
+ 
++export type TapeCategory = 'predictions' | 'executions' | 'drops' | 'untyped';
++
+ /**
+- * Chip semantics: predictions = prediction + outcome rows; executions =
+- * position open/close rows; drops = drop rows. Untyped events (system, feed,
+- * warnings, ...) surface under `all` only.
++ * Category semantics: predictions = prediction + outcome rows; executions =
++ * position open/close rows; drops = drop rows; untyped = everything without a
++ * tape payload (system, feed, warnings, ...). The store's per-category
++ * retention and the filter chips share this one classifier.
+  */
+-export function matchesTapeFilter(event: BlotterEvent, filter: TapeFilter): boolean {
+-  if (filter === 'all') return true;
+-  const kind = event.tape?.kind;
+-  if (kind === undefined) return false;
+-  switch (filter) {
+-    case 'predictions':
+-      return kind === 'prediction' || kind === 'outcome';
+-    case 'executions':
+-      return kind === 'position_open' || kind === 'position_close';
+-    case 'drops':
+-      return kind === 'drop';
++export function tapeCategory(event: Pick<BlotterEvent, 'tape'>): TapeCategory {
++  switch (event.tape?.kind) {
++    case 'prediction':
++    case 'outcome':
++      return 'predictions';
++    case 'position_open':
++    case 'position_close':
++      return 'executions';
++    case 'drop':
++      return 'drops';
++    default:
++      return 'untyped';
+   }
+ }
+ 
++// Untyped events surface under `all` only — 'untyped' never equals a chip value.
++export function matchesTapeFilter(event: BlotterEvent, filter: TapeFilter): boolean {
++  return filter === 'all' || tapeCategory(event) === filter;
++}
++
+ export type RealizedPoints = { points: number; pointsConservative: number };
+ 
+ /**
+diff --git a/frontend/src/chart/axisTime.test.ts b/frontend/src/chart/axisTime.test.ts
+new file mode 100644
+index 0000000..97a9923
+--- /dev/null
++++ b/frontend/src/chart/axisTime.test.ts
+@@ -0,0 +1,109 @@
++import { describe, expect, it } from 'vitest';
++import { TickMarkType, type Time } from 'lightweight-charts';
++import { axisIndexInvalidated, buildAxisTimeIndex, formatCrosshairCt, formatTickMarkCt } from './axisTime';
++import { normalizeBarsForTimeframe } from './viewModels';
++import type { MarketBar } from '../domain/models';
++
++const bar = (overrides: Partial<MarketBar>): MarketBar => ({
++  timeframe: 147,
++  tradingDay: '2026-05-21',
++  barIndex: 0,
++  barId: '147t:2026-05-21:0',
++  openTimeUtc: '2026-05-21T14:00:00Z',
++  closeTimeUtc: '2026-05-21T14:00:10Z',
++  openTicks: 76000,
++  highTicks: 76008,
++  lowTicks: 75996,
++  closeTicks: 76004,
++  volume: 10,
++  tradeCount: 10,
++  complete: true,
++  ...overrides,
++});
++
++// COCKPIT-FIX F4: the chart time coordinate is synthetic (trading-day midnight
++// UTC + bar_index), so every case below goes through the real normalization
++// pipeline and asserts the label comes from the bar's REAL open instant.
++describe('axis time formatting (COCKPIT-FIX F4)', () => {
++  it('formats a January (CST, UTC-6) tick as 12-hour Central wall-clock time', () => {
++    const bars = normalizeBarsForTimeframe([
++      bar({ tradingDay: '2026-01-15', barIndex: 42, barId: '147t:2026-01-15:42', openTimeUtc: '2026-01-15T15:30:00Z', closeTimeUtc: '2026-01-15T15:30:10Z' }),
++    ], 147);
++    const index = buildAxisTimeIndex(bars);
++
++    expect(formatTickMarkCt(index, bars[0].time, TickMarkType.Time)).toBe('9:30 am');
++  });
++
++  it('formats a July (CDT, UTC-5) tick as 12-hour Central wall-clock time', () => {
++    const bars = normalizeBarsForTimeframe([
++      bar({ tradingDay: '2026-07-08', barIndex: 42, barId: '147t:2026-07-08:42', openTimeUtc: '2026-07-08T15:30:00Z', closeTimeUtc: '2026-07-08T15:30:10Z' }),
++    ], 147);
++    const index = buildAxisTimeIndex(bars);
++
++    // Same UTC wall clock as the January case, one hour later in CT: DST pinned.
++    expect(formatTickMarkCt(index, bars[0].time, TickMarkType.Time)).toBe('10:30 am');
++    // Seconds-granularity ticks keep their seconds — adjacent same-minute tick
++    // bars must not all render the same label.
++    expect(formatTickMarkCt(index, bars[0].time, TickMarkType.TimeWithSeconds)).toBe('10:30:00 am');
++  });
++
++  it('renders a Central date label on day-boundary tick types', () => {
++    const bars = normalizeBarsForTimeframe([
++      bar({ tradingDay: '2026-07-08', barIndex: 0, barId: '147t:2026-07-08:0', openTimeUtc: '2026-07-08T15:30:00Z', closeTimeUtc: '2026-07-08T15:30:10Z' }),
++      // 03:00Z is still the PREVIOUS day in Chicago — the date label must say so.
++      bar({ tradingDay: '2026-07-09', barIndex: 0, barId: '147t:2026-07-09:0', openTimeUtc: '2026-07-09T03:00:00Z', closeTimeUtc: '2026-07-09T03:00:10Z' }),
++    ], 147);
++    const index = buildAxisTimeIndex(bars);
++
++    expect(formatTickMarkCt(index, bars[0].time, TickMarkType.DayOfMonth)).toBe('Jul 8');
++    expect(formatTickMarkCt(index, bars[1].time, TickMarkType.DayOfMonth)).toBe('Jul 8');
++    expect(formatTickMarkCt(index, bars[0].time, TickMarkType.Month)).toBe('Jul 2026');
++    expect(formatTickMarkCt(index, bars[0].time, TickMarkType.Year)).toBe('2026');
++  });
++
++  it('maps each synthetic tick to its own bar, not to the coordinate read as an epoch', () => {
++    const bars = normalizeBarsForTimeframe([
++      bar({ barIndex: 7, barId: '147t:2026-05-21:7', openTimeUtc: '2026-05-21T14:00:00Z', closeTimeUtc: '2026-05-21T14:00:10Z' }),
++      bar({ barIndex: 8, barId: '147t:2026-05-21:8', openTimeUtc: '2026-05-21T14:07:12Z', closeTimeUtc: '2026-05-21T14:07:22Z' }),
++    ], 147);
++    const index = buildAxisTimeIndex(bars);
++
++    // Adjacent synthetic seconds resolve seven wall-clock minutes apart —
++    // proof the label comes from the bar mapping, not the tick value itself.
++    expect(bars.map((entry) => Number(entry.time))).toEqual([1779321607, 1779321608]);
++    expect(formatTickMarkCt(index, bars[0].time, TickMarkType.Time)).toBe('9:00 am');
++    expect(formatTickMarkCt(index, bars[1].time, TickMarkType.Time)).toBe('9:07 am');
++  });
++
++  it('renders empty labels for ticks outside the loaded bars', () => {
++    const bars = normalizeBarsForTimeframe([bar({})], 147);
++    const index = buildAxisTimeIndex(bars);
++    const beyond = (Number(bars[0].time) + 500) as unknown as Time;
++
++    expect(formatTickMarkCt(index, beyond, TickMarkType.Time)).toBe('');
++    expect(formatCrosshairCt(index, beyond)).toBe('');
++    expect(formatCrosshairCt(new Map(), bars[0].time)).toBe('');
++  });
++
++  it('formats the crosshair label with date and seconds-precision Central time', () => {
++    const bars = normalizeBarsForTimeframe([
++      bar({ tradingDay: '2026-07-08', barIndex: 3, barId: '147t:2026-07-08:3', openTimeUtc: '2026-07-08T15:30:45Z', closeTimeUtc: '2026-07-08T15:30:55Z' }),
++    ], 147);
++    const index = buildAxisTimeIndex(bars);
++
++    expect(formatCrosshairCt(index, bars[0].time)).toBe('Jul 8 · 10:30:45 am');
++  });
++
++  it('flags an index rebuild as invalidating only when an existing key remaps or disappears', () => {
++    const entry = (key: number, at: number): [number, number] => [key, at];
++
++    // Pure append (the live hot path): no flush.
++    expect(axisIndexInvalidated(new Map([entry(1, 100)]), new Map([entry(1, 100), entry(2, 200)]))).toBe(false);
++    // Identical rebuild (fresh Map object, same content): no flush.
++    expect(axisIndexInvalidated(new Map([entry(1, 100)]), new Map([entry(1, 100)]))).toBe(false);
++    // Timeframe switch: the same synthetic key resolves to a different open.
++    expect(axisIndexInvalidated(new Map([entry(1, 100)]), new Map([entry(1, 999)]))).toBe(true);
++    // Repopulate: a previously known key vanished.
++    expect(axisIndexInvalidated(new Map([entry(1, 100)]), new Map([entry(2, 200)]))).toBe(true);
++  });
++});
+diff --git a/frontend/src/chart/axisTime.ts b/frontend/src/chart/axisTime.ts
+new file mode 100644
+index 0000000..a6954af
+--- /dev/null
++++ b/frontend/src/chart/axisTime.ts
+@@ -0,0 +1,92 @@
++// COCKPIT-FIX F4: display-only axis time. The chart's time coordinate is
++// SYNTHETIC — trading-day midnight UTC + bar_index seconds (chartTimestamp in
++// viewModels.ts) — so axis tick and crosshair labels resolve each tick back to
++// its bar's real wall-clock open before formatting in America/Chicago. This
++// module never touches the coordinate itself: bars, markers, resolvers, and
++// session bands all keep living on the synthetic axis.
++import type { TickMarkType, Time } from 'lightweight-charts';
++import type { ChartBar } from './viewModels';
++
++export const CT_TIME_ZONE = 'America/Chicago';
++
++// TickMarkType is imported type-only (component tests mock the module), so the
++// lightweight-charts 5.x numeric contract is restated here: Year=0, Month=1,
++// DayOfMonth=2, Time=3, TimeWithSeconds=4.
++const YEAR = 0;
++const MONTH = 1;
++const DAY_OF_MONTH = 2;
++const TIME_WITH_SECONDS = 4;
++
++// Chart-time (synthetic seconds) -> real epoch ms of the bar's open. Bars whose
++// time fell back to a real epoch (no bar_index) land in the map identically, so
++// lookups never need to know which branch produced the coordinate.
++export const buildAxisTimeIndex = (bars: ChartBar[]): Map<number, number> => {
++  const index = new Map<number, number>();
++  for (const bar of bars) {
++    const at = Date.parse(bar.openTimeUtc);
++    if (Number.isFinite(at)) index.set(Number(bar.time), at);
++  }
++  return index;
++};
++
++// True when a key the previous index knew about now resolves differently
++// (remapped or gone). lightweight-charts memoizes tick labels by time key and
++// only flushes that cache on applyOptions — never on setData — and synthetic
++// keys collide across timeframes (same trading-day midnight + bar_index), so
++// the caller must flush when this returns true or the axis keeps rendering the
++// previous mapping's wall clock. Pure appends (the live hot path) return false.
++export const axisIndexInvalidated = (previous: Map<number, number>, next: Map<number, number>): boolean => {
++  for (const [key, at] of previous) {
++    if (next.get(key) !== at) return true;
++  }
++  return false;
++};
++
++const CT_TIME = new Intl.DateTimeFormat('en-US', { timeZone: CT_TIME_ZONE, hour: 'numeric', minute: '2-digit', hour12: true });
++const CT_TIME_SECONDS = new Intl.DateTimeFormat('en-US', { timeZone: CT_TIME_ZONE, hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: true });
++const CT_DATE = new Intl.DateTimeFormat('en-US', { timeZone: CT_TIME_ZONE, month: 'short', day: 'numeric' });
++const CT_MONTH = new Intl.DateTimeFormat('en-US', { timeZone: CT_TIME_ZONE, month: 'short', year: 'numeric' });
++const CT_YEAR = new Intl.DateTimeFormat('en-US', { timeZone: CT_TIME_ZONE, year: 'numeric' });
++
++const partsOf = (formatter: Intl.DateTimeFormat, epochMs: number): Partial<Record<Intl.DateTimeFormatPartTypes, string>> => {
++  const out: Partial<Record<Intl.DateTimeFormatPartTypes, string>> = {};
++  for (const part of formatter.formatToParts(epochMs)) out[part.type] = part.value;
++  return out;
++};
++
++export const formatCtTime = (epochMs: number, withSeconds = false): string => {
++  const parts = partsOf(withSeconds ? CT_TIME_SECONDS : CT_TIME, epochMs);
++  const clock = withSeconds ? `${parts.hour}:${parts.minute}:${parts.second}` : `${parts.hour}:${parts.minute}`;
++  return `${clock} ${(parts.dayPeriod ?? '').toLowerCase()}`;
++};
++
++export const formatCtDate = (epochMs: number): string => {
++  const parts = partsOf(CT_DATE, epochMs);
++  return `${parts.month} ${parts.day}`;
++};
++
++// Axis tick label: intraday ticks show 12-hour CT wall time; day-boundary and
++// coarser ticks show a date label instead. Ticks with no loaded bar (whitespace
++// extrapolated past the data) render empty. TimeWithSeconds ticks — emitted
++// only when tick spacing drops below a minute — keep their seconds, otherwise
++// adjacent same-minute tick bars all render identical labels.
++export const formatTickMarkCt = (index: Map<number, number>, time: Time, tickMarkType: TickMarkType): string => {
++  const at = index.get(Number(time));
++  if (at === undefined) return '';
++  if (tickMarkType === YEAR) return partsOf(CT_YEAR, at).year ?? '';
++  if (tickMarkType === MONTH) {
++    const parts = partsOf(CT_MONTH, at);
++    return `${parts.month} ${parts.year}`;
++  }
++  if (tickMarkType === DAY_OF_MONTH) return formatCtDate(at);
++  return formatCtTime(at, tickMarkType === TIME_WITH_SECONDS);
++};
++
++// Crosshair label carries the date plus a seconds-precision clock — tick bars
++// can share a wall-clock second, so the label is honest about the bar's real
++// open instant while bar identity stays on the synthetic coordinate.
++export const formatCrosshairCt = (index: Map<number, number>, time: Time): string => {
++  const at = index.get(Number(time));
++  if (at === undefined) return '';
++  return `${formatCtDate(at)} · ${formatCtTime(at, true)}`;
++};
+diff --git a/frontend/src/components/EventBlotter.test.tsx b/frontend/src/components/EventBlotter.test.tsx
+index 10dfa50..5b903fd 100644
+--- a/frontend/src/components/EventBlotter.test.tsx
++++ b/frontend/src/components/EventBlotter.test.tsx
+@@ -171,8 +171,13 @@ describe('EventBlotter', () => {
+   });
+ 
+   it('flashes the newest row and keeps the render bounded at 80 rows', () => {
++    // Mixed categories keep the store above the 80-row render cap under the
++    // per-category retention bounds (50 predictions + 40 untyped = 90 retained);
++    // the untyped batch goes last so the newest row renders its plain message.
+     for (let index = 0; index < 90; index += 1) {
+-      addBlotterEvent({ timeUtc: '2026-05-21T14:03:00Z', category: 'system', severity: 'info', message: `row ${index}` });
++      addBlotterEvent(index < 50
++        ? { timeUtc: '2026-05-21T14:03:00Z', category: 'observation', severity: 'info', message: `row ${index}`, tape: { kind: 'prediction', predictionId: `pred-${index}`, predictedClass: 'up', probability: 0.7, eligible: true, direction: 'long', session: 'ny' } }
++        : { timeUtc: '2026-05-21T14:03:00Z', category: 'system', severity: 'info', message: `row ${index}` });
+     }
+ 
+     render(<EventBlotter />);
+diff --git a/frontend/src/components/IntelligencePanel.test.tsx b/frontend/src/components/IntelligencePanel.test.tsx
+index 17bf597..cdb0dfd 100644
+--- a/frontend/src/components/IntelligencePanel.test.tsx
++++ b/frontend/src/components/IntelligencePanel.test.tsx
+@@ -1,7 +1,7 @@
+ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+ import { cleanup, render, screen } from '@testing-library/react';
+ import { IntelligencePanel } from './IntelligencePanel';
+-import { intelligenceStore, marketStore, predictionStore, runtimeStore } from '../state/stores';
++import { addPrediction, intelligenceStore, marketStore, predictionStore, runtimeStore } from '../state/stores';
+ import type { MarketBar, MarketLevel, ModelStatus, Observation, Outcome, Prediction } from '../domain/models';
+ 
+ const prediction = (overrides: Partial<Prediction> = {}): Prediction => ({
+@@ -133,6 +133,19 @@ describe('IntelligencePanel', () => {
+     expect(screen.getByText('Level origin').closest('.key-value')).toHaveTextContent('prior day');
+   });
+ 
++  it('renders the predictions pane inside an internal scroll container, newest first (COCKPIT-FIX F3)', () => {
++    addPrediction(prediction({ id: 'pred-old', predictedClass: 'hold' }));
++    addPrediction(prediction({ id: 'pred-new', predictedClass: 'down' }));
++    render(<IntelligencePanel />);
++
++    const pane = document.querySelector('.intel-section-body.predictions');
++    expect(pane).not.toBeNull();
++    const rows = [...(pane as HTMLElement).querySelectorAll('.intel-prediction')];
++    expect(rows).toHaveLength(2);
++    expect(rows[0].querySelector('strong')?.textContent).toBe('down');
++    expect(rows[1].querySelector('strong')?.textContent).toBe('hold');
++  });
++
+   it('renders the gate math with a fill bar and no reason for an eligible prediction', () => {
+     predictionStore.setState({
+       predictions: [prediction({ probabilities: { up: 0.82, hold: 0.18 } })],
+diff --git a/frontend/src/components/IntelligencePanel.tsx b/frontend/src/components/IntelligencePanel.tsx
+index 56921ee..7afe809 100644
+--- a/frontend/src/components/IntelligencePanel.tsx
++++ b/frontend/src/components/IntelligencePanel.tsx
+@@ -69,7 +69,7 @@ export function IntelligencePanel() {
+           </div>
+         ))}
+       </Section>
+-      <Section title="Predictions">
++      <Section title="Predictions" bodyClass="predictions">
+         {predictions.length === 0 ? <Empty text="No predictions yet." /> : predictions.slice(0, 8).map((prediction) => <PredictionRow key={prediction.id} prediction={prediction} modelStatus={modelStatus} />)}
+       </Section>
+       <Section title="Touches">
+@@ -134,8 +134,15 @@ function PredictionRow({ prediction, modelStatus }: { prediction: Prediction; mo
+   );
+ }
+ 
+-function Section({ title, children }: { title: string; children: React.ReactNode }) {
+-  return <section className="intel-section"><h3>{title}</h3>{children}</section>;
++// Every section body scrolls internally past its max-height, so section
++// content (newest first from the stores) can never grow the sidebar open-ended.
++function Section({ title, children, bodyClass }: { title: string; children: React.ReactNode; bodyClass?: string }) {
++  return (
++    <section className="intel-section">
++      <h3>{title}</h3>
++      <div className={bodyClass ? `intel-section-body ${bodyClass}` : 'intel-section-body'}>{children}</div>
++    </section>
++  );
+ }
+ 
+ function KeyValue({ label, value }: { label: string; value: string }) {
+diff --git a/frontend/src/components/TradingChart.test.tsx b/frontend/src/components/TradingChart.test.tsx
+index 979a890..7c11b56 100644
+--- a/frontend/src/components/TradingChart.test.tsx
++++ b/frontend/src/components/TradingChart.test.tsx
+@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => ({
+   getVisibleRange: vi.fn((): { from: number; to: number } | null => null),
+   setVisibleRange: vi.fn(),
+   fitContent: vi.fn(),
++  applyTimeScaleOptions: vi.fn(),
+ }));
+ 
+ vi.mock('lightweight-charts', () => ({
+@@ -44,7 +45,7 @@ describe('TradingChart', () => {
+     mocks.addSeries.mockReturnValue({ setData: mocks.setData, update: mocks.update, createPriceLine: mocks.createPriceLine, removePriceLine: mocks.removePriceLine, attachPrimitive: vi.fn(), detachPrimitive: vi.fn() });
+     mocks.scrollPosition.mockReturnValue(0);
+     mocks.getVisibleRange.mockReturnValue(null);
+-    mocks.timeScale.mockReturnValue({ scrollPosition: mocks.scrollPosition, getVisibleRange: mocks.getVisibleRange, setVisibleRange: mocks.setVisibleRange, fitContent: mocks.fitContent });
++    mocks.timeScale.mockReturnValue({ scrollPosition: mocks.scrollPosition, getVisibleRange: mocks.getVisibleRange, setVisibleRange: mocks.setVisibleRange, fitContent: mocks.fitContent, applyOptions: mocks.applyTimeScaleOptions });
+     mocks.createChart.mockReturnValue({ addSeries: mocks.addSeries, remove: mocks.remove, subscribeCrosshairMove: mocks.subscribeCrosshairMove, unsubscribeCrosshairMove: mocks.unsubscribeCrosshairMove, timeScale: mocks.timeScale });
+     mocks.createSeriesMarkers.mockReturnValue({ setMarkers: mocks.setMarkers, remove: mocks.removeMarkers });
+   });
+@@ -334,4 +335,47 @@ describe('TradingChart', () => {
+     expect(screen.getByText('Backend offline · WebSocket offline')).toBeInTheDocument();
+     expect(screen.getByTestId('trading-chart-canvas')).toBeInTheDocument();
+   });
++
++  it('labels the time axis CT exactly once (COCKPIT-FIX F4)', () => {
++    renderChart();
++
++    const labels = screen.getAllByTestId('axis-tz-label');
++    expect(labels).toHaveLength(1);
++    expect(labels[0]).toHaveTextContent('CT');
++  });
++
++  it('installs Central Time axis formatters that resolve ticks through the live bar set (COCKPIT-FIX F4)', () => {
++    const bars = [chartBar('a', 1779321607, 100)]; // openTimeUtc 2026-05-21T14:00:00Z (CDT)
++    renderChart({ bars });
++
++    const options = mocks.createChart.mock.calls[0]?.[1] as {
++      timeScale: { tickMarkFormatter: (time: unknown, tickMarkType: number, locale: string) => string };
++      localization: { timeFormatter: (time: unknown) => string };
++    };
++    expect(options.timeScale.tickMarkFormatter(1779321607, 3, 'en-US')).toBe('9:00 am');
++    expect(options.timeScale.tickMarkFormatter(1779321607, 2, 'en-US')).toBe('May 21');
++    expect(options.localization.timeFormatter(1779321607)).toBe('May 21 · 9:00:00 am');
++    // A tick with no loaded bar renders empty rather than lying about the clock.
++    expect(options.timeScale.tickMarkFormatter(1779999999, 3, 'en-US')).toBe('');
++  });
++
++  it('flushes the axis tick-label cache when an existing time key remaps, but not on pure appends (COCKPIT-FIX F4)', () => {
++    // lightweight-charts memoizes tick labels by time key across setData, so a
++    // remap (timeframe switch reusing colliding synthetic keys) must force an
++    // applyOptions cache flush.
++    const first = [{ ...chartBar('a', 1000, 100), openTimeUtc: '2026-05-21T14:00:00Z' }];
++    const { rerender } = renderChart({ bars: first });
++    mocks.applyTimeScaleOptions.mockClear();
++
++    const appended = [...first, { ...chartBar('b', 1001, 101), openTimeUtc: '2026-05-21T14:00:10Z' }];
++    rerender(<TradingChart timeframe={147} bars={appended} levels={[]} markers={[]} emptyTitle="empty" emptySubtitle="offline" />);
++    expect(mocks.applyTimeScaleOptions).not.toHaveBeenCalled();
++
++    const remapped = [{ ...chartBar('a2', 1000, 100), openTimeUtc: '2026-05-21T18:00:00Z' }];
++    rerender(<TradingChart timeframe={147} bars={remapped} levels={[]} markers={[]} emptyTitle="empty" emptySubtitle="offline" />);
++    expect(mocks.applyTimeScaleOptions).toHaveBeenCalledWith({});
++
++    const options = mocks.createChart.mock.calls[0]?.[1] as { timeScale: { tickMarkFormatter: (time: unknown, tickMarkType: number, locale: string) => string } };
++    expect(options.timeScale.tickMarkFormatter(1000, 3, 'en-US')).toBe('1:00 pm'); // 18:00Z in CDT
++  });
+ });
+diff --git a/frontend/src/components/TradingChart.tsx b/frontend/src/components/TradingChart.tsx
+index 5a734c2..e144ce0 100644
+--- a/frontend/src/components/TradingChart.tsx
++++ b/frontend/src/components/TradingChart.tsx
+@@ -1,6 +1,7 @@
+ import { useEffect, useMemo, useRef } from 'react';
+-import { CandlestickSeries, ColorType, CrosshairMode, createChart, type IChartApi, type ISeriesApi, type MouseEventParams } from 'lightweight-charts';
++import { CandlestickSeries, ColorType, CrosshairMode, createChart, type IChartApi, type ISeriesApi, type MouseEventParams, type TickMarkType, type Time } from 'lightweight-charts';
+ import { ChartOverlayManager } from '../chart/overlayManager';
++import { axisIndexInvalidated, buildAxisTimeIndex, formatCrosshairCt, formatTickMarkCt } from '../chart/axisTime';
+ import { sessionBands, type ChartBar, type LevelOverlay, type MarkerOverlay, type PositionLineOverlay } from '../chart/viewModels';
+ import type { Timeframe } from '../domain/models';
+ 
+@@ -47,6 +48,10 @@ export function TradingChart({ timeframe, bars, levels, markers, positionLines =
+   // cursor sits still can reconcile a stale/removed label (no crosshair event fires
+   // for a stationary cursor when setMarkers runs).
+   const hoveredMarkerIdRef = useRef<string | null>(null);
++  // COCKPIT-FIX F4: chart-time -> real-open-epoch lookup for the axis/crosshair
++  // formatters. A ref (refreshed with the bars) because the formatters are
++  // installed once at createChart and must see the current bar set.
++  const axisTimeIndexRef = useRef<Map<number, number>>(new Map());
+ 
+   useEffect(() => {
+     if (!containerRef.current) return;
+@@ -57,7 +62,15 @@ export function TradingChart({ timeframe, bars, levels, markers, positionLines =
+       layout: { background: { type: ColorType.Solid, color: '#071017' }, textColor: '#9fb0c2' },
+       grid: { vertLines: { color: '#122231' }, horzLines: { color: '#122231' } },
+       rightPriceScale: { borderColor: '#203244', scaleMargins: { top: 0.12, bottom: 0.12 } },
+-      timeScale: { borderColor: '#203244', timeVisible: true, secondsVisible: true },
++      // Display-only Central Time labels: ticks resolve to their bar's real
++      // wall-clock open; the synthetic time coordinate itself is untouched.
++      timeScale: {
++        borderColor: '#203244',
++        timeVisible: true,
++        secondsVisible: true,
++        tickMarkFormatter: (time: Time, tickMarkType: TickMarkType) => formatTickMarkCt(axisTimeIndexRef.current, time, tickMarkType),
++      },
++      localization: { timeFormatter: (time: Time) => formatCrosshairCt(axisTimeIndexRef.current, time) },
+       crosshair: { mode: CrosshairMode.Normal },
+     });
+     const series = chart.addSeries(CandlestickSeries, {
+@@ -117,8 +130,20 @@ export function TradingChart({ timeframe, bars, levels, markers, positionLines =
+     const series = seriesRef.current;
+     const chart = chartRef.current;
+     if (!series || !chart) return;
++    // Refresh the axis-label lookup before the data reaches the series, so the
++    // tick layout triggered by setData/update always resolves against the bars
++    // it is laying out.
++    const previousAxisIndex = axisTimeIndexRef.current;
++    axisTimeIndexRef.current = buildAxisTimeIndex(bars);
+     const previous = previousBarsRef.current;
+     const timeScale = chart.timeScale();
++    // lightweight-charts memoizes formatted tick labels by time key and only
++    // flushes that cache via applyOptions — never on setData. When an existing
++    // key remaps to a different real open (timeframe switch: the synthetic
++    // coordinates collide across timeframes; replay repopulate), flush it or
++    // the axis keeps showing the previous mapping's wall clock. Pure appends —
++    // the live hot path — never trigger this.
++    if (axisIndexInvalidated(previousAxisIndex, axisTimeIndexRef.current)) timeScale.applyOptions({});
+ 
+     // A "fresh" series generation: the first bars, a timeframe switch, or a repopulate after the
+     // store cleared (warm-up / replay (re)start).
+@@ -196,6 +221,7 @@ export function TradingChart({ timeframe, bars, levels, markers, positionLines =
+         <span><i className="legend-line display" /> Display-only {legend.display}</span>
+         <span><i className="legend-marker" /> Touch / observation</span>
+       </div>
++      <span className="chart-axis-tz" data-testid="axis-tz-label">CT</span>
+       {bars.length === 0 && (
+         <div className="empty-overlay">
+           <strong>{emptyTitle}</strong>
+diff --git a/frontend/src/state/stores.test.ts b/frontend/src/state/stores.test.ts
+index 29386fa..d3a13d2 100644
+--- a/frontend/src/state/stores.test.ts
++++ b/frontend/src/state/stores.test.ts
+@@ -1,6 +1,7 @@
+ import { afterEach, describe, expect, it } from 'vitest';
+ import { addBlotterEvent, addDropped, addOpenPosition, addOutcome, addPrediction, blotterStore, clearExecutions, clearPredictions, closeOpenPosition, connectionStore, executionStore, intelligenceStore, marketStore, predictionStore, runtimeStore, setModelStatus, setOpenPositions } from './stores';
+-import type { ClosedExecution, DroppedPrediction, OpenPosition, Outcome, Prediction } from '../domain/models';
++import { tapeCategory } from '../blotter/viewModels';
++import type { ClosedExecution, DroppedPrediction, OpenPosition, Outcome, Prediction, TapeRow } from '../domain/models';
+ 
+ const resetStores = () => {
+   runtimeStore.reset();
+@@ -54,6 +55,20 @@ const makeDropped = (predictionId: string): DroppedPrediction => ({
+   entryPrice: null,
+ });
+ 
++const tapeEvent = (message: string, tape?: TapeRow) => ({
++  timeUtc: '2026-05-21T14:00:00Z',
++  category: 'observation' as const,
++  severity: 'info' as const,
++  message,
++  tape,
++});
++
++const predictionTape = (predictionId: string): TapeRow => ({ kind: 'prediction', predictionId, predictedClass: 'continuation', probability: 0.7, eligible: true, direction: 'long', session: 'ny' });
++const outcomeTape = (predictionId: string): TapeRow => ({ kind: 'outcome', predictionId, resolutionType: 'target', correct: true, actualClass: 'continuation' });
++const dropTape = (predictionId: string): TapeRow => ({ kind: 'drop', predictionId, reason: 'flatten' });
++const openTape = (predictionId: string): TapeRow => ({ kind: 'position_open', predictionId, direction: 'long', entryPrice: 23000, entryPriceConservative: 23000.25, tpPrice: 23015, slPrice: 22970 });
++const closeTape = (predictionId: string): TapeRow => ({ kind: 'position_close', predictionId, direction: 'long', reason: 'tp_hit', points: 15, pointsConservative: 14.75, exitPrice: 23015 });
++
+ describe('workstation stores', () => {
+   afterEach(resetStores);
+ 
+@@ -70,17 +85,57 @@ describe('workstation stores', () => {
+     expect(blotterStore.getSnapshot().events).toEqual([]);
+   });
+ 
+-  it('bounds event blotter retention to the newest 200 events', () => {
+-    for (let index = 0; index < 205; index += 1) {
+-      addBlotterEvent({ timeUtc: `2026-05-21T14:${String(index).padStart(2, '0')}:00Z`, category: 'system', severity: 'info', message: `event-${index}` });
++  it('bounds untyped blotter retention to the newest 60 events', () => {
++    for (let index = 0; index < 65; index += 1) {
++      addBlotterEvent({ timeUtc: `2026-05-21T14:${String(index % 60).padStart(2, '0')}:00Z`, category: 'system', severity: 'info', message: `event-${index}` });
+     }
+ 
+     const events = blotterStore.getSnapshot().events;
+-    expect(events).toHaveLength(200);
+-    expect(events[0].message).toBe('event-204');
++    expect(events).toHaveLength(60);
++    expect(events[0].message).toBe('event-64');
+     expect(events.at(-1)?.message).toBe('event-5');
+   });
+ 
++  it('keeps typed tape rows alive through a flood of 500 untyped events', () => {
++    addBlotterEvent(tapeEvent('pred created', predictionTape('pred-1')));
++    addBlotterEvent(tapeEvent('pred resolved', outcomeTape('pred-1')));
++    addBlotterEvent(tapeEvent('pred dropped', dropTape('pred-2')));
++    addBlotterEvent(tapeEvent('position opened', openTape('pred-3')));
++    addBlotterEvent(tapeEvent('position closed', closeTape('pred-3')));
++
++    for (let index = 0; index < 500; index += 1) {
++      addBlotterEvent({ timeUtc: '2026-05-21T15:00:00Z', category: 'system', severity: 'info', message: `chatter-${index}` });
++    }
++
++    const events = blotterStore.getSnapshot().events;
++    expect(events.filter((event) => tapeCategory(event) === 'untyped')).toHaveLength(60);
++    expect(events.map((event) => event.message)).toEqual(expect.arrayContaining([
++      'pred created', 'pred resolved', 'pred dropped', 'position opened', 'position closed',
++    ]));
++    expect(events.filter((event) => tapeCategory(event) === 'predictions')).toHaveLength(2);
++    expect(events.filter((event) => tapeCategory(event) === 'executions')).toHaveLength(2);
++    expect(events.filter((event) => tapeCategory(event) === 'drops')).toHaveLength(1);
++  });
++
++  it('caps each tape category independently at its own newest-first bound', () => {
++    for (let index = 0; index < 70; index += 1) addBlotterEvent(tapeEvent(`pred-${index}`, predictionTape(`pred-${index}`)));
++    for (let index = 0; index < 70; index += 1) addBlotterEvent(tapeEvent(`exec-${index}`, openTape(`pred-${index}`)));
++    for (let index = 0; index < 50; index += 1) addBlotterEvent(tapeEvent(`drop-${index}`, dropTape(`pred-${index}`)));
++
++    const events = blotterStore.getSnapshot().events;
++    const predictions = events.filter((event) => tapeCategory(event) === 'predictions');
++    const executions = events.filter((event) => tapeCategory(event) === 'executions');
++    const drops = events.filter((event) => tapeCategory(event) === 'drops');
++    expect(predictions).toHaveLength(60);
++    expect(predictions[0].message).toBe('pred-69');
++    expect(predictions.at(-1)?.message).toBe('pred-10');
++    expect(executions).toHaveLength(60);
++    expect(executions[0].message).toBe('exec-69');
++    expect(drops).toHaveLength(40);
++    expect(drops[0].message).toBe('drop-49');
++    expect(drops.at(-1)?.message).toBe('drop-10');
++  });
++
+   it('assigns unique IDs to repeated identical blotter events', () => {
+     const event = { timeUtc: '2026-05-21T14:00:00Z', category: 'system' as const, severity: 'info' as const, message: 'Heartbeat', sequence: 10 };
+ 
+diff --git a/frontend/src/state/stores.ts b/frontend/src/state/stores.ts
+index a77a10a..bdc6fe6 100644
+--- a/frontend/src/state/stores.ts
++++ b/frontend/src/state/stores.ts
+@@ -1,4 +1,5 @@
+ import { createStore, useStore } from './createStore';
++import { tapeCategory, type TapeCategory } from '../blotter/viewModels';
+ import type { BlotterEvent, ClosedExecution, DroppedPrediction, LiveStatus, MarketBar, MarketLevel, MarketTouch, ModelBundle, ModelStatus, Observation, OpenPosition, Outcome, Prediction, ReplaySource, ReplayStatus, RuntimeSummary, Timeframe, Warning } from '../domain/models';
+ 
+ const MAX_PREDICTIONS = 100;
+@@ -6,6 +7,16 @@ const MAX_OUTCOMES = 100;
+ const MAX_DROPPED = 100;
+ const MAX_CLOSED_EXECUTIONS = 100;
+ 
++// COCKPIT-FIX F2: the tape retains events per category, so untyped chatter
++// (heartbeats, bar closes, feed status, ...) can never evict typed rows —
++// each category keeps its own newest-first ring.
++const TAPE_RETENTION: Record<TapeCategory, number> = {
++  predictions: 60,
++  executions: 60,
++  drops: 40,
++  untyped: 60,
++};
++
+ export type PredictionState = {
+   predictions: Prediction[];
+   outcomes: Outcome[];
+@@ -222,10 +233,21 @@ export const useBundles = <T = ModelBundle[]>(selector?: (bundles: ModelBundle[]
+ 
+ let blotterEventCounter = 0;
+ 
++// Events arrive newest-first, so keeping the first N of each category keeps
++// the newest N of that category and preserves overall ordering.
++const enforceTapeRetention = (events: BlotterEvent[]): BlotterEvent[] => {
++  const remaining = { ...TAPE_RETENTION };
++  return events.filter((event) => {
++    const category = tapeCategory(event);
++    remaining[category] -= 1;
++    return remaining[category] >= 0;
++  });
++};
++
+ export const addBlotterEvent = (event: Omit<BlotterEvent, 'id'> & { sequence?: number }) => {
+   blotterEventCounter += 1;
+   const sequencePart = event.sequence === undefined ? 'local' : `ws-${event.sequence}`;
+   blotterStore.setState((current) => ({
+-    events: [{ ...event, id: `${sequencePart}-${blotterEventCounter}-${event.timeUtc}-${event.category}-${event.message}` }, ...current.events].slice(0, 200),
++    events: enforceTapeRetention([{ ...event, id: `${sequencePart}-${blotterEventCounter}-${event.timeUtc}-${event.category}-${event.message}` }, ...current.events]),
+   }));
+ };
+diff --git a/frontend/src/styles.css b/frontend/src/styles.css
+index 7a79127..88f8438 100644
+--- a/frontend/src/styles.css
++++ b/frontend/src/styles.css
+@@ -10,6 +10,10 @@
+   --green: #36d399;
+   --amber: #f2b84b;
+   --red: #ff6b6b;
++  /* COCKPIT-FIX F1: the shared viewport-relative height of the chart/sidebar
++     workspace — a function of the viewport only, never of panel content.
++     Uncapped above so very tall monitors keep filling the workspace row. */
++  --workspace-h: max(420px, 58vh);
+   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+ }
+ * { box-sizing: border-box; }
+@@ -28,13 +32,15 @@ button { font: inherit; }
+ .status-pill span { display:block; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+ .status-pill strong { font-size: 13px; text-transform: uppercase; }
+ .status-pill.green strong { color: var(--green); } .status-pill.red strong { color: var(--red); } .status-pill.amber strong { color: var(--amber); } .status-pill.blue strong { color: var(--blue); }
+-.workspace-grid { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 12px; min-height: 0; }
++/* align-items:start stops the columns stretching to each other's height — the
++   sidebar's content can never drive the chart's height (COCKPIT-FIX F1). */
++.workspace-grid { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 12px; min-height: 0; align-items: start; }
+ .panel { border-radius: 14px; min-width: 0; overflow: hidden; }
+ .panel-header { height: 76px; display:flex; align-items:center; justify-content:space-between; gap:16px; padding: 16px 18px; border-bottom: 1px solid var(--line); background: rgba(255,255,255,.02); }
+ .panel-header.compact { height: 58px; align-items: baseline; justify-content: flex-start; gap: 12px; }
+ .panel-header h1 { font-size: 22px; } .panel-header h2 { font-size: 16px; }
+ .chart-panel { display:grid; grid-template-rows: auto 1fr; min-height: 0; }
+-.chart-shell { position: relative; min-height: 420px; height: 100%; }
++.chart-shell { position: relative; min-height: 420px; height: var(--workspace-h); }
+ .chart-canvas { position:absolute; inset:0; }
+ .chart-marker-tooltip { position:absolute; top:0; left:0; z-index:3; pointer-events:none; max-width:260px; padding:5px 9px; border:1px solid rgba(28,48,65,.92); border-radius:8px; background:rgba(5,10,15,.94); backdrop-filter:blur(8px); color:#e6eef6; font-size:11px; line-height:1.35; letter-spacing:.04em; white-space:nowrap; box-shadow:0 4px 16px rgba(0,0,0,.45); }
+ .chart-legend { position:absolute; top:12px; left:14px; z-index:2; display:flex; flex-wrap:wrap; gap:10px; align-items:center; max-width:calc(100% - 28px); padding:7px 9px; border:1px solid rgba(28,48,65,.78); border-radius:10px; background:rgba(5,10,15,.72); backdrop-filter: blur(8px); color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
+@@ -42,13 +48,23 @@ button { font: inherit; }
+ .legend-line { width:18px; height:0; border-top:2px solid var(--green); display:inline-block; }
+ .legend-line.display { border-top:1px dashed #708194; }
+ .legend-marker { width:8px; height:8px; border-radius:50%; background:var(--amber); box-shadow:0 0 0 2px rgba(242,184,75,.16); display:inline-block; }
++.chart-axis-tz { position:absolute; right:8px; bottom:6px; z-index:2; pointer-events:none; padding:2px 6px; border:1px solid rgba(28,48,65,.78); border-radius:6px; background:rgba(5,10,15,.72); color:var(--muted); font-size:10px; letter-spacing:.08em; }
+ .empty-overlay { position:absolute; inset: 20% auto auto 50%; transform: translateX(-50%); width:min(460px, calc(100% - 40px)); border:1px solid var(--line); border-radius:16px; padding:22px; text-align:center; background: rgba(5,10,15,.88); backdrop-filter: blur(10px); }
+ .empty-overlay strong { display:block; font-size:20px; margin-bottom:8px; } .empty-overlay span, .empty-overlay small { display:block; color: var(--muted); margin-top:6px; }
+ .segmented-control { display:flex; border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+ .segmented-control button { color:var(--muted); background:#071017; border:0; border-right:1px solid var(--line); padding:8px 13px; cursor:pointer; }
+ .segmented-control button:last-child { border-right:0; } .segmented-control button.active { color:#061018; background:var(--blue); font-weight:700; }
+-.intelligence-panel { overflow:auto; }
++/* The sidebar matches the chart panel's total height (workspace + 76px header)
++   and scrolls internally instead of growing the workspace row. */
++.intelligence-panel { max-height: calc(var(--workspace-h) + 76px); overflow-y: auto; }
+ .intel-section { padding: 14px 16px; border-bottom: 1px solid var(--line); }
++/* Each section also bounds its own content, so one noisy section can never
++   bury the others below the fold (COCKPIT-FIX F1/F3). The 6px side padding
++   (offset by the negative margin) absorbs .level-row.nearest's -6px bleed the
++   way the section padding used to, keeping the scroll container overflow-free
++   horizontally. */
++.intel-section-body { max-height: 240px; overflow-y: auto; padding: 0 6px; margin: 0 -6px; }
++.intel-section-body.predictions { max-height: 340px; }
+ .intel-section h3 { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .12em; margin-bottom: 10px; }
+ .key-value, .level-row { display:grid; grid-template-columns: 1fr auto; gap:10px; align-items:center; padding:7px 0; font-size:13px; }
+ .key-value span, .level-row span, .empty-text { color: var(--muted); }
+diff --git a/frontend/src/styles.test.ts b/frontend/src/styles.test.ts
+new file mode 100644
+index 0000000..eb4d636
+--- /dev/null
++++ b/frontend/src/styles.test.ts
+@@ -0,0 +1,49 @@
++import { readFileSync } from 'node:fs';
++import { resolve } from 'node:path';
++import { describe, expect, it } from 'vitest';
++
++// COCKPIT-FIX F1: jsdom performs no layout, so the layout decoupling is pinned
++// as a stylesheet contract — the chart wrapper's height must be a function of
++// the viewport alone, and nothing may re-couple the two workspace columns.
++
++const rawStyles = readFileSync(resolve(process.cwd(), 'src/styles.css'), 'utf8');
++const stylesheet = rawStyles.replace(/\/\*[\s\S]*?\*\//g, '');
++
++const ruleFor = (selector: string): string => {
++  const start = stylesheet.indexOf(`${selector} {`);
++  if (start === -1) throw new Error(`no rule found for ${selector}`);
++  const end = stylesheet.indexOf('}', start);
++  return stylesheet.slice(start + selector.length + 2, end);
++};
++
++describe('workspace layout contract (COCKPIT-FIX F1)', () => {
++  it('declares the shared workspace height from viewport units only', () => {
++    const declaration = ruleFor(':root').match(/--workspace-h:[^;]*/)?.[0] ?? '';
++    expect(declaration).toContain('vh');
++    expect(declaration).not.toContain('%');
++    expect(declaration).not.toContain('auto');
++  });
++
++  it('sizes the chart wrapper from the viewport variable, never from content or siblings', () => {
++    const rule = ruleFor('.chart-shell');
++    expect(rule).toMatch(/height:\s*var\(--workspace-h\)/);
++    expect(rule).not.toMatch(/height:\s*100%/);
++  });
++
++  it('keeps the workspace columns from stretching to each other', () => {
++    expect(ruleFor('.workspace-grid')).toMatch(/align-items:\s*start/);
++  });
++
++  it('bounds the sidebar to the workspace height with internal scrolling', () => {
++    const rule = ruleFor('.intelligence-panel');
++    expect(rule).toMatch(/max-height:\s*calc\(var\(--workspace-h\)/);
++    expect(rule).toMatch(/overflow-y:\s*auto/);
++  });
++
++  it('bounds each sidebar section with its own internal scroll', () => {
++    const body = ruleFor('.intel-section-body');
++    expect(body).toMatch(/max-height:\s*\d+px/);
++    expect(body).toMatch(/overflow-y:\s*auto/);
++    expect(ruleFor('.intel-section-body.predictions')).toMatch(/max-height:\s*\d+px/);
++  });
++});
+diff --git a/frontend/src/test/node.d.ts b/frontend/src/test/node.d.ts
+new file mode 100644
+index 0000000..1064bc4
+--- /dev/null
++++ b/frontend/src/test/node.d.ts
+@@ -0,0 +1,12 @@
++// Minimal Node declarations for tests that read repo files (the stylesheet
++// contract test). The project intentionally ships no @types/node — vitest runs
++// in Node, but only this narrow surface is needed.
++declare module 'node:fs' {
++  export function readFileSync(path: string, encoding: 'utf8'): string;
++}
++
++declare module 'node:path' {
++  export function resolve(...segments: string[]): string;
++}
++
++declare const process: { cwd(): string };

@@ -1,0 +1,391 @@
+diff --git a/backend/src/trade_lab/services/replay.py b/backend/src/trade_lab/services/replay.py
+index f3f56cf..a5024d4 100644
+--- a/backend/src/trade_lab/services/replay.py
++++ b/backend/src/trade_lab/services/replay.py
+@@ -10,6 +10,7 @@ from enum import StrEnum
+ from pathlib import Path
+ from typing import cast
+ 
++from strategy_core.data.prior_day import prior_full_day_extremes
+ from strategy_core.runtime import ReplayConfig as CoreReplayConfig
+ from strategy_core.runtime import ReplayRuntime as CoreReplayRuntime
+ from strategy_core.runtime import ReplayState as CoreReplayState
+@@ -33,6 +34,10 @@ logger = logging.getLogger(__name__)
+ _REPLAY_FLUSH_INTERVAL_SECONDS = 0.05
+ _REPLAY_MAX_PENDING_UPDATES = 4000
+ 
++# SEED: how far back the prior-day PDH/PDL store walk looks. Passed explicitly so the
++# unseeded warning states the bound actually used.
++_SEED_MAX_WALK_DAYS = 10
++
+ class _StrategyCoreHistoricalSourceAdapter:
+     """Expose a Trade-Lab historical source as a Strategy-Core replay source."""
+ 
+@@ -115,6 +120,7 @@ class HistoricalReplayService:
+             raise ValueError("update_queue_depth must be positive")
+         self.runtime = runtime
+         self._state = ReplayState.IDLE
++        self._starting = False
+         self._events_processed = 0
+         self._warnings_recorded = 0
+         self._last_error: str | None = None
+@@ -181,8 +187,22 @@ class HistoricalReplayService:
+         )
+ 
+     async def start(self, source: HistoricalMarketDataSource, config: ReplayConfig) -> None:
+-        if self._task is not None and not self._task.done():
++        # The seed drain below yields the event loop for seconds, so an in-flight start
++        # must be visible to concurrent callers before self._task exists.
++        if self._starting or (self._task is not None and not self._task.done()):
+             raise RuntimeError("replay is already running")
++        self._starting = True
++        try:
++            await self._start_locked(source, config)
++        finally:
++            self._starting = False
++
++    async def _start_locked(self, source: HistoricalMarketDataSource, config: ReplayConfig) -> None:
++        # Drop the previous run's core handle FIRST: status() prefers the core state, and
++        # during the seed drain a stale handle would report the PREVIOUS replay's
++        # COMPLETED — which also punches through the app-level live/replay 409 exclusion
++        # (LOADING is an active state; the stale COMPLETED is not).
++        self.strategy_core_replay = None
+         self._config = config
+         self._events_processed = 0
+         self._warnings_recorded = 0
+@@ -203,6 +223,41 @@ class HistoricalReplayService:
+                 reset_reason="replay_reset",
+             )
+         )
++        # SEED: give day-mode replays the training-parity PDH/PDL seed — the canonical
++        # store walk (SEED_PARITY_RECON.md §5: tick-exact equal to QL's prev_full_hl
++        # carry). Must run AFTER runtime.reset (the reset rebuilds the SC service, so an
++        # earlier seed would be wiped) and BEFORE the core replay task starts (so the
++        # summary is banked before the first event). A walk miss or a seed failure never
++        # kills the replay — it proceeds unseeded, QL's cold-start equivalent.
++        seed_note = ""
++        if config.trading_day is not None and config.symbol_dir is not None:
++            try:
++                extremes = await asyncio.to_thread(
++                    prior_full_day_extremes,
++                    config.symbol_dir,
++                    config.trading_day,
++                    requested_symbol=config.requested_symbol,
++                    max_walk_days=_SEED_MAX_WALK_DAYS,
++                )
++                if extremes is None:
++                    logger.warning(
++                        "replay unseeded: no prior store day with trades within %d days of %s",
++                        _SEED_MAX_WALK_DAYS,
++                        config.trading_day,
++                    )
++                else:
++                    self.runtime.levels.load_prior_day_summary(
++                        extremes.source_day,
++                        high_ticks=extremes.high_ticks,
++                        low_ticks=extremes.low_ticks,
++                    )
++                    seed_note = f"; seeded PDH/PDL from {extremes.source_day.isoformat()}"
++            except Exception as exc:  # ANY seed problem must never kill a replay
++                logger.warning(
++                    "replay PDH/PDL seed resolution failed for %s (%s); proceeding unseeded",
++                    config.trading_day,
++                    exc,
++                )
+         await self._emit(
+             self.runtime.set_feed_status(
+                 FeedStatus(
+@@ -210,11 +265,19 @@ class HistoricalReplayService:
+                     mode="replay",
+                     requested_symbol=config.requested_symbol,
+                     schema=config.schema,
+-                    last_message="historical replay loading",
++                    last_message=f"historical replay loading{seed_note}",
+                     metadata={"source_id": config.source_id} if config.source_id else {},
+                 )
+             )
+         )
++        # A stop() issued during the seed drain must win: abort before spawning the
++        # core replay (stop() found nothing to cancel while _task was still None).
++        if self._stop_requested:
++            if self._state is not ReplayState.STOPPED:
++                self._state = ReplayState.STOPPED
++                self._completed_at_utc = datetime.now(UTC)
++                await self._emit_terminal_feed_status("historical replay stopped")
++            return
+         adapter = _StrategyCoreHistoricalSourceAdapter(source, config)
+         self.strategy_core_replay = CoreReplayRuntime(
+             None,
+diff --git a/backend/tests/test_replay_seed.py b/backend/tests/test_replay_seed.py
+new file mode 100644
+index 0000000..e72d576
+--- /dev/null
++++ b/backend/tests/test_replay_seed.py
+@@ -0,0 +1,267 @@
++"""SEED window: dashboard replays get the training-parity PDH/PDL seed.
++
++The seed rides ``HistoricalReplayService.start`` — after the runtime reset (a seed on the
++pre-reset runtime would be wiped with the rebuilt service) and before the core replay task
++(so the summary is banked before the first event). Value source = the canonical store walk
++(``strategy_core.data.prior_day.prior_full_day_extremes``), proven tick-exact equal to QL
++training's ``prev_full_hl`` carry in SEED_PARITY_RECON.md §5.
++"""
++
++import asyncio
++import logging
++import threading
++from datetime import UTC, date, datetime
++from pathlib import Path
++
++import pyarrow as pa
++import pyarrow.parquet as pq
++import pytest
++from strategy_core.data.prior_day import PriorDayExtremes
++
++import trade_lab.services.replay as replay_module
++from trade_lab.domain.events import TradeEvent
++from trade_lab.domain.levels import LevelKind
++from trade_lab.ports.market_data import HistoricalMarketDataSource
++from trade_lab.services.replay import HistoricalReplayService, ReplayConfig, ReplayState
++from trade_lab.services.runtime import ApplicationRuntime
++
++
++class FakeDaySource(HistoricalMarketDataSource):
++    """Fake source that tolerates the day-mode scan kwargs (trading_day/symbol_dir)."""
++
++    def __init__(self, items=()):
++        self._items = tuple(items)
++
++    def scan(
++        self,
++        paths,
++        *,
++        requested_symbol,
++        schema,
++        start_ts_utc=None,
++        end_ts_utc=None,
++        **_day_kwargs,
++    ):
++        yield from self._items
++
++
++def _runtime() -> ApplicationRuntime:
++    return ApplicationRuntime(
++        requested_symbol="NQ",
++        tick_timeframes=(2,),
++        observation_duration_seconds=300,
++    )
++
++
++def _write_prior_day(symbol_dir: Path) -> None:
++    """Fixture store: prior day 2026-03-09 with trades at 17001.00 / 17000.25."""
++    day_dir = symbol_dir / "2026-03-09"
++    day_dir.mkdir(parents=True)
++    rows = [
++        {
++            "ts_event": datetime(2026, 3, 9, 14, 0, tzinfo=UTC),
++            "price": 17001.00,
++            "size": 1,
++            "side": "B",
++            "sequence": 1,
++        },
++        {
++            "ts_event": datetime(2026, 3, 9, 14, 1, tzinfo=UTC),
++            "price": 17000.25,
++            "size": 1,
++            "side": "A",
++            "sequence": 2,
++        },
++    ]
++    pq.write_table(pa.Table.from_pylist(rows), day_dir / "trades.parquet")
++
++
++def _day_config(symbol_dir: Path) -> ReplayConfig:
++    return ReplayConfig(
++        paths=(Path("synthetic:seed"),),
++        requested_symbol="NQ",
++        schema="trades",
++        trading_day=date(2026, 3, 10),
++        symbol_dir=symbol_dir,
++    )
++
++
++def _replay_trade(minute: int, price_ticks: int, seq: int) -> TradeEvent:
++    return TradeEvent(
++        datetime(2026, 3, 10, 14, minute, tzinfo=UTC),
++        None,
++        1,
++        "NQ",
++        "NQM6",
++        price_ticks,
++        1,
++    )
++
++
++async def _wait_terminal(service: HistoricalReplayService) -> None:
++    while service.status().state not in {ReplayState.COMPLETED, ReplayState.FAILED}:
++        await asyncio.sleep(0)
++    assert service.status().state == ReplayState.COMPLETED
++
++
++def _level_ticks(runtime: ApplicationRuntime, kind: LevelKind) -> set[int]:
++    return {
++        level.price_ticks
++        for level in runtime.snapshot().display_levels
++        if level.kind == kind
++    }
++
++
++@pytest.mark.asyncio
++async def test_day_replay_seeds_pdh_pdl_from_the_store_walk(tmp_path: Path) -> None:
++    symbol_dir = tmp_path / "NQ"
++    _write_prior_day(symbol_dir)
++    runtime = _runtime()
++    service = HistoricalReplayService(runtime)
++    await service.start(
++        FakeDaySource((_replay_trade(0, 68010, 1), _replay_trade(1, 68012, 2))),
++        _day_config(symbol_dir),
++    )
++    # start() has seeded and set the LOADING status; the replay task has not run yet.
++    assert (
++        "seeded PDH/PDL from 2026-03-09"
++        in (runtime.snapshot().feed_status.last_message or "")
++    )
++    await _wait_terminal(service)
++    assert _level_ticks(runtime, LevelKind.PDH) == {68004}
++    assert _level_ticks(runtime, LevelKind.PDL) == {68001}
++
++
++@pytest.mark.asyncio
++async def test_walk_miss_warns_and_replay_completes_unseeded(
++    tmp_path: Path, caplog: pytest.LogCaptureFixture
++) -> None:
++    symbol_dir = tmp_path / "NQ"
++    symbol_dir.mkdir(parents=True)  # store exists but holds no prior day at all
++    runtime = _runtime()
++    service = HistoricalReplayService(runtime)
++    with caplog.at_level(logging.WARNING, logger="trade_lab.services.replay"):
++        await service.start(
++            FakeDaySource((_replay_trade(0, 68010, 1), _replay_trade(1, 68012, 2))),
++            _day_config(symbol_dir),
++        )
++        await _wait_terminal(service)
++    assert any(
++        "replay unseeded: no prior store day with trades" in record.getMessage()
++        for record in caplog.records
++    )
++    assert "seeded PDH/PDL" not in (runtime.snapshot().feed_status.last_message or "")
++    assert _level_ticks(runtime, LevelKind.PDH) == set()
++    assert _level_ticks(runtime, LevelKind.PDL) == set()
++
++
++@pytest.mark.asyncio
++async def test_seed_exception_warns_and_replay_completes_unseeded(
++    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """ANY seed-path failure proceeds unseeded — a seed problem never kills a replay."""
++    symbol_dir = tmp_path / "NQ"
++    _write_prior_day(symbol_dir)
++
++    def boom(*args, **kwargs):
++        raise RuntimeError("synthetic seed failure")
++
++    monkeypatch.setattr(replay_module, "prior_full_day_extremes", boom)
++    runtime = _runtime()
++    service = HistoricalReplayService(runtime)
++    with caplog.at_level(logging.WARNING, logger="trade_lab.services.replay"):
++        await service.start(
++            FakeDaySource((_replay_trade(0, 68010, 1), _replay_trade(1, 68012, 2))),
++            _day_config(symbol_dir),
++        )
++        await _wait_terminal(service)
++    assert any(
++        "seed resolution failed" in record.getMessage() for record in caplog.records
++    )
++    assert _level_ticks(runtime, LevelKind.PDH) == set()
++
++
++class _GatedSeed:
++    """Seed stub whose Nth call blocks on an event (runs inside asyncio.to_thread)."""
++
++    def __init__(self, gate_from_call: int) -> None:
++        self.calls = 0
++        self.release = threading.Event()
++        self._gate_from_call = gate_from_call
++
++    def __call__(self, *args, **kwargs):
++        self.calls += 1
++        if self.calls >= self._gate_from_call:
++            assert self.release.wait(timeout=5), "seed gate never released"
++        return PriorDayExtremes(source_day=date(2026, 3, 9), high_ticks=68004, low_ticks=68001)
++
++
++@pytest.mark.asyncio
++async def test_concurrent_start_rejected_and_status_loading_during_seed_drain(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """During the seed drain: a second start() raises, and status() reports LOADING —
++    not the PREVIOUS run's COMPLETED (which would punch through the app-level
++    live/replay 409 exclusion)."""
++    symbol_dir = tmp_path / "NQ"
++    _write_prior_day(symbol_dir)
++    seed = _GatedSeed(gate_from_call=2)  # first run seeds instantly, second blocks
++    monkeypatch.setattr(replay_module, "prior_full_day_extremes", seed)
++    runtime = _runtime()
++    service = HistoricalReplayService(runtime)
++    await service.start(FakeDaySource((_replay_trade(0, 68010, 1),)), _day_config(symbol_dir))
++    await _wait_terminal(service)
++    assert service.status().state == ReplayState.COMPLETED
++
++    second = asyncio.ensure_future(
++        service.start(FakeDaySource((_replay_trade(1, 68012, 2),)), _day_config(symbol_dir))
++    )
++    while seed.calls < 2:  # the drain is in flight
++        await asyncio.sleep(0.01)
++    assert service.status().state == ReplayState.LOADING
++    with pytest.raises(RuntimeError, match="already running"):
++        await service.start(FakeDaySource(()), _day_config(symbol_dir))
++    seed.release.set()
++    await second
++    await _wait_terminal(service)
++
++
++@pytest.mark.asyncio
++async def test_stop_during_seed_drain_aborts_before_any_event(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    symbol_dir = tmp_path / "NQ"
++    _write_prior_day(symbol_dir)
++    seed = _GatedSeed(gate_from_call=1)  # blocks immediately
++    monkeypatch.setattr(replay_module, "prior_full_day_extremes", seed)
++    runtime = _runtime()
++    service = HistoricalReplayService(runtime)
++    starter = asyncio.ensure_future(
++        service.start(FakeDaySource((_replay_trade(0, 68010, 1),)), _day_config(symbol_dir))
++    )
++    while seed.calls < 1:
++        await asyncio.sleep(0.01)
++    await service.stop()  # lands mid-drain: nothing to cancel yet
++    seed.release.set()
++    await starter
++    assert service.status().state == ReplayState.STOPPED
++    assert service.status().events_processed == 0
++
++
++@pytest.mark.asyncio
++async def test_seed_lands_on_the_post_reset_runtime(tmp_path: Path) -> None:
++    symbol_dir = tmp_path / "NQ"
++    _write_prior_day(symbol_dir)
++    runtime = _runtime()
++    service = HistoricalReplayService(runtime)
++    service_before = runtime.strategy_core_service
++    # No replay events at all: the seed must not depend on the replayed stream.
++    await service.start(FakeDaySource(()), _day_config(symbol_dir))
++    service_after = runtime.strategy_core_service
++    assert service_after is not service_before  # reset rebuilt the SC service
++    await _wait_terminal(service)
++    # The banked summary lives on the POST-reset service: the first trade folded through
++    # the runtime emits the fixture's PDH/PDL (a pre-reset seed would have been wiped).
++    runtime.process_market_event(_replay_trade(0, 68010, 1))
++    assert _level_ticks(runtime, LevelKind.PDH) == {68004}
++    assert _level_ticks(runtime, LevelKind.PDL) == {68001}

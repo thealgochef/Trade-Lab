@@ -1,7 +1,8 @@
 from dataclasses import FrozenInstanceError
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 from types import MappingProxyType
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -13,7 +14,6 @@ from trade_lab.domain.events import (
     TradeEvent,
 )
 from trade_lab.domain.prices import PriceError, price_to_ticks, ticks_to_price
-from trade_lab.domain.sessions import SessionClassifier, SessionName, classify_session, to_ct
 
 
 def trade(ts: datetime, price_ticks: int = 100, size: int = 1) -> TradeEvent:
@@ -77,8 +77,7 @@ def test_event_timestamps_must_be_timezone_aware_and_are_normalized_to_utc() -> 
     with pytest.raises(ValueError, match="timezone-aware"):
         trade(datetime(2026, 1, 5, 0, 0), 100)
 
-    central_tz = to_ct(datetime(2026, 1, 5, 0, 0, tzinfo=UTC)).tzinfo
-    central_timestamp = datetime(2026, 1, 4, 18, 0, tzinfo=central_tz)
+    central_timestamp = datetime(2026, 1, 4, 18, 0, tzinfo=ZoneInfo("America/Chicago"))
     event = trade(central_timestamp, 100)
     assert event.event_ts_utc == datetime(2026, 1, 5, 0, 0, tzinfo=UTC)
 
@@ -135,61 +134,3 @@ def test_non_trade_events_do_not_look_like_tick_bar_inputs() -> None:
     for event in (quote, status, statistic):
         assert not isinstance(event, TradeEvent)
         assert not hasattr(event, "size")
-
-
-@pytest.mark.parametrize(
-    ("ts_utc", "session", "trading_day"),
-    [
-        (datetime(2026, 1, 5, 0, 0, tzinfo=UTC), SessionName.ASIA, "2026-01-05"),  # 6 PM CT
-        (datetime(2026, 1, 5, 7, 59, tzinfo=UTC), SessionName.ASIA, "2026-01-05"),
-        (datetime(2026, 1, 5, 8, 0, tzinfo=UTC), SessionName.LONDON, "2026-01-05"),  # 2 AM CT
-        (datetime(2026, 1, 5, 13, 59, tzinfo=UTC), SessionName.LONDON, "2026-01-05"),
-        (datetime(2026, 1, 5, 14, 0, tzinfo=UTC), SessionName.NY, "2026-01-05"),  # 8 AM CT
-        (datetime(2026, 1, 5, 22, 0, tzinfo=UTC), SessionName.CLOSED, None),  # 4 PM CT
-        (datetime(2026, 1, 5, 23, 59, tzinfo=UTC), SessionName.CLOSED, None),
-    ],
-)
-def test_session_calendar_labels_close_date_and_boundary_instants(
-    ts_utc: datetime, session: SessionName, trading_day: str | None
-) -> None:
-    info = classify_session(ts_utc)
-    assert info.session == session
-    assert (info.trading_day.isoformat() if info.trading_day else None) == trading_day
-
-
-def test_session_calendar_is_dst_aware_around_spring_transition() -> None:
-    before_transition = classify_session(datetime(2026, 3, 8, 7, 59, tzinfo=UTC))
-    after_transition = classify_session(datetime(2026, 3, 8, 8, 0, tzinfo=UTC))
-    new_trading_day = classify_session(datetime(2026, 3, 8, 23, 0, tzinfo=UTC))
-
-    assert before_transition.local_ts.utcoffset() == timedelta(hours=-6)
-    assert after_transition.local_ts.utcoffset() == timedelta(hours=-5)
-    assert new_trading_day.session == SessionName.ASIA
-    assert new_trading_day.trading_day.isoformat() == "2026-03-09"
-
-
-def test_session_calendar_is_dst_aware_around_fall_repeated_hour() -> None:
-    first_repeated_hour = classify_session(datetime(2026, 11, 1, 6, 30, tzinfo=UTC))
-    second_repeated_hour = classify_session(datetime(2026, 11, 1, 7, 30, tzinfo=UTC))
-    new_trading_day = classify_session(datetime(2026, 11, 2, 0, 0, tzinfo=UTC))
-
-    assert first_repeated_hour.local_ts.hour == 1
-    assert first_repeated_hour.local_ts.utcoffset() == timedelta(hours=-5)
-    assert first_repeated_hour.session == SessionName.ASIA
-    assert first_repeated_hour.trading_day.isoformat() == "2026-11-01"
-    assert second_repeated_hour.local_ts.hour == 1
-    assert second_repeated_hour.local_ts.utcoffset() == timedelta(hours=-6)
-    assert second_repeated_hour.session == SessionName.ASIA
-    assert second_repeated_hour.trading_day.isoformat() == "2026-11-01"
-    assert new_trading_day.session == SessionName.ASIA
-    assert new_trading_day.trading_day.isoformat() == "2026-11-02"
-
-
-def test_cached_session_classifier_preserves_minute_boundary_semantics() -> None:
-    classifier = SessionClassifier()
-
-    asia = classifier.classify(datetime(2026, 1, 5, 7, 59, 59, tzinfo=UTC))
-    london = classifier.classify(datetime(2026, 1, 5, 8, 0, tzinfo=UTC))
-
-    assert asia == (datetime(2026, 1, 5, tzinfo=UTC).date(), SessionName.ASIA)
-    assert london == (datetime(2026, 1, 5, tzinfo=UTC).date(), SessionName.LONDON)

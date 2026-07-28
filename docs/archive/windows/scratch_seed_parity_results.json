@@ -1,0 +1,487 @@
+[
+  {
+    "probe_day": "2026-02-18",
+    "in_store": true,
+    "ql_all_store": {
+      "seed_day": "2026-02-17",
+      "high_pts": 24889.75,
+      "low_pts": 24449.25,
+      "high_ticks": 99559,
+      "low_ticks": 97797,
+      "walked": [
+        {
+          "day": "2026-02-17",
+          "result": [
+            24889.75,
+            24449.25
+          ],
+          "secs": 1.1
+        }
+      ]
+    },
+    "ql_d036_window": {
+      "seed_day": "N/A (outside D-036 window)"
+    },
+    "tl_dashboard_replay": "UNSEEDED (recon section 1: no seed call on the path)",
+    "ground_truth": {
+      "gt_day": "2026-02-17",
+      "high_ticks": 99559,
+      "low_ticks": 97797,
+      "n_trades": 437324,
+      "candidates": [
+        {
+          "day": "2026-02-17",
+          "n_trades": 437324,
+          "high_ticks": 99559,
+          "low_ticks": 97797,
+          "warnings": [],
+          "n_warnings": 0,
+          "secs": 46.4
+        }
+      ]
+    },
+    "reader_xcheck_pyarrow": {
+      "day": "2026-02-17",
+      "n_trades": 437324,
+      "front_symbol": "NQH6",
+      "front_instrument_id": 42002475,
+      "instrument_trade_counts": {
+        "42002475": 437324,
+        "42004058": 1940,
+        "42004177": 17
+      },
+      "high_ticks": 99559,
+      "low_ticks": 97797
+    },
+    "tl_live_key_day": "2026-02-17",
+    "ql_vs_gt": "GREEN (same day, tick-exact)",
+    "ql_d036_vs_gt": "N/A"
+  },
+  {
+    "probe_day": "2026-02-17",
+    "in_store": true,
+    "ql_all_store": {
+      "seed_day": "2026-02-16",
+      "high_pts": 24922.25,
+      "low_pts": 24670.75,
+      "high_ticks": 99689,
+      "low_ticks": 98683,
+      "walked": [
+        {
+          "day": "2026-02-16",
+          "result": [
+            24922.25,
+            24670.75
+          ],
+          "secs": 0.2
+        }
+      ]
+    },
+    "ql_d036_window": {
+      "seed_day": "N/A (outside D-036 window)"
+    },
+    "tl_dashboard_replay": "UNSEEDED (recon section 1: no seed call on the path)",
+    "ground_truth": {
+      "gt_day": "2026-02-16",
+      "high_ticks": 99689,
+      "low_ticks": 98683,
+      "n_trades": 78527,
+      "candidates": [
+        {
+          "day": "2026-02-16",
+          "n_trades": 78527,
+          "high_ticks": 99689,
+          "low_ticks": 98683,
+          "warnings": [],
+          "n_warnings": 0,
+          "secs": 7.9
+        }
+      ]
+    },
+    "reader_xcheck_pyarrow": {
+      "day": "2026-02-16",
+      "n_trades": 78527,
+      "front_symbol": "NQH6",
+      "front_instrument_id": 42002475,
+      "instrument_trade_counts": {
+        "42002475": 78527,
+        "42004058": 235
+      },
+      "high_ticks": 99689,
+      "low_ticks": 98683
+    },
+    "tl_live_key_day": "2026-02-16",
+    "ql_vs_gt": "GREEN (same day, tick-exact)",
+    "ql_d036_vs_gt": "N/A"
+  },
+  {
+    "probe_day": "2026-01-20",
+    "in_store": true,
+    "ql_all_store": {
+      "seed_day": "2026-01-19",
+      "high_pts": 25472.0,
+      "low_pts": 25236.5,
+      "high_ticks": 101888,
+      "low_ticks": 100946,
+      "walked": [
+        {
+          "day": "2026-01-19",
+          "result": [
+            25472.0,
+            25236.5
+          ],
+          "secs": 0.3
+        }
+      ]
+    },
+    "ql_d036_window": {
+      "seed_day": "2026-01-19",
+      "high_pts": 25472.0,
+      "low_pts": 25236.5,
+      "high_ticks": 101888,
+      "low_ticks": 100946,
+      "walked": [
+        {
+          "day": "2026-01-19",
+          "result": [
+            25472.0,
+            25236.5
+          ],
+          "secs": 0.2
+        }
+      ]
+    },
+    "tl_dashboard_replay": "UNSEEDED (recon section 1: no seed call on the path)",
+    "ground_truth": {
+      "gt_day": "2026-01-19",
+      "high_ticks": 101888,
+      "low_ticks": 100946,
+      "n_trades": 118945,
+      "candidates": [
+        {
+          "day": "2026-01-19",
+          "n_trades": 118945,
+          "high_ticks": 101888,
+          "low_ticks": 100946,
+          "warnings": [],
+          "n_warnings": 0,
+          "secs": 10.7
+        }
+      ]
+    },
+    "reader_xcheck_pyarrow": {
+      "day": "2026-01-19",
+      "n_trades": 118945,
+      "front_symbol": "NQH6",
+      "front_instrument_id": 42002475,
+      "instrument_trade_counts": {
+        "42002475": 118945,
+        "42004058": 335,
+        "42004177": 2
+      },
+      "high_ticks": 101888,
+      "low_ticks": 100946
+    },
+    "tl_live_key_day": "2026-01-19",
+    "ql_vs_gt": "GREEN (same day, tick-exact)",
+    "ql_d036_vs_gt": "GREEN (same day, tick-exact)"
+  },
+  {
+    "probe_day": "2026-01-12",
+    "in_store": true,
+    "ql_all_store": {
+      "seed_day": "2026-01-09",
+      "high_pts": 25985.5,
+      "low_pts": 25615.5,
+      "high_ticks": 103942,
+      "low_ticks": 102462,
+      "walked": [
+        {
+          "day": "2026-01-11",
+          "result": null,
+          "secs": 0.0
+        },
+        {
+          "day": "2026-01-09",
+          "result": [
+            25985.5,
+            25615.5
+          ],
+          "secs": 0.8
+        }
+      ]
+    },
+    "ql_d036_window": {
+      "seed_day": "2026-01-09",
+      "high_pts": 25985.5,
+      "low_pts": 25615.5,
+      "high_ticks": 103942,
+      "low_ticks": 102462,
+      "walked": [
+        {
+          "day": "2026-01-11",
+          "result": null,
+          "secs": 0.0
+        },
+        {
+          "day": "2026-01-09",
+          "result": [
+            25985.5,
+            25615.5
+          ],
+          "secs": 0.8
+        }
+      ]
+    },
+    "tl_dashboard_replay": "UNSEEDED (recon section 1: no seed call on the path)",
+    "ground_truth": {
+      "gt_day": "2026-01-09",
+      "high_ticks": 103942,
+      "low_ticks": 102462,
+      "n_trades": 327486,
+      "candidates": [
+        {
+          "day": "2026-01-11",
+          "n_trades": 0,
+          "high_ticks": null,
+          "low_ticks": null,
+          "warnings": [
+            "missing_prior_day_file"
+          ],
+          "n_warnings": 1,
+          "secs": 0.2
+        },
+        {
+          "day": "2026-01-09",
+          "n_trades": 327486,
+          "high_ticks": 103942,
+          "low_ticks": 102462,
+          "warnings": [],
+          "n_warnings": 0,
+          "secs": 31.5
+        }
+      ]
+    },
+    "reader_xcheck_pyarrow": {
+      "day": "2026-01-09",
+      "n_trades": 327486,
+      "front_symbol": "NQH6",
+      "front_instrument_id": 42002475,
+      "instrument_trade_counts": {
+        "42002475": 327486,
+        "42004058": 257
+      },
+      "high_ticks": 103942,
+      "low_ticks": 102462
+    },
+    "tl_live_key_day": "2026-01-09",
+    "ql_vs_gt": "GREEN (same day, tick-exact)",
+    "ql_d036_vs_gt": "GREEN (same day, tick-exact)"
+  },
+  {
+    "probe_day": "2025-12-26",
+    "in_store": true,
+    "ql_all_store": {
+      "seed_day": "2025-12-24",
+      "high_pts": 25892.0,
+      "low_pts": 25777.5,
+      "high_ticks": 103568,
+      "low_ticks": 103110,
+      "walked": [
+        {
+          "day": "2025-12-25",
+          "result": null,
+          "secs": 0.1
+        },
+        {
+          "day": "2025-12-24",
+          "result": [
+            25892.0,
+            25777.5
+          ],
+          "secs": 0.4
+        }
+      ]
+    },
+    "ql_d036_window": {
+      "seed_day": "2025-12-24",
+      "high_pts": 25892.0,
+      "low_pts": 25777.5,
+      "high_ticks": 103568,
+      "low_ticks": 103110,
+      "walked": [
+        {
+          "day": "2025-12-25",
+          "result": null,
+          "secs": 0.1
+        },
+        {
+          "day": "2025-12-24",
+          "result": [
+            25892.0,
+            25777.5
+          ],
+          "secs": 0.4
+        }
+      ]
+    },
+    "tl_dashboard_replay": "UNSEEDED (recon section 1: no seed call on the path)",
+    "ground_truth": {
+      "gt_day": "2025-12-24",
+      "high_ticks": 103568,
+      "low_ticks": 103110,
+      "n_trades": 101451,
+      "candidates": [
+        {
+          "day": "2025-12-25",
+          "n_trades": 0,
+          "high_ticks": null,
+          "low_ticks": null,
+          "warnings": [],
+          "n_warnings": 0,
+          "secs": 0.1
+        },
+        {
+          "day": "2025-12-24",
+          "n_trades": 101451,
+          "high_ticks": 103568,
+          "low_ticks": 103110,
+          "warnings": [],
+          "n_warnings": 0,
+          "secs": 9.4
+        }
+      ]
+    },
+    "reader_xcheck_pyarrow": {
+      "day": "2025-12-24",
+      "n_trades": 101451,
+      "front_symbol": "NQH6",
+      "front_instrument_id": 42002475,
+      "instrument_trade_counts": {
+        "42002475": 101451,
+        "42004058": 67
+      },
+      "high_ticks": 103568,
+      "low_ticks": 103110
+    },
+    "tl_live_key_day": "2025-12-25",
+    "ql_vs_gt": "GREEN (same day, tick-exact)",
+    "ql_d036_vs_gt": "GREEN (same day, tick-exact)"
+  },
+  {
+    "probe_day": "2025-11-21",
+    "in_store": true,
+    "ql_all_store": {
+      "seed_day": "2025-11-19",
+      "high_pts": 24988.0,
+      "low_pts": 24445.0,
+      "high_ticks": 99952,
+      "low_ticks": 97780,
+      "walked": [
+        {
+          "day": "2025-11-19",
+          "result": [
+            24988.0,
+            24445.0
+          ],
+          "secs": 1.8
+        }
+      ]
+    },
+    "ql_d036_window": {
+      "seed_day": null,
+      "walked": []
+    },
+    "tl_dashboard_replay": "UNSEEDED (recon section 1: no seed call on the path)",
+    "ground_truth": {
+      "gt_day": "2025-11-19",
+      "high_ticks": 99952,
+      "low_ticks": 97780,
+      "n_trades": 535784,
+      "candidates": [
+        {
+          "day": "2025-11-19",
+          "n_trades": 535784,
+          "high_ticks": 99952,
+          "low_ticks": 97780,
+          "warnings": [],
+          "n_warnings": 0,
+          "secs": 57.5
+        }
+      ]
+    },
+    "reader_xcheck_pyarrow": {
+      "day": "2025-11-19",
+      "n_trades": 535784,
+      "front_symbol": "NQZ5",
+      "front_instrument_id": 158704,
+      "instrument_trade_counts": {
+        "158704": 535784,
+        "42002475": 741,
+        "42004058": 15
+      },
+      "high_ticks": 99952,
+      "low_ticks": 97780
+    },
+    "tl_live_key_day": "2025-11-20",
+    "ql_vs_gt": "GREEN (same day, tick-exact)",
+    "ql_d036_vs_gt": "ABSENCE (cold start: no prior day in window)"
+  },
+  {
+    "probe_day": "2025-07-15",
+    "in_store": true,
+    "ql_all_store": {
+      "seed_day": "2025-07-14",
+      "high_pts": 23066.5,
+      "low_pts": 22803.0,
+      "high_ticks": 92266,
+      "low_ticks": 91212,
+      "walked": [
+        {
+          "day": "2025-07-14",
+          "result": [
+            23066.5,
+            22803.0
+          ],
+          "secs": 0.3
+        }
+      ]
+    },
+    "ql_d036_window": {
+      "seed_day": "N/A (outside D-036 window)"
+    },
+    "tl_dashboard_replay": "UNSEEDED (recon section 1: no seed call on the path)",
+    "ground_truth": {
+      "gt_day": "2025-07-14",
+      "high_ticks": 92266,
+      "low_ticks": 91212,
+      "n_trades": 263663,
+      "candidates": [
+        {
+          "day": "2025-07-14",
+          "n_trades": 263663,
+          "high_ticks": 92266,
+          "low_ticks": 91212,
+          "warnings": [],
+          "n_warnings": 0,
+          "secs": 15.3
+        }
+      ]
+    },
+    "reader_xcheck_pyarrow": {
+      "day": "2025-07-14",
+      "n_trades": 263663,
+      "front_symbol": "NQU5",
+      "front_instrument_id": 42008487,
+      "instrument_trade_counts": {
+        "158704": 244,
+        "42008487": 263663
+      },
+      "high_ticks": 92266,
+      "low_ticks": 91212
+    },
+    "tl_live_key_day": "2025-07-14",
+    "ql_vs_gt": "GREEN (same day, tick-exact)",
+    "ql_d036_vs_gt": "N/A"
+  }
+]

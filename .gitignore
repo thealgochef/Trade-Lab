@@ -70,3 +70,14 @@ Thumbs.db
 # Window recon/diff scratch artifacts at the repo root (review deliverables, never committed)
 /VIZ_RECON.md
 /*_DIFF.txt
+
+# (2026-07 cleanup) widened window-artifact patterns; archived copies live under docs/archive/windows/
+/*_DIFF*.txt
+/backend/*_DIFF*.txt
+/*_RECON.md
+/*.zip
+/scratch_*
+*.out
+/.claude/scheduled_tasks.lock
+/.claude/worktrees/
+/*_REVIEW.txt

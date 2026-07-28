@@ -1,0 +1,564 @@
+﻿commit 9b00eb57a21025d60d5767fa17428cb9dcb51986
+Author: algochef <gonzalezlg020@gmail.com>
+Date:   Wed Jun 10 18:13:20 2026 -0500
+
+    E1/E2: platform-version hook + registry router gate at both entries
+    
+    model_registry.py - both entries mirror the engine-hook precedent (D-C1a):
+    discovery _describe_bundle and activation _load_contract pass
+    expected_platform_version=PLATFORM_VERSION. NEW _strategy_binding_error
+    (module-level, shared by both entries): (i) get_strategy(contract.strategy_id)
+    - TL's first, intended import of the SC strategy registry (with the explicit
+    touch_reversal registration import; the registry is empty on a bare import);
+    (ii) plugin.strategy_version == contract.strategy_version; (iii)
+    contract.supported_by_runtime is True. Discovery: any failure -> bundle
+    skipped with a precise warning, same as the platform hook. Activation:
+    between contract load and model load, each failure -> ModelValidationError;
+    plus check (iv) - NEW ModelRegistry(serving_strategy_id=...) ctor param
+    (production app.py passes the runtime service's wired plugin id): a contract
+    routed to ANY other strategy is refused. The hardcoded touch_reversal wiring
+    stays, now guarded instead of implicit.
+    
+    inference_engine.py: Prediction.contract_id stamps the registry's ACTIVE
+    BUNDLE id (active.model_id, the dir name) instead of contract.strategy_id -
+    the contract field is now the shared router key, so the per-bundle stamp
+    moves source; observed values byte-compatible with pre-E (the contract used
+    to restate the bundle name); pinned by test (stamp == activated bundle name).
+    
+    strategy_core_service.py: property engine_version -> platform_version; report
+    metadata key strategy_core_engine_version -> strategy_core_platform_version
+    (BOTH sites: the snapshot metadata and the feed-status mapper); NEW
+    plugin_strategy_id / plugin_strategy_version properties exposing the wired
+    plugin's identity (feeds check iv).
+    
+    tests (every assertion change enumerated in the window report):
+    fixtures/strategy.json -> v2 shape (contract v2, platform_v1, strategy_id
+    touch_reversal + strategy_version 1; mid_price_source top_of_book ->
+    trade_price closing the recon-flagged fixture drift; supported_by_runtime
+    stays true). test_engine_version_binding.py -> git mv
+    test_platform_version_binding.py, rewritten to the platform axis + 5 NEW
+    negatives: v1 contract rejected on contract_version; unknown strategy_id
+    rejected at discovery AND activation; strategy_version mismatch rejected at
+    both; supported_by_runtime=false rejected at both; serving-id guard refuses
+    foreign routing. test_strategy_contract.py: the unsupported-version literal
+    flips v2 -> v1 (v2 is now the supported shape). test_inference_engine.py: the
+    contract_id assertion pins the bundle name ("good-model") instead of
+    startswith("NQ_"). test_strategy_core_dependency.py: imports/asserts
+    PLATFORM_VERSION.
+    
+    NOTE (UI-visible value change, shape unchanged): ModelStatus/ModelBundle
+    strategy_id DTO VALUES become "touch_reversal" for every migrated bundle
+    post-migration (previously the bundle dir name); the per-bundle identity
+    remains model_id.
+    
+    Gates on this tree (editable SC @ E1 8e5c017): TL suite 424 (= 419 baseline
+    + 5 new gate negatives); seam-by-name 4 (acceptance 3 incl. D2 guard +
+    replay 1); ruff clean; frontend UNTOUCHED (zero frontend diffs). REAL-BUNDLE
+    GATE (post-migration store): discovery lists EXACTLY the 3 migrated v3
+    bundles; all 3 activate end-to-end incl. hot-swap through the
+    serving-guard registry; an un-migrated .bak copy rejected on
+    contract_version; output in the window report.
+    
+    Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+diff --git a/backend/src/trade_lab/api/app.py b/backend/src/trade_lab/api/app.py
+index aaf4080..5c06023 100644
+--- a/backend/src/trade_lab/api/app.py
++++ b/backend/src/trade_lab/api/app.py
+@@ -228,7 +228,12 @@ def create_app(
+     # invokes inference on completed observations only once an operator activates a
+     # model (Stage 5). No model is active by default, so the runtime just serves
+     # market data until then.
+-    model_registry = ModelRegistry(settings.models_path)
++    model_registry = ModelRegistry(
++        settings.models_path,
++        # E2 check (iv): activation refuses contracts routed to any strategy other
++        # than the one the runtime's wired plugin actually serves.
++        serving_strategy_id=runtime.strategy_core_service.plugin_strategy_id,
++    )
+     inference_engine = InferenceEngine(model_registry)
+     runtime.set_inference_engine(inference_engine)
+     app.state.model_registry = model_registry
+diff --git a/backend/src/trade_lab/services/inference/inference_engine.py b/backend/src/trade_lab/services/inference/inference_engine.py
+index eb7d596..49a0524 100644
+--- a/backend/src/trade_lab/services/inference/inference_engine.py
++++ b/backend/src/trade_lab/services/inference/inference_engine.py
+@@ -206,7 +206,11 @@ class InferenceEngine:
+             session=session,
+             is_eligible=is_eligible,
+             model_id=active.model_id,
+-            contract_id=contract.strategy_id,
++            # E2: contract.strategy_id is now the registry ROUTER key (identical
++            # across bundles), so the per-bundle stamp moves to the ACTIVE BUNDLE
++            # id (the dir name) — byte-compatible with pre-E observed values,
++            # where the contract restated the bundle name.
++            contract_id=active.model_id,
+             nan_count=nan_count,
+         )
+ 
+diff --git a/backend/src/trade_lab/services/model_registry.py b/backend/src/trade_lab/services/model_registry.py
+index d1005f9..fa5a0cf 100644
+--- a/backend/src/trade_lab/services/model_registry.py
++++ b/backend/src/trade_lab/services/model_registry.py
+@@ -23,7 +23,12 @@ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Any
+ 
+-from strategy_core import ENGINE_VERSION, ContractError, StrategyContract, load_strategy_contract
++# E2: the explicit registration import — the registry is empty on a bare
++# `import strategy_core`; routing needs the production plugin registered. This is
++# TL's first (intended) import of the strategy registry.
++import strategy_core.strategies.touch_reversal  # noqa: F401
++from strategy_core import PLATFORM_VERSION, ContractError, StrategyContract, load_strategy_contract
++from strategy_core.strategies.registry import get_strategy
+ 
+ if TYPE_CHECKING:
+     from catboost import CatBoostClassifier
+@@ -132,11 +137,18 @@ def _describe_bundle(directory: Path, model_id: str) -> ModelBundle | None:
+         return None
+ 
+     try:
+-        contract = load_strategy_contract(strategy_file, expected_engine_version=ENGINE_VERSION)
++        contract = load_strategy_contract(strategy_file, expected_platform_version=PLATFORM_VERSION)
+     except ContractError as exc:
+         logger.warning("ignored model bundle with invalid strategy contract: %s", exc)
+         return None
+ 
++    # E2: the strategy axis gates discovery exactly like the platform hook —
++    # an unroutable/mismatched/unservable bundle is skipped with a warning.
++    binding_error = _strategy_binding_error(contract)
++    if binding_error is not None:
++        logger.warning("ignored model bundle: %s", binding_error)
++        return None
++
+     validation_ok, validation_detail = _validate_against_metadata(metadata_file, contract)
+ 
+     return ModelBundle(
+@@ -152,6 +164,31 @@ def _describe_bundle(directory: Path, model_id: str) -> ModelBundle | None:
+     )
+ 
+ 
++def _strategy_binding_error(contract: StrategyContract) -> str | None:
++    """E2 router gate: resolve + equality-check the contract's strategy axis.
++
++    Returns a precise, path-free error string when the contract (i) names a
++    ``strategy_id`` unknown to the SC registry, (ii) carries a
++    ``strategy_version`` that mismatches the registered plugin's declared
++    version, or (iii) declares itself unservable; ``None`` when the binding
++    holds. Callers fail closed (discovery skips; activation raises).
++    """
++
++    try:
++        plugin_cls = get_strategy(contract.strategy_id)
++    except ContractError as exc:
++        return str(exc)
++    if plugin_cls.strategy_version != contract.strategy_version:
++        return (
++            f"strategy_version mismatch for {contract.strategy_id!r}: contract declares "
++            f"{contract.strategy_version!r} but the registered plugin is "
++            f"{plugin_cls.strategy_version!r}"
++        )
++    if contract.supported_by_runtime is not True:
++        return "contract declares supported_by_runtime=false; the bundle is not servable"
++    return None
++
++
+ def _validate_against_metadata(metadata_file: Path, contract) -> tuple[bool, str]:
+     """Cross-check the contract's feature set against ``metadata.json``.
+ 
+@@ -215,8 +252,14 @@ class ModelRegistry:
+     model descriptor.
+     """
+ 
+-    def __init__(self, models_path: Path | None) -> None:
++    def __init__(
++        self, models_path: Path | None, *, serving_strategy_id: str | None = None
++    ) -> None:
++        # E2 check (iv): the running service's wired plugin id. When supplied,
++        # activation refuses a contract routed to ANY other strategy — the
++        # hardcoded touch_reversal wiring stays, now guarded instead of implicit.
+         self._models_path = models_path
++        self._serving_strategy_id = serving_strategy_id
+         self._lock = threading.RLock()
+         self._active: ActiveModel | None = None
+ 
+@@ -248,6 +291,21 @@ class ModelRegistry:
+             raise ModelNotFoundError("unknown model id")
+         directory = self._resolve_bundle_dir(model_id)
+         contract = self._load_contract(directory)
++        # E2 router gate (between contract load and model load), fail-closed:
++        # (i) strategy_id resolves in the SC registry, (ii) strategy_version
++        # equals the registered plugin's, (iii) the bundle is servable, and
++        # (iv) the contract routes to the strategy this service actually runs.
++        binding_error = _strategy_binding_error(contract)
++        if binding_error is not None:
++            raise ModelValidationError(binding_error)
++        if (
++            self._serving_strategy_id is not None
++            and contract.strategy_id != self._serving_strategy_id
++        ):
++            raise ModelValidationError(
++                f"contract strategy_id {contract.strategy_id!r} does not match the "
++                f"running service's plugin {self._serving_strategy_id!r}"
++            )
+         model = self._load_and_validate_model(directory, contract)
+         active = ActiveModel(model_id=model_id, model=model, contract=contract)
+         with self._lock:
+@@ -284,7 +342,7 @@ class ModelRegistry:
+     def _load_contract(directory: Path) -> StrategyContract:
+         try:
+             return load_strategy_contract(
+-                directory / STRATEGY_FILE, expected_engine_version=ENGINE_VERSION
++                directory / STRATEGY_FILE, expected_platform_version=PLATFORM_VERSION
+             )
+         except ContractError as exc:
+             raise ModelValidationError(f"invalid strategy contract: {exc}") from exc
+diff --git a/backend/src/trade_lab/services/strategy_core_service.py b/backend/src/trade_lab/services/strategy_core_service.py
+index b48e89d..1f2027b 100644
+--- a/backend/src/trade_lab/services/strategy_core_service.py
++++ b/backend/src/trade_lab/services/strategy_core_service.py
+@@ -119,8 +119,20 @@ class StrategyCoreService:
+         self._touch_sequence: dict[tuple[date, str], int] = {}
+ 
+     @property
+-    def engine_version(self) -> str:
+-        return strategy_core.ENGINE_VERSION
++    def platform_version(self) -> str:
++        return strategy_core.PLATFORM_VERSION
++
++    @property
++    def plugin_strategy_id(self) -> str:
++        """The wired plugin's registry id (E2: activation guards contracts against it)."""
++
++        return self._runtime._plugin.strategy_id
++
++    @property
++    def plugin_strategy_version(self) -> str:
++        """The wired plugin's declared strategy_version (the E2 strategy axis)."""
++
++        return self._runtime._plugin.strategy_version
+ 
+     def reset(self, *, requested_symbol: str | None = None) -> StrategyCoreUpdate:
+         if requested_symbol is not None:
+@@ -223,7 +235,7 @@ class StrategyCoreService:
+             session=snapshot.session,
+             trading_day=snapshot.trading_day,
+             metadata=MappingProxyType(
+-                {"strategy_core_engine_version": strategy_core.ENGINE_VERSION}
++                {"strategy_core_platform_version": strategy_core.PLATFORM_VERSION}
+             ),
+         )
+ 
+@@ -379,6 +391,6 @@ def _feed_status_to_trade_lab(
+         last_message=status.last_message,
+         metadata={
+             **dict(status.metadata),
+-            "strategy_core_engine_version": strategy_core.ENGINE_VERSION,
++            "strategy_core_platform_version": strategy_core.PLATFORM_VERSION,
+         },
+     )
+diff --git a/backend/tests/fixtures/strategy.json b/backend/tests/fixtures/strategy.json
+index 6da579d..64938ba 100644
+--- a/backend/tests/fixtures/strategy.json
++++ b/backend/tests/fixtures/strategy.json
+@@ -1,7 +1,8 @@
+ {
+-  "contract_version": "trade_lab_contract_v1",
+-  "engine_version": "strategy_core_engine_v3",
+-  "strategy_id": "NQ_20260405_147t_5m_30m_multiclass-250602-260220-iterations800_depth4",
++  "contract_version": "trade_lab_contract_v2",
++  "platform_version": "strategy_core_platform_v1",
++  "strategy_id": "touch_reversal",
++  "strategy_version": "1",
+   "training_mode": "dashboard_utility",
+   "supported_by_runtime": true,
+   "instrument": "NQ",
+@@ -87,7 +88,7 @@
+     "within_band_pts": 2.0,
+     "level_proximity_pts": 0.5,
+     "large_trade_threshold": 10,
+-    "mid_price_source": "top_of_book"
++    "mid_price_source": "trade_price"
+   },
+   "label_policy": {
+     "resolution": "mae_first",
+diff --git a/backend/tests/test_engine_version_binding.py b/backend/tests/test_engine_version_binding.py
+deleted file mode 100644
+index d0878ae..0000000
+--- a/backend/tests/test_engine_version_binding.py
++++ /dev/null
+@@ -1,62 +0,0 @@
+-"""Regression coverage for the engine_version fail-closed gate.
+-
+-TL loads contracts through SC's ``load_strategy_contract`` with the
+-``expected_engine_version=ENGINE_VERSION`` hook — the exact call shape used by
+-``model_registry`` at both its loader entries (discovery and activation). A
+-contract that declares a mismatched engine_version OR omits the field entirely
+-must be rejected fail-closed; only a matching one loads. The old local loader's
+-legacy loads-unbound path (no engine_version -> load with a warning) is retired.
+-These mirror the contract-loading style in ``test_strategy_contract.py`` (read
+-the real fixture, mutate, write to tmp_path).
+-"""
+-
+-import json
+-from pathlib import Path
+-
+-import pytest
+-import strategy_core
+-from strategy_core import ContractError, StrategyContract, load_strategy_contract
+-
+-_FIXTURE_STRATEGY = Path(__file__).parent / "fixtures" / "strategy.json"
+-
+-
+-def _load_real_payload() -> dict[str, object]:
+-    return json.loads(_FIXTURE_STRATEGY.read_text(encoding="utf-8"))
+-
+-
+-def _write_strategy(path: Path, payload: dict[str, object]) -> None:
+-    path.write_text(json.dumps(payload), encoding="utf-8")
+-
+-
+-def test_matching_engine_version_loads(tmp_path: Path) -> None:
+-    payload = _load_real_payload()
+-    payload["engine_version"] = strategy_core.ENGINE_VERSION
+-    target = tmp_path / "strategy.json"
+-    _write_strategy(target, payload)
+-
+-    contract = load_strategy_contract(
+-        target, expected_engine_version=strategy_core.ENGINE_VERSION
+-    )
+-
+-    assert isinstance(contract, StrategyContract)
+-    assert contract.engine_version == strategy_core.ENGINE_VERSION
+-
+-
+-def test_mismatched_engine_version_fails_closed(tmp_path: Path) -> None:
+-    payload = _load_real_payload()
+-    payload["engine_version"] = "strategy_core_engine_v2"
+-    target = tmp_path / "strategy.json"
+-    _write_strategy(target, payload)
+-
+-    with pytest.raises(ContractError, match="engine_version"):
+-        load_strategy_contract(target, expected_engine_version=strategy_core.ENGINE_VERSION)
+-
+-
+-def test_absent_engine_version_fails_closed(tmp_path: Path) -> None:
+-    payload = _load_real_payload()
+-    payload.pop("engine_version", None)
+-    target = tmp_path / "strategy.json"
+-    _write_strategy(target, payload)
+-
+-    with pytest.raises(ContractError, match="engine_version"):
+-        load_strategy_contract(target, expected_engine_version=strategy_core.ENGINE_VERSION)
+diff --git a/backend/tests/test_inference_engine.py b/backend/tests/test_inference_engine.py
+index 62162fa..99bbbdf 100644
+--- a/backend/tests/test_inference_engine.py
++++ b/backend/tests/test_inference_engine.py
+@@ -273,7 +273,9 @@ def test_prediction_is_deterministic_and_well_formed(tmp_path: Path) -> None:
+     assert first.probabilities[first.predicted_class] == max(first.probabilities.values())
+     assert abs(sum(first.probabilities.values()) - 1.0) < 1e-6
+     assert set(first.feature_values) == set(_CONTRACT_FEATURES)
+-    assert first.contract_id.startswith("NQ_")
++    # E2: the per-bundle stamp is the ACTIVE BUNDLE id (the dir name) — the
++    # contract's strategy_id is now the shared registry router key.
++    assert first.contract_id == "good-model"
+     assert first.model_id == "good-model"
+     assert first.direction == "long"  # ny_low -> touched from above -> long reversal
+     assert first.nan_count == 0
+diff --git a/backend/tests/test_platform_version_binding.py b/backend/tests/test_platform_version_binding.py
+new file mode 100644
+index 0000000..06f043a
+--- /dev/null
++++ b/backend/tests/test_platform_version_binding.py
+@@ -0,0 +1,165 @@
++"""Regression coverage for the two-axis fail-closed gates (E1/E2).
++
++TL loads contracts through SC's ``load_strategy_contract`` with the
++``expected_platform_version=PLATFORM_VERSION`` hook — the exact call shape used
++by ``model_registry`` at both its loader entries (discovery and activation). A
++contract that declares a mismatched platform_version OR omits the field must be
++rejected fail-closed; only a matching one loads. On top of the platform axis,
++the E2 strategy-axis gate (``_strategy_binding_error`` + the serving-id check)
++rejects unknown strategy_ids, strategy_version mismatches, and unservable
++bundles at BOTH discovery and activation; a pre-migration v1 contract dies at
++the contract_version check. These mirror the contract-loading style in
++``test_strategy_contract.py`` (read the real fixture, mutate, write to
++tmp_path).
++"""
++
++import json
++import logging
++from pathlib import Path
++
++import pytest
++import strategy_core
++from strategy_core import ContractError, StrategyContract, load_strategy_contract
++
++from trade_lab.services.model_registry import (
++    ModelRegistry,
++    ModelValidationError,
++    discover_model_bundles,
++)
++
++_FIXTURE_STRATEGY = Path(__file__).parent / "fixtures" / "strategy.json"
++
++
++def _load_real_payload() -> dict[str, object]:
++    return json.loads(_FIXTURE_STRATEGY.read_text(encoding="utf-8"))
++
++
++def _write_strategy(path: Path, payload: dict[str, object]) -> None:
++    path.write_text(json.dumps(payload), encoding="utf-8")
++
++
++def _write_bundle_dir(root: Path, name: str, payload: dict[str, object]) -> Path:
++    """A minimal on-disk bundle: real strategy.json + stub model/metadata files.
++
++    The stub model.cbm is enough for DISCOVERY (which never opens the binary)
++    and for ACTIVATION's strategy gate (which fires BEFORE the model load).
++    """
++
++    bundle = root / name
++    bundle.mkdir()
++    _write_strategy(bundle / "strategy.json", payload)
++    (bundle / "model.cbm").write_bytes(b"stub")
++    (bundle / "metadata.json").write_text(
++        json.dumps({"selected_features": list(payload["feature_set"]["names"])}),  # type: ignore[index]
++        encoding="utf-8",
++    )
++    return bundle
++
++
++# ── E1: the platform axis (loader hook) ─────────────────────────────────────
++
++
++def test_matching_platform_version_loads(tmp_path: Path) -> None:
++    payload = _load_real_payload()
++    payload["platform_version"] = strategy_core.PLATFORM_VERSION
++    target = tmp_path / "strategy.json"
++    _write_strategy(target, payload)
++
++    contract = load_strategy_contract(
++        target, expected_platform_version=strategy_core.PLATFORM_VERSION
++    )
++
++    assert isinstance(contract, StrategyContract)
++    assert contract.platform_version == strategy_core.PLATFORM_VERSION
++    assert contract.strategy_version == "1"
++
++
++def test_mismatched_platform_version_fails_closed(tmp_path: Path) -> None:
++    payload = _load_real_payload()
++    payload["platform_version"] = "strategy_core_engine_v3"  # the retired axis literal
++    target = tmp_path / "strategy.json"
++    _write_strategy(target, payload)
++
++    with pytest.raises(ContractError, match="platform_version"):
++        load_strategy_contract(target, expected_platform_version=strategy_core.PLATFORM_VERSION)
++
++
++def test_absent_platform_version_fails_closed(tmp_path: Path) -> None:
++    payload = _load_real_payload()
++    payload.pop("platform_version", None)
++    target = tmp_path / "strategy.json"
++    _write_strategy(target, payload)
++
++    with pytest.raises(ContractError, match="platform_version"):
++        load_strategy_contract(target, expected_platform_version=strategy_core.PLATFORM_VERSION)
++
++
++def test_v1_contract_rejected_on_contract_version(tmp_path: Path) -> None:
++    # A pre-migration bundle dies at the FIRST loader check, before the platform
++    # hook or any shape complaint.
++    payload = _load_real_payload()
++    payload["contract_version"] = "trade_lab_contract_v1"
++    target = tmp_path / "strategy.json"
++    _write_strategy(target, payload)
++
++    with pytest.raises(ContractError, match="unsupported contract_version"):
++        load_strategy_contract(target, expected_platform_version=strategy_core.PLATFORM_VERSION)
++
++
++# ── E2: the strategy axis (registry router gate, BOTH entries) ──────────────
++
++
++def test_unknown_strategy_id_rejected_at_discovery_and_activation(
++    tmp_path: Path, caplog: pytest.LogCaptureFixture
++) -> None:
++    payload = _load_real_payload()
++    payload["strategy_id"] = "not_a_registered_strategy"
++    _write_bundle_dir(tmp_path, "bundle-x", payload)
++
++    with caplog.at_level(logging.WARNING):
++        assert discover_model_bundles(tmp_path) == []
++    assert any("unknown strategy_id" in r.getMessage() for r in caplog.records)
++
++    with pytest.raises(ModelValidationError, match="unknown strategy_id"):
++        ModelRegistry(tmp_path).activate("bundle-x")
++
++
++def test_strategy_version_mismatch_rejected_at_discovery_and_activation(
++    tmp_path: Path, caplog: pytest.LogCaptureFixture
++) -> None:
++    payload = _load_real_payload()
++    payload["strategy_version"] = "999"
++    _write_bundle_dir(tmp_path, "bundle-x", payload)
++
++    with caplog.at_level(logging.WARNING):
++        assert discover_model_bundles(tmp_path) == []
++    assert any("strategy_version mismatch" in r.getMessage() for r in caplog.records)
++
++    with pytest.raises(ModelValidationError, match="strategy_version mismatch"):
++        ModelRegistry(tmp_path).activate("bundle-x")
++
++
++def test_unservable_flag_rejected_at_discovery_and_activation(
++    tmp_path: Path, caplog: pytest.LogCaptureFixture
++) -> None:
++    payload = _load_real_payload()
++    payload["supported_by_runtime"] = False
++    _write_bundle_dir(tmp_path, "bundle-x", payload)
++
++    with caplog.at_level(logging.WARNING):
++        assert discover_model_bundles(tmp_path) == []
++    assert any("supported_by_runtime" in r.getMessage() for r in caplog.records)
++
++    with pytest.raises(ModelValidationError, match="supported_by_runtime"):
++        ModelRegistry(tmp_path).activate("bundle-x")
++
++
++def test_serving_strategy_id_guard_rejects_foreign_routing(tmp_path: Path) -> None:
++    # Check (iv): even a registry-valid contract is refused when it routes to a
++    # strategy other than the one the running service's plugin serves.
++    payload = _load_real_payload()
++    _write_bundle_dir(tmp_path, "bundle-x", payload)
++
++    registry = ModelRegistry(tmp_path, serving_strategy_id="some_other_plugin")
++    with pytest.raises(ModelValidationError, match="does not match the"):
++        registry.activate("bundle-x")
+diff --git a/backend/tests/test_strategy_contract.py b/backend/tests/test_strategy_contract.py
+index 8e45b61..137609d 100644
+--- a/backend/tests/test_strategy_contract.py
++++ b/backend/tests/test_strategy_contract.py
+@@ -80,8 +80,9 @@ def test_load_real_strategy_contract_parses_all_sections() -> None:
+ 
+ 
+ def test_load_rejects_unsupported_contract_version(tmp_path: Path) -> None:
++    # E1: v1 is now the UNSUPPORTED version (the shape break migrated v1 -> v2).
+     payload = _load_real_payload()
+-    payload["contract_version"] = "trade_lab_contract_v2"
++    payload["contract_version"] = "trade_lab_contract_v1"
+     target = tmp_path / "strategy.json"
+     _write_strategy(target, payload)
+ 
+diff --git a/backend/tests/test_strategy_core_dependency.py b/backend/tests/test_strategy_core_dependency.py
+index 0586383..df42e8a 100644
+--- a/backend/tests/test_strategy_core_dependency.py
++++ b/backend/tests/test_strategy_core_dependency.py
+@@ -1,4 +1,4 @@
+-def test_strategy_core_dependency_imports_engine_version() -> None:
++def test_strategy_core_dependency_imports_platform_version() -> None:
+     import strategy_core
+ 
+-    assert strategy_core.ENGINE_VERSION.startswith("strategy_core_engine_")
++    assert strategy_core.PLATFORM_VERSION.startswith("strategy_core_platform_")
