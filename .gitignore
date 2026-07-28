@@ -80,3 +80,4 @@ Thumbs.db
 *.out
 /.claude/scheduled_tasks.lock
 /.claude/worktrees/
+/*_REVIEW.txt
