@@ -1,6 +1,6 @@
 """Shared fake Databento Live SDK client for adapter tests.
 
-WEDGE fix (see WEDGE_CAPTURE.md at the repo root): the SDK facade now (1) forces
+WEDGE fix (see docs/archive/windows/WEDGE_CAPTURE.md): the SDK facade now (1) forces
 connect+auth through the guarded private session handle before any subscription
 and (2) marshals every subscribe/start onto the SDK session loop. Fakes therefore
 expose the same shape the facade's guarded getattr chain expects — a ``_session``

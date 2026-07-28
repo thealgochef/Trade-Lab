@@ -1,0 +1,2998 @@
+﻿commit 94610ffc8eb07e3de7fa48abce8f2457c9ced981
+Author: algochef <gonzalezlg020@gmail.com>
+Date:   Wed Jun 10 03:38:53 2026 -0500
+
+    D1b: serve the honest resolver, retire the tracker (flip + delete)
+    
+    RATIFIED SEMANTICS: full honest alignment - the dashboard serves the D1a
+    streaming resolver's outcomes; drops surface explicitly with reasons;
+    SESSION_END classification retires; entry is the real trade print. The legacy
+    level-anchored OutcomeTracker is DELETED (services/inference/outcome_tracker.py
+    + tests/test_outcome_tracker.py, -16 tests).
+    
+    Adapter (NEW services/inference/resolution_adapter.py): StreamResolution + its
+    Prediction -> served Outcome. actual_class = result.label; resolution_type =
+    TP_HIT for tradeable_reversal, SL_HIT for aggressive_blowthrough/trap_reversal
+    (fail-loud on an unmapped label); correct = (label == predicted_class) computed
+    TL-side; mfe/mae/bars passthrough (bars now SC ZERO-BASED - the tracker served a
+    1-based count; documented in domain/outcomes.py); resolved_ts from the new SC
+    StreamResolution.resolved_ts_utc; NEW Outcome/OutcomeDTO field entry_price (the
+    honest fill). parse_bar_type RELOCATED here verbatim (regex + ValueError
+    semantics intact; now public - the resolver build is its sole src consumer).
+    
+    Drops: NEW domain DroppedPrediction + DroppedPredictionDTO + WS frame
+    prediction.dropped {prediction_id, touch_id, reason, decision_ts_utc,
+    entry_price?} broadcast like prediction.resolved; carried in the snapshot (new
+    dropped ring beside outcomes, same cap); RuntimeUpdate/RuntimeSnapshot gain
+    dropped; replay coalesce accumulates it event-style. Frontend: MessageType +
+    DTO + normalizeDropped + store ring (cap 100, de-dupe, reset/clear coverage) +
+    prediction annotation + IntelligencePanel dropped badge with reason; drops
+    never enter prediction.outcome so no chart marker.
+    
+    ApplicationRuntime rewired: _track_outcomes serves resolver emissions through
+    the adapter (resolutions -> outcomes ring + prediction.resolved; terminal drops
+    -> dropped ring + prediction.dropped) under a PER-ITEM guard preserving D1a's
+    hot-path swallow posture (a failing adaptation loses only that emission,
+    logged - adversarial-verify finding, repaired + pinned by test);
+    registration-time drops from _register_prediction (ex _register_dark) surface
+    identically; _open_predictions correlates resolver keys -> predictions, cleared
+    in lockstep (reset/hot-swap/clear). The dark ring + dark_outcomes property +
+    _append_dark die - the resolver IS the serving path. _build_outcome_tracker
+    deleted.
+    
+    ResolutionType: SESSION_END + NO_RESOLUTION members REMOVED - grep proof: zero
+    references after the flip (the tracker, its tests, and the gate-B harness were
+    the only producers/consumers; the contract key no_resolution_dropped and the
+    StreamDrop.reason string vocabulary are unrelated).
+    
+    validation/d1_characterization_harness.py RETIRED (deleted): its comparison
+    subject (the tracker) is gone; a single-path repoint would characterize
+    nothing. backend/D1_CHARACTERIZATION.md + git history are the record.
+    
+    D2 acceptance guard: the dead outcome_tracker carve-out bullet removed from the
+    docstring (the tracker died on schedule); scan code unchanged (it never carved
+    the tracker out in code).
+    
+    Tests: test_dark_honest_resolver.py -> test_honest_resolver_serving.py (7
+    adapted to the served surfaces + 1 NEW hot-path swallow pin, incl. drop-frame
+    end-to-end + 0-based bars served); NEW test_resolution_adapter.py (13: mapping
+    table x3 labels + correctness both ways + fail-loud + id uniqueness + drop
+    mapping x2 + parse_bar_type x2 forms + 5 rejects); test_inference_api: resolved
+    payload gains entry_price + full keyset pin, NEW prediction.dropped envelope
+    test; test_api_contract: snapshot + empty-snapshot keysets gain dropped.
+    
+    PIN NOTE: this tree consumes SC StreamResolution.resolved_ts_utc (SC 945f381,
+    local); the pyproject pin bump to the final pushed SC sha rides the greenlight
+    as a chore commit per the established convention (cold install before the bump
+    would AttributeError on first resolution - dev resolves SC editable).
+    
+    Gates on this tree: TL suite 419 (= 420 baseline - 16 tracker + 13 adapter + 1
+    dropped-frame + 1 swallow pin; dark file 7 -> 8); seam by name 4 (acceptance 3
+    incl. D2 guard + replay integration 1); ruff clean (validation/ no longer
+    exists); frontend typecheck clean + vitest 142 (incl. 5 new dropped tests) +
+    vite build green. 6-agent adversarial verify: 5 PASS (high) + 1 finding
+    repaired (the per-item guard above).
+    
+    Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+diff --git a/backend/src/trade_lab/api/dto.py b/backend/src/trade_lab/api/dto.py
+index cb375e1..7597791 100644
+--- a/backend/src/trade_lab/api/dto.py
++++ b/backend/src/trade_lab/api/dto.py
+@@ -15,7 +15,7 @@ from trade_lab.domain.data_quality import DataQualityWarning
+ from trade_lab.domain.feed import FeedConnectionState, FeedStatus
+ from trade_lab.domain.levels import DisplayLevel, TouchEvent
+ from trade_lab.domain.observations import Observation
+-from trade_lab.domain.outcomes import Outcome
++from trade_lab.domain.outcomes import DroppedPrediction, Outcome
+ from trade_lab.services.inference.inference_engine import Prediction
+ from trade_lab.services.model_registry import ModelBundle
+ from trade_lab.services.replay import ReplayStatus
+@@ -34,6 +34,7 @@ MessageType = Literal[
+     "feed.status",
+     "prediction.created",
+     "prediction.resolved",
++    "prediction.dropped",
+     "model.status",
+ ]
+ 
+@@ -126,6 +127,15 @@ class OutcomeDTO(ApiModel):
+     max_mae_pts: float
+     bars_to_resolution: int
+     resolved_ts_utc: datetime
++    entry_price: float
++
++
++class DroppedPredictionDTO(ApiModel):
++    prediction_id: str
++    touch_id: str
++    reason: str
++    decision_ts_utc: datetime
++    entry_price: float | None = None
+ 
+ 
+ class ModelStatusDTO(ApiModel):
+@@ -186,6 +196,7 @@ class SnapshotPayload(ApiModel):
+     warnings: list[DataQualityWarningDTO] = Field(default_factory=list)
+     predictions: list[PredictionDTO] = Field(default_factory=list)
+     outcomes: list[OutcomeDTO] = Field(default_factory=list)
++    dropped: list[DroppedPredictionDTO] = Field(default_factory=list)
+     model_status: ModelStatusDTO
+     session: str | None = None
+     trading_day: date | None = None
+@@ -314,6 +325,17 @@ def outcome_to_dto(outcome: Outcome) -> OutcomeDTO:
+         max_mae_pts=outcome.max_mae_pts,
+         bars_to_resolution=outcome.bars_to_resolution,
+         resolved_ts_utc=outcome.resolved_ts_utc,
++        entry_price=outcome.entry_price,
++    )
++
++
++def dropped_to_dto(dropped: DroppedPrediction) -> DroppedPredictionDTO:
++    return DroppedPredictionDTO(
++        prediction_id=dropped.prediction_id,
++        touch_id=dropped.touch_id,
++        reason=dropped.reason,
++        decision_ts_utc=dropped.decision_ts_utc,
++        entry_price=dropped.entry_price,
+     )
+ 
+ 
+@@ -400,6 +422,7 @@ def snapshot_payload_from_runtime(snapshot: RuntimeSnapshot) -> SnapshotPayload:
+         warnings=[warning_to_dto(warning) for warning in snapshot.warnings],
+         predictions=[prediction_to_dto(prediction) for prediction in snapshot.predictions],
+         outcomes=[outcome_to_dto(outcome) for outcome in snapshot.outcomes],
++        dropped=[dropped_to_dto(dropped) for dropped in snapshot.dropped],
+         model_status=model_status_to_dto(snapshot.model_status),
+         session=snapshot.session,
+         trading_day=snapshot.trading_day,
+@@ -426,6 +449,10 @@ def outcome_payload(outcome: Outcome) -> dict[str, Any]:
+     return {"outcome": outcome_to_dto(outcome).model_dump(mode="json")}
+ 
+ 
++def dropped_payload(dropped: DroppedPrediction) -> dict[str, Any]:
++    return {"dropped": dropped_to_dto(dropped).model_dump(mode="json")}
++
++
+ def make_envelope(
+     message_type: MessageType,
+     sequence: int,
+diff --git a/backend/src/trade_lab/domain/outcomes.py b/backend/src/trade_lab/domain/outcomes.py
+index 6e2a7b8..6f61090 100644
+--- a/backend/src/trade_lab/domain/outcomes.py
++++ b/backend/src/trade_lab/domain/outcomes.py
+@@ -1,12 +1,21 @@
+-"""Resolved-outcome domain object for MAE-first forward labeling.
++"""Resolved-outcome domain objects for honest decision-time labeling.
+ 
+ An :class:`Outcome` is the ground-truth label a :class:`~trade_lab.services.
+-inference.inference_engine.Prediction` resolves to once enough contract
+-``forward_bar_type`` bars have closed after the touch. It mirrors the offline
+-``dashboard_utility_labeling`` ladder (MAE checked first) so a live/replay
+-resolution matches how the model was trained. Like a prediction it is frozen and
+-path-free, carrying the ``prediction_id``/``touch_id`` it belongs to plus the
+-diagnostics (MFE/MAE in points, bars scanned) and the correctness flag.
++inference.inference_engine.Prediction` resolves to on the Strategy-Core streaming
++honest resolver (D1b): entry is the realistic front-month trade print at the
++decision instant (the honest fill, NOT the level price), excursions are MAE-first
++over the contract ``forward_bar_type`` bars strictly inside the decision->cutoff
++window, exactly the batch ``resolve_honest_outcome`` semantics. Like a prediction
++it is frozen and path-free, carrying the ``prediction_id``/``touch_id`` it belongs
++to plus the diagnostics (MFE/MAE in points, bars scanned) and the correctness flag.
++
++``bars_to_resolution`` is the engine's ZERO-BASED index of the resolving bar
++within the forward window (the retired tracker reported a 1-based bar count).
++
++A :class:`DroppedPrediction` is a prediction the resolver yields NO tradeable
++outcome for — surfaced explicitly with its reason instead of being force-labeled:
++``flatten``/``cutoff``/``no_fill`` at registration (no entry queried/filled),
++``no_forward``/``no_resolution`` at the cutoff (entry carried).
+ """
+ 
+ from __future__ import annotations
+@@ -17,17 +26,20 @@ from enum import StrEnum
+ 
+ 
+ class ResolutionType(StrEnum):
+-    """How a prediction's forward scan terminated."""
++    """How a prediction's forward scan terminated.
++
++    D1b: ``SESSION_END`` and ``NO_RESOLUTION`` are RETIRED — the honest resolver
++    never force-labels; an unresolved-at-cutoff setup surfaces as a
++    :class:`DroppedPrediction` (reason ``no_resolution``) instead.
++    """
+ 
+     TP_HIT = "tp_hit"
+     SL_HIT = "sl_hit"
+-    SESSION_END = "session_end"
+-    NO_RESOLUTION = "no_resolution"
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class Outcome:
+-    """A frozen, MAE-first resolution of one open prediction."""
++    """A frozen, MAE-first resolution of one open prediction (honest entry)."""
+ 
+     outcome_id: str
+     prediction_id: str
+@@ -40,3 +52,20 @@ class Outcome:
+     max_mae_pts: float
+     bars_to_resolution: int
+     resolved_ts_utc: datetime
++    entry_price: float
++
++
++@dataclass(frozen=True, slots=True)
++class DroppedPrediction:
++    """A prediction the honest resolver dropped instead of resolving.
++
++    ``entry_price`` is ``None`` for registration-time drops (``flatten``/
++    ``cutoff``/``no_fill`` — no fill was queried or none existed) and carries the
++    honest fill for terminal drops (``no_forward``/``no_resolution``).
++    """
++
++    prediction_id: str
++    touch_id: str
++    reason: str
++    decision_ts_utc: datetime
++    entry_price: float | None = None
+diff --git a/backend/src/trade_lab/services/broadcaster.py b/backend/src/trade_lab/services/broadcaster.py
+index c296335..7ef745e 100644
+--- a/backend/src/trade_lab/services/broadcaster.py
++++ b/backend/src/trade_lab/services/broadcaster.py
+@@ -15,6 +15,7 @@ from trade_lab.api.dto import (
+     MessageType,
+     SnapshotPayload,
+     bars_payload,
++    dropped_payload,
+     feed_status_to_dto,
+     levels_payload,
+     make_envelope,
+@@ -106,6 +107,8 @@ class WebSocketBroadcaster:
+             )
+         for outcome in update.outcomes:
+             messages.append(self.envelope_bytes("prediction.resolved", outcome_payload(outcome)))
++        for dropped in update.dropped:
++            messages.append(self.envelope_bytes("prediction.dropped", dropped_payload(dropped)))
+         model_status_message = self._model_status_message_if_changed()
+         if model_status_message is not None:
+             messages.append(model_status_message)
+diff --git a/backend/src/trade_lab/services/inference/inference_engine.py b/backend/src/trade_lab/services/inference/inference_engine.py
+index 4f99914..eb7d596 100644
+--- a/backend/src/trade_lab/services/inference/inference_engine.py
++++ b/backend/src/trade_lab/services/inference/inference_engine.py
+@@ -126,8 +126,9 @@ class InferenceEngine:
+     def active_contract(self) -> StrategyContract | None:
+         """The contract the active model was validated against, or ``None``.
+ 
+-        Lets the runtime build a contract-specific OutcomeTracker without reaching
+-        into the registry, so a hot-swap re-derives forward thresholds/bar type.
++        Lets the runtime build the contract-specific honest resolver without
++        reaching into the registry, so a hot-swap re-derives forward
++        thresholds/bar type.
+         """
+ 
+         active = self._registry.active()
+diff --git a/backend/src/trade_lab/services/inference/outcome_tracker.py b/backend/src/trade_lab/services/inference/outcome_tracker.py
+deleted file mode 100644
+index 41504fb..0000000
+--- a/backend/src/trade_lab/services/inference/outcome_tracker.py
++++ /dev/null
+@@ -1,223 +0,0 @@
+-"""MAE-first forward-outcome tracking for open predictions.
+-
+-Each open :class:`Prediction` is registered with the tracker; the tracker then
+-consumes CLOSED bars of the contract's ``label_policy.forward_bar_type`` (e.g.
+-``147t``) that occur AFTER the touch, maintaining the running max MFE/MAE in
+-points versus the level reference price by direction. Resolution mirrors the
+-offline ``dashboard_utility_labeling`` ladder exactly: MAE is checked FIRST each
+-bar, so a single bar whose range satisfies BOTH the stop and the target resolves
+-to the LOSS (trap/blowthrough), never the win.
+-
+-The forward scan is capped at the RTH close (``label_policy.forward_cutoff``,
+-16:15 ET). A bar that closes at or after that cutoff forces a ``session_end``
+-resolution using the same MAE-first classification.
+-
+-This module is pure Python: it never loads CatBoost or reads market bytes. It
+-holds no filesystem paths and emits only the path-free :class:`Outcome`.
+-"""
+-
+-from __future__ import annotations
+-
+-import re
+-from dataclasses import dataclass
+-from datetime import datetime, time
+-from decimal import Decimal
+-from uuid import uuid4
+-from zoneinfo import ZoneInfo
+-
+-from strategy_core import StrategyContract
+-
+-from trade_lab.domain.candles import Candle
+-from trade_lab.domain.outcomes import Outcome, ResolutionType
+-from trade_lab.services.inference.inference_engine import Prediction
+-
+-_BAR_TYPE_RE = re.compile(r"^(\d+)t$")
+-
+-
+-def _parse_bar_type(bar_type: str) -> int:
+-    """Map a contract ``bar_type`` like ``147t`` to its tick count ``147``."""
+-
+-    match = _BAR_TYPE_RE.match(bar_type.strip().lower())
+-    if match is None:
+-        raise ValueError(f"unsupported forward_bar_type {bar_type!r}; expected '<n>t'")
+-    return int(match.group(1))
+-
+-
+-def _parse_cutoff(forward_cutoff: str) -> tuple[time, ZoneInfo]:
+-    """Parse ``"16:15_US/Eastern_rth_close"`` into a wall-clock time + timezone.
+-
+-    The cutoff string packs ``HH:MM``, an IANA timezone, and a descriptive tail
+-    separated by underscores. Only the first two tokens are semantically used; the
+-    tail (``rth_close``) is purely documentation.
+-    """
+-
+-    parts = forward_cutoff.split("_")
+-    if len(parts) < 2:
+-        raise ValueError(f"unsupported forward_cutoff {forward_cutoff!r}")
+-    hour_text, minute_text = parts[0].split(":", 1)
+-    cutoff_time = time(int(hour_text), int(minute_text))
+-    return cutoff_time, ZoneInfo(parts[1])
+-
+-
+-@dataclass(slots=True)
+-class _OpenTracker:
+-    """Mutable running MFE/MAE state for one open prediction."""
+-
+-    prediction: Prediction
+-    entry_points: float
+-    is_long: bool
+-    max_mfe_pts: float = 0.0
+-    max_mae_pts: float = 0.0
+-    bars_seen: int = 0
+-
+-
+-class OutcomeTracker:
+-    """Resolve open predictions against contract forward bars (MAE-first).
+-
+-    One tracker instance serves one runtime/session. ``register`` enrolls a
+-    prediction; ``on_bar_close`` advances every open tracker with a just-closed bar
+-    and returns the outcomes that resolved on it. ``reset`` drops all open state
+-    (called on runtime reset and model hot-swap so bundles never mix).
+-    """
+-
+-    def __init__(self, contract: StrategyContract) -> None:
+-        policy = contract.label_policy
+-        self._forward_timeframe_ticks = _parse_bar_type(policy.forward_bar_type)
+-        self._tick_size = Decimal(str(contract.tick_size))
+-        self._tp_points = float(policy.tp_points)
+-        self._sl_points = float(policy.sl_points)
+-        self._trap_mfe_min = float(policy.trap_mfe_min)
+-        self._cutoff_time, self._cutoff_tz = _parse_cutoff(policy.forward_cutoff)
+-        self._open: list[_OpenTracker] = []
+-
+-    @property
+-    def forward_timeframe_ticks(self) -> int:
+-        return self._forward_timeframe_ticks
+-
+-    @property
+-    def open_count(self) -> int:
+-        return len(self._open)
+-
+-    def register(self, prediction: Prediction) -> None:
+-        """Begin tracking a prediction's forward outcome from its touch.
+-
+-        Entry reference is the level's representative price (``level_price_ticks``
+-        in points), matching the training labels.
+-        """
+-
+-        entry_points = float(Decimal(prediction.level_price_ticks) * self._tick_size)
+-        self._open.append(
+-            _OpenTracker(
+-                prediction=prediction,
+-                entry_points=entry_points,
+-                is_long=prediction.direction.lower() == "long",
+-            )
+-        )
+-
+-    def on_bar_close(self, bar: Candle) -> tuple[Outcome, ...]:
+-        """Advance open trackers with one just-closed bar; emit any resolutions.
+-
+-        Only bars of the contract's forward timeframe that close strictly after a
+-        prediction's touch advance that prediction. A bar that closes at or after
+-        the RTH cutoff forces a ``session_end`` resolution for every still-open
+-        prediction it touches.
+-        """
+-
+-        if bar.timeframe_ticks != self._forward_timeframe_ticks:
+-            return ()
+-
+-        high_points = float(Decimal(bar.high_ticks) * self._tick_size)
+-        low_points = float(Decimal(bar.low_ticks) * self._tick_size)
+-        at_or_after_cutoff = self._is_at_or_after_cutoff(bar.close_ts_utc)
+-
+-        resolved: list[Outcome] = []
+-        still_open: list[_OpenTracker] = []
+-        for tracker in self._open:
+-            # A bar only counts if it closed after the touch (touch bar excluded).
+-            if bar.close_ts_utc <= tracker.prediction.event_ts_utc:
+-                still_open.append(tracker)
+-                continue
+-
+-            if tracker.is_long:
+-                bar_mfe = high_points - tracker.entry_points
+-                bar_mae = tracker.entry_points - low_points
+-            else:
+-                bar_mfe = tracker.entry_points - low_points
+-                bar_mae = high_points - tracker.entry_points
+-
+-            tracker.max_mfe_pts = max(tracker.max_mfe_pts, bar_mfe)
+-            tracker.max_mae_pts = max(tracker.max_mae_pts, bar_mae)
+-            tracker.bars_seen += 1
+-
+-            outcome = self._classify(tracker, bar.close_ts_utc, forced=at_or_after_cutoff)
+-            if outcome is None:
+-                still_open.append(tracker)
+-            else:
+-                resolved.append(outcome)
+-
+-        self._open = still_open
+-        return tuple(resolved)
+-
+-    def _classify(
+-        self, tracker: _OpenTracker, resolved_ts_utc: datetime, *, forced: bool
+-    ) -> Outcome | None:
+-        """Apply the MAE-first ladder; return an Outcome only when resolved.
+-
+-        MAE is checked first so a bar that breaches both the stop and the target
+-        resolves to the loss. ``forced`` (RTH cutoff) resolves the prediction even
+-        when neither threshold is hit, using the same trap/blowthrough split.
+-        """
+-
+-        if tracker.max_mae_pts >= self._sl_points:
+-            actual = (
+-                "trap_reversal"
+-                if tracker.max_mfe_pts >= self._trap_mfe_min
+-                else "aggressive_blowthrough"
+-            )
+-            return self._build(tracker, ResolutionType.SL_HIT, actual, resolved_ts_utc)
+-
+-        if tracker.max_mfe_pts >= self._tp_points:
+-            return self._build(
+-                tracker, ResolutionType.TP_HIT, "tradeable_reversal", resolved_ts_utc
+-            )
+-
+-        if forced:
+-            actual = (
+-                "trap_reversal"
+-                if tracker.max_mfe_pts >= self._trap_mfe_min
+-                else "aggressive_blowthrough"
+-            )
+-            return self._build(tracker, ResolutionType.SESSION_END, actual, resolved_ts_utc)
+-
+-        return None
+-
+-    def _build(
+-        self,
+-        tracker: _OpenTracker,
+-        resolution_type: ResolutionType,
+-        actual_class: str,
+-        resolved_ts_utc: datetime,
+-    ) -> Outcome:
+-        predicted = tracker.prediction.predicted_class
+-        return Outcome(
+-            outcome_id=str(uuid4()),
+-            prediction_id=tracker.prediction.prediction_id,
+-            touch_id=tracker.prediction.touch_id,
+-            resolution_type=resolution_type,
+-            actual_class=actual_class,
+-            predicted_class=predicted,
+-            correct=predicted == actual_class,
+-            max_mfe_pts=round(tracker.max_mfe_pts, 4),
+-            max_mae_pts=round(tracker.max_mae_pts, 4),
+-            bars_to_resolution=tracker.bars_seen,
+-            resolved_ts_utc=resolved_ts_utc,
+-        )
+-
+-    def _is_at_or_after_cutoff(self, ts_utc: datetime) -> bool:
+-        local = ts_utc.astimezone(self._cutoff_tz)
+-        return local.time() >= self._cutoff_time
+-
+-    def reset(self) -> None:
+-        """Drop all open-prediction state (runtime reset / model hot-swap)."""
+-
+-        self._open.clear()
+diff --git a/backend/src/trade_lab/services/inference/resolution_adapter.py b/backend/src/trade_lab/services/inference/resolution_adapter.py
+new file mode 100644
+index 0000000..34eef36
+--- /dev/null
++++ b/backend/src/trade_lab/services/inference/resolution_adapter.py
+@@ -0,0 +1,84 @@
++"""Adapt Strategy-Core streaming honest-resolver emissions to served TL shapes.
++
++The D1b serving seam: ``StreamResolution``/``StreamDrop`` (SC, prediction-free —
++keyed by the ``prediction_id`` the runtime registered) + the originating
++:class:`Prediction` map onto the path-free domain objects the API edge serves.
++Correctness (predicted vs actual) is computed HERE — TL's concern, never SC's.
++
++``parse_bar_type`` relocated from the retired ``outcome_tracker`` module
++(regex + ValueError semantics intact); the resolver build consumes it to map a
++contract ``forward_bar_type`` onto the runtime's tick timeframes.
++"""
++
++from __future__ import annotations
++
++import re
++from uuid import uuid4
++
++from strategy_core import StreamDrop, StreamResolution
++
++from trade_lab.domain.outcomes import DroppedPrediction, Outcome, ResolutionType
++from trade_lab.services.inference.inference_engine import Prediction
++
++_BAR_TYPE_RE = re.compile(r"^(\d+)t$")
++
++#: The ratified label -> resolution-type mapping: a tradeable reversal is the
++#: target (TP); both loss shapes (blowthrough, trap) are the stop (SL). The honest
++#: resolver never force-labels, so no other resolution type exists.
++_RESOLUTION_TYPE_BY_LABEL = {
++    "tradeable_reversal": ResolutionType.TP_HIT,
++    "aggressive_blowthrough": ResolutionType.SL_HIT,
++    "trap_reversal": ResolutionType.SL_HIT,
++}
++
++
++def parse_bar_type(bar_type: str) -> int:
++    """Map a contract ``bar_type`` like ``147t`` to its tick count ``147``."""
++
++    match = _BAR_TYPE_RE.match(bar_type.strip().lower())
++    if match is None:
++        raise ValueError(f"unsupported forward_bar_type {bar_type!r}; expected '<n>t'")
++    return int(match.group(1))
++
++
++def resolution_to_outcome(resolution: StreamResolution, prediction: Prediction) -> Outcome:
++    """Map one streaming resolution + its prediction onto the served Outcome.
++
++    ``bars_to_resolution`` is served with the engine's ZERO-BASED semantics (the
++    resolving bar's index within the forward window); the retired tracker served a
++    1-based bar count. ``entry_price`` is the honest decision-time fill the
++    excursions were anchored on. Fails loud on a label outside the engine's
++    three-class vocabulary — a new label must be mapped deliberately, not guessed.
++    """
++
++    label = resolution.result.label
++    try:
++        resolution_type = _RESOLUTION_TYPE_BY_LABEL[label]
++    except KeyError:
++        raise ValueError(f"unmapped resolution label {label!r}") from None
++    return Outcome(
++        outcome_id=str(uuid4()),
++        prediction_id=prediction.prediction_id,
++        touch_id=prediction.touch_id,
++        resolution_type=resolution_type,
++        actual_class=label,
++        predicted_class=prediction.predicted_class,
++        correct=prediction.predicted_class == label,
++        max_mfe_pts=resolution.result.max_mfe,
++        max_mae_pts=resolution.result.max_mae,
++        bars_to_resolution=resolution.result.bars_to_resolution,
++        resolved_ts_utc=resolution.resolved_ts_utc,
++        entry_price=resolution.entry_price,
++    )
++
++
++def drop_to_dropped(drop: StreamDrop, prediction: Prediction) -> DroppedPrediction:
++    """Map one streaming drop + its prediction onto the served drop record."""
++
++    return DroppedPrediction(
++        prediction_id=prediction.prediction_id,
++        touch_id=prediction.touch_id,
++        reason=drop.reason,
++        decision_ts_utc=drop.decision_ts_utc,
++        entry_price=drop.entry_price,
++    )
+diff --git a/backend/src/trade_lab/services/replay.py b/backend/src/trade_lab/services/replay.py
+index d385f7f..a34fe56 100644
+--- a/backend/src/trade_lab/services/replay.py
++++ b/backend/src/trade_lab/services/replay.py
+@@ -425,7 +425,9 @@ def _coalesce_replay_updates(updates: list[RuntimeUpdate]) -> RuntimeUpdate:
+     predictions = list(merged.predictions)
+     # audit #N4: 'outcomes' is an event-style delta (prediction.resolved); accumulate
+     # it like 'predictions' so coalesced replay never drops resolved-outcome broadcasts.
++    # 'dropped' (prediction.dropped) is event-style for the same reason.
+     outcomes = list(merged.outcomes)
++    dropped = list(merged.dropped)
+     for update in updates:
+         if update.feed_status is not None:
+             feed_status = update.feed_status
+@@ -445,6 +447,8 @@ def _coalesce_replay_updates(updates: list[RuntimeUpdate]) -> RuntimeUpdate:
+             predictions.extend(update.predictions)
+         if update.outcomes:
+             outcomes.extend(update.outcomes)
++        if update.dropped:
++            dropped.extend(update.dropped)
+     return RuntimeUpdate(
+         feed_status=feed_status,
+         warnings=tuple(warnings),
+@@ -455,6 +459,7 @@ def _coalesce_replay_updates(updates: list[RuntimeUpdate]) -> RuntimeUpdate:
+         observations=tuple(observations),
+         predictions=tuple(predictions),
+         outcomes=tuple(outcomes),
++        dropped=tuple(dropped),
+     )
+ 
+ 
+diff --git a/backend/src/trade_lab/services/runtime.py b/backend/src/trade_lab/services/runtime.py
+index 94b2072..cb0db4b 100644
+--- a/backend/src/trade_lab/services/runtime.py
++++ b/backend/src/trade_lab/services/runtime.py
+@@ -13,7 +13,7 @@ from datetime import date, timedelta
+ from types import MappingProxyType
+ from typing import Any
+ 
+-from strategy_core import StreamDrop, StreamingHonestResolver, StreamResolution
++from strategy_core import StreamingHonestResolver, StreamResolution
+ 
+ from trade_lab.domain.candles import Candle
+ from trade_lab.domain.data_quality import DataQualityWarning
+@@ -29,9 +29,13 @@ from trade_lab.domain.feed import FeedConnectionState, FeedStatus
+ from trade_lab.domain.levels import DisplayLevel, TouchEvent
+ from trade_lab.domain.market_context import DEFAULT_RETENTION_MINUTES, MarketContextBuffer
+ from trade_lab.domain.observations import Observation, ObservationEngine, ObservationStatus
+-from trade_lab.domain.outcomes import Outcome
++from trade_lab.domain.outcomes import DroppedPrediction, Outcome
+ from trade_lab.services.inference.inference_engine import InferenceEngine, Prediction
+-from trade_lab.services.inference.outcome_tracker import OutcomeTracker, _parse_bar_type
++from trade_lab.services.inference.resolution_adapter import (
++    drop_to_dropped,
++    parse_bar_type,
++    resolution_to_outcome,
++)
+ from trade_lab.services.strategy_core_service import StrategyCoreService
+ 
+ logger = logging.getLogger(__name__)
+@@ -48,6 +52,7 @@ class RuntimeUpdate:
+     observations: tuple[Observation, ...] = ()
+     predictions: tuple[Prediction, ...] = ()
+     outcomes: tuple[Outcome, ...] = ()
++    dropped: tuple[DroppedPrediction, ...] = ()
+ 
+     def has_deltas(self) -> bool:
+         return any(
+@@ -61,6 +66,7 @@ class RuntimeUpdate:
+                 self.observations,
+                 self.predictions,
+                 self.outcomes,
++                self.dropped,
+             )
+         )
+ 
+@@ -97,6 +103,7 @@ class RuntimeSnapshot:
+     warnings: tuple[DataQualityWarning, ...]
+     predictions: tuple[Prediction, ...] = ()
+     outcomes: tuple[Outcome, ...] = ()
++    dropped: tuple[DroppedPrediction, ...] = ()
+     model_status: ModelStatus = field(default_factory=lambda: ModelStatus(loaded=False))
+     session: str | None = None
+     trading_day: date | None = None
+@@ -156,21 +163,18 @@ class ApplicationRuntime:
+         self._outcome_limit = outcome_limit
+         self._predictions: list[Prediction] = []
+         self._outcomes: list[Outcome] = []
+-        # MAE-first forward-outcome tracker, contract-specific. Built from the active
+-        # model's contract so a hot-swap re-derives forward bar type + thresholds.
+-        self._outcome_tracker: OutcomeTracker | None = self._build_outcome_tracker(
+-            inference_engine
+-        )
++        # D1b: drops are surfaced explicitly, ring-bounded like outcomes (same cap).
++        self._dropped: list[DroppedPrediction] = []
++        # Open registrations awaiting a resolver emission, keyed by prediction_id —
++        # cleared in lockstep with the resolver (reset / hot-swap / clear).
++        self._open_predictions: dict[object, Prediction] = {}
+         self._warning_limit = warning_limit
+         self._recent_closed_bar_limit = recent_closed_bar_limit
+         self._seed_bar_limit_per_timeframe = seed_bar_limit_per_timeframe
+         self._tick_timeframes = tick_timeframes
+         self._observation_duration_seconds = observation_duration_seconds
+-        # D1a DARK seat: the SC streaming honest resolver runs alongside the tracker at
+-        # the same lifecycle points, accumulating into a parallel dark ring (same cap as
+-        # outcomes) consumed ONLY by the gate-B characterization harness — no
+-        # RuntimeUpdate/snapshot/DTO/WS surface reads it.
+-        self._dark_outcomes: list[StreamResolution | StreamDrop] = []
++        # D1b: the SC streaming honest resolver IS the serving outcome path (the D1a
++        # dark seat promoted; the legacy level-anchored OutcomeTracker is retired).
+         self._honest_resolver: StreamingHonestResolver | None = self._build_honest_resolver(
+             inference_engine
+         )
+@@ -217,11 +221,10 @@ class ApplicationRuntime:
+         self.market_context.reset()
+         self._predictions.clear()
+         self._outcomes.clear()
+-        if self._outcome_tracker is not None:
+-            self._outcome_tracker.reset()
++        self._dropped.clear()
++        self._open_predictions.clear()
+         if self._honest_resolver is not None:
+             self._honest_resolver.reset()
+-        self._dark_outcomes.clear()
+         if not preserve_warnings:
+             self._warnings.clear()
+         self._recent_closed_bars.clear()
+@@ -254,38 +257,23 @@ class ApplicationRuntime:
+         self._inference_engine = engine
+         self._predictions.clear()
+         self._outcomes.clear()
+-        self._dark_outcomes.clear()
+-        self._outcome_tracker = self._build_outcome_tracker(engine)
++        self._dropped.clear()
++        self._open_predictions.clear()
+         self._honest_resolver = self._build_honest_resolver(engine)
+ 
+-    @staticmethod
+-    def _build_outcome_tracker(engine: InferenceEngine | None) -> OutcomeTracker | None:
+-        """Construct a contract-specific OutcomeTracker for the active model, if any.
+-
+-        Returns ``None`` when no engine/model is active so the runtime tracks no
+-        outcomes until a model is loaded.
+-        """
+-
+-        if engine is None:
+-            return None
+-        contract = engine.active_contract
+-        if contract is None:
+-            return None
+-        return OutcomeTracker(contract)
+-
+     def _build_honest_resolver(
+         self, engine: InferenceEngine | None
+     ) -> StreamingHonestResolver | None:
+-        """Construct the contract-specific SC streaming honest resolver (D1a, DARK).
+-
+-        Mirrors ``_build_outcome_tracker``'s lifecycle exactly (same activation /
+-        hot-swap / reset points, same active contract). Entry prints come from the
+-        Strategy-Core runtime's trade ring via a late-binding closure so the seam
+-        survives ``reset()`` swapping the service. Construction FAILS LOUD when the
+-        contract's forward bar type is not among the runtime's configured tick
+-        timeframes — the recon's silent-never-resolve hole — so a bad activation is
+-        rejected instead of silently tracking nothing. Returns ``None`` when no
+-        engine/model is active.
++        """Construct the contract-specific SC streaming honest resolver.
++
++        The serving outcome path (D1b): built from the active model's contract so a
++        hot-swap re-derives forward bar type + thresholds. Entry prints come from
++        the Strategy-Core runtime's trade ring via a late-binding closure so the
++        seam survives ``reset()`` swapping the service. Construction FAILS LOUD
++        when the contract's forward bar type is not among the runtime's configured
++        tick timeframes — the recon's silent-never-resolve hole — so a bad
++        activation is rejected instead of silently tracking nothing. Returns
++        ``None`` when no engine/model is active.
+         """
+ 
+         if engine is None:
+@@ -303,7 +291,7 @@ class ApplicationRuntime:
+                 self._observation_duration_seconds,
+             )
+         return StreamingHonestResolver(
+-            forward_timeframe_ticks=_parse_bar_type(policy.forward_bar_type),
++            forward_timeframe_ticks=parse_bar_type(policy.forward_bar_type),
+             tick_size=contract.tick_size,
+             tp_points=policy.tp_points,
+             sl_points=policy.sl_points,
+@@ -314,35 +302,36 @@ class ApplicationRuntime:
+         )
+ 
+     @property
+-    def dark_outcomes(self) -> tuple[StreamResolution | StreamDrop, ...]:
+-        """The D1a dark ring (gate-B characterization harness only; no DTO/WS surface)."""
++    def dropped(self) -> tuple[DroppedPrediction, ...]:
++        """The served drops ring (mirrors ``outcomes``; same cap)."""
+ 
+-        return tuple(self._dark_outcomes)
++        return tuple(self._dropped)
+ 
+-    def _append_dark(self, emitted: tuple[StreamResolution | StreamDrop, ...]) -> None:
+-        if not emitted:
+-            return
+-        self._dark_outcomes.extend(emitted)
+-        if len(self._dark_outcomes) > self._outcome_limit:
+-            del self._dark_outcomes[: len(self._dark_outcomes) - self._outcome_limit]
++    def _append_dropped(self, dropped: DroppedPrediction) -> None:
++        self._dropped.append(dropped)
++        if len(self._dropped) > self._outcome_limit:
++            del self._dropped[: len(self._dropped) - self._outcome_limit]
+ 
+-    def _register_dark(
++    def _register_prediction(
+         self,
+         resolver: StreamingHonestResolver,
+         prediction: Prediction,
+         observation: Observation,
+-    ) -> None:
+-        """Register one prediction with the dark resolver off its TOUCH anchors.
++    ) -> DroppedPrediction | None:
++        """Register one prediction with the resolver off its TOUCH anchors.
+ 
+         The decision anchor is the touch's bar-close instant + trading day carried on
+         the observation/touch chain (``Observation.start_ts_utc`` = the SC touch's
+         ``bar_ts_utc``) — NEVER the prediction's ``event_ts_utc`` (= touch + the
+-        observation window). Fails loud if the chain did not carry them.
++        observation window). Fails loud if the chain did not carry them. A
++        registration-time drop (flatten/cutoff/no_fill) is adapted, ring-appended,
++        and returned so the caller can broadcast it; a live registration is held in
++        ``_open_predictions`` until the resolver emits for it.
+         """
+ 
+         if observation.start_ts_utc is None or observation.trading_day is None:
+             raise ValueError(
+-                "dark resolver registration requires the touch bar ts + trading_day "
++                "honest-resolver registration requires the touch bar ts + trading_day "
+                 "carried on the observation chain; refusing to approximate with the "
+                 "prediction event_ts"
+             )
+@@ -354,22 +343,25 @@ class ApplicationRuntime:
+                 direction=prediction.direction,
+             )
+         except Exception:
+-            # The dark seat must never break the market-data hot path.
+-            logger.warning("dark honest-resolver registration failed", exc_info=False)
+-            return
++            # Outcome tracking must never break the market-data hot path.
++            logger.warning("honest-resolver registration failed", exc_info=False)
++            return None
+         if drop is not None:
+-            self._append_dark((drop,))
++            dropped = drop_to_dropped(drop, prediction)
++            self._append_dropped(dropped)
++            return dropped
++        self._open_predictions[prediction.prediction_id] = prediction
++        return None
+ 
+     def clear_predictions(self) -> None:
+-        """Drop accumulated predictions + outcomes (e.g. on model hot-swap)."""
++        """Drop accumulated predictions + outcomes + drops (e.g. on model hot-swap)."""
+ 
+         self._predictions.clear()
+         self._outcomes.clear()
+-        if self._outcome_tracker is not None:
+-            self._outcome_tracker.reset()
++        self._dropped.clear()
++        self._open_predictions.clear()
+         if self._honest_resolver is not None:
+             self._honest_resolver.reset()
+-        self._dark_outcomes.clear()
+ 
+     @property
+     def predictions(self) -> tuple[Prediction, ...]:
+@@ -417,19 +409,22 @@ class ApplicationRuntime:
+ 
+     def _run_inference(
+         self, changed_observations: tuple[Observation, ...]
+-    ) -> tuple[Prediction, ...]:
++    ) -> tuple[tuple[Prediction, ...], tuple[DroppedPrediction, ...]]:
+         """Produce predictions for observations that just completed.
+ 
+         An observation "completes" when the engine expires it at its scheduled end
+         (its full interaction window has elapsed). With no active model this yields
+-        nothing and the runtime keeps serving market data unchanged.
++        nothing and the runtime keeps serving market data unchanged. Each produced
++        prediction is registered with the honest resolver off its TOUCH anchors;
++        registration-time drops (flatten/cutoff/no_fill) are returned alongside the
++        predictions so they ride the same RuntimeUpdate.
+         """
+ 
+         engine = self._inference_engine
+         if engine is None or not engine.has_active_model:
+-            return ()
++            return (), ()
+         produced: list[Prediction] = []
+-        # (prediction, observation) pairs: the dark resolver registers off the TOUCH
++        # (prediction, observation) pairs: the resolver registers off the TOUCH
+         # anchors carried on the observation chain, not off the prediction timestamps.
+         produced_pairs: list[tuple[Prediction, Observation]] = []
+         for observation in changed_observations:
+@@ -444,56 +439,69 @@ class ApplicationRuntime:
+             if prediction is not None:
+                 produced.append(prediction)
+                 produced_pairs.append((prediction, observation))
++        dropped: list[DroppedPrediction] = []
+         if produced:
+             self._predictions.extend(produced)
+             if len(self._predictions) > self._prediction_limit:
+                 del self._predictions[: len(self._predictions) - self._prediction_limit]
+-            tracker = self._outcome_tracker
+-            if tracker is not None:
+-                for prediction in produced:
+-                    tracker.register(prediction)
+             resolver = self._honest_resolver
+             if resolver is not None:
+-                # D1a dark seat: mirror every tracker registration one-for-one.
+                 for prediction, observation in produced_pairs:
+-                    self._register_dark(resolver, prediction, observation)
+-        return tuple(produced)
+-
+-    def _track_outcomes(self, closed_bars: tuple[Candle, ...]) -> tuple[Outcome, ...]:
+-        """Advance open outcome trackers on each just-closed contract bar.
+-
+-        Only forward-bar-type closes resolve predictions; non-matching timeframes are
+-        ignored inside the tracker. Outcome tracking must never break the market-data
+-        hot path, so failures are swallowed.
++                    drop = self._register_prediction(resolver, prediction, observation)
++                    if drop is not None:
++                        dropped.append(drop)
++        return tuple(produced), tuple(dropped)
++
++    def _track_outcomes(
++        self, closed_bars: tuple[Candle, ...]
++    ) -> tuple[tuple[Outcome, ...], tuple[DroppedPrediction, ...]]:
++        """Advance the honest resolver on each just-closed contract bar.
++
++        Only forward-bar-type closes advance setups; non-matching timeframes are
++        ignored inside the resolver. Resolutions are adapted to served ``Outcome``s
++        (correctness computed here); terminal drops (no_forward/no_resolution) to
++        served ``DroppedPrediction``s. Outcome tracking must never break the
++        market-data hot path, so failures are swallowed.
+         """
+ 
+-        if not closed_bars:
+-            return ()
+         resolver = self._honest_resolver
+-        if resolver is not None:
+-            # D1a dark seat: advance the SC streaming honest resolver from the same
+-            # closed-bars hook the tracker consumes; emissions land in the dark ring only.
+-            for bar in closed_bars:
+-                try:
+-                    self._append_dark(resolver.on_bar(bar))
+-                except Exception:
+-                    logger.warning(
+-                        "dark honest-resolver advance failed for a closed bar", exc_info=False
+-                    )
+-        tracker = self._outcome_tracker
+-        if tracker is None:
+-            return ()
++        if resolver is None or not closed_bars:
++            return (), ()
+         resolved: list[Outcome] = []
++        dropped: list[DroppedPrediction] = []
+         for bar in closed_bars:
+             try:
+-                resolved.extend(tracker.on_bar_close(bar))
++                emitted = resolver.on_bar(bar)
+             except Exception:
+-                logger.warning("outcome tracking failed for a closed bar", exc_info=False)
++                logger.warning(
++                    "honest-resolver advance failed for a closed bar", exc_info=False
++                )
++                continue
++            for item in emitted:
++                # Per-item guard: a failing adaptation loses only THAT emission
++                # (logged), never the bar's other emissions or the trade event.
++                try:
++                    prediction = self._open_predictions.pop(item.key, None)
++                    if prediction is None:
++                        # Lifecycle bug guard: the map clears in lockstep with the
++                        # resolver, so an emission must always find its registration.
++                        logger.warning("honest-resolver emission has no open prediction")
++                        continue
++                    if isinstance(item, StreamResolution):
++                        resolved.append(resolution_to_outcome(item, prediction))
++                    else:
++                        drop = drop_to_dropped(item, prediction)
++                        self._append_dropped(drop)
++                        dropped.append(drop)
++                except Exception:
++                    logger.warning(
++                        "honest-resolver emission could not be served", exc_info=False
++                    )
+         if resolved:
+             self._outcomes.extend(resolved)
+             if len(self._outcomes) > self._outcome_limit:
+                 del self._outcomes[: len(self._outcomes) - self._outcome_limit]
+-        return tuple(resolved)
++        return tuple(resolved), tuple(dropped)
+ 
+     def record_warning(self, warning: DataQualityWarning) -> RuntimeUpdate:
+         warning = _safe_warning(warning)
+@@ -607,6 +615,7 @@ class ApplicationRuntime:
+             warnings=tuple(self._warnings),
+             predictions=tuple(self._predictions),
+             outcomes=tuple(self._outcomes),
++            dropped=tuple(self._dropped),
+             model_status=self.model_status(),
+             session=session,
+             trading_day=trading_day,
+@@ -660,9 +669,9 @@ class ApplicationRuntime:
+         changed_observations = list(self.observations.refresh(trade.event_ts_utc))
+         # Run inference before appending the just-started observations: only the
+         # observations completed by this trade are eligible for a prediction now.
+-        predictions = self._run_inference(tuple(changed_observations))
++        predictions, registration_drops = self._run_inference(tuple(changed_observations))
+         # Resolve any open predictions against bars that just closed on this trade.
+-        outcomes = self._track_outcomes(core_update.closed_bars)
++        outcomes, terminal_drops = self._track_outcomes(core_update.closed_bars)
+         for touch in core_update.touches:
+             changed_observations.append(self.observations.start_from_touch(touch))
+         self._feed_status = self._feed_status_for_mode(core_update.feed_status, trade=trade)
+@@ -675,6 +684,7 @@ class ApplicationRuntime:
+             observations=tuple(changed_observations),
+             predictions=predictions,
+             outcomes=outcomes,
++            dropped=(*registration_drops, *terminal_drops),
+         )
+ 
+     def _feed_status_for_mode(
+diff --git a/backend/tests/test_api_contract.py b/backend/tests/test_api_contract.py
+index 45b8fc4..c1a9803 100644
+--- a/backend/tests/test_api_contract.py
++++ b/backend/tests/test_api_contract.py
+@@ -545,6 +545,7 @@ def test_websocket_snapshot_contract_is_versioned_deterministic_and_safe() -> No
+         "warnings",
+         "predictions",
+         "outcomes",
++        "dropped",
+         "model_status",
+         "session",
+         "trading_day",
+@@ -556,6 +557,7 @@ def test_websocket_snapshot_contract_is_versioned_deterministic_and_safe() -> No
+     assert snapshot["payload"]["warnings"] == []
+     assert snapshot["payload"]["predictions"] == []
+     assert snapshot["payload"]["outcomes"] == []
++    assert snapshot["payload"]["dropped"] == []
+     assert snapshot["payload"]["model_status"] == {
+         "loaded": False,
+         "model_id": None,
+@@ -649,6 +651,7 @@ def test_empty_snapshot_payload_has_required_shape() -> None:
+         "warnings",
+         "predictions",
+         "outcomes",
++        "dropped",
+         "model_status",
+         "session",
+         "trading_day",
+diff --git a/backend/tests/test_dark_honest_resolver.py b/backend/tests/test_dark_honest_resolver.py
+deleted file mode 100644
+index cb186f8..0000000
+--- a/backend/tests/test_dark_honest_resolver.py
++++ /dev/null
+@@ -1,212 +0,0 @@
+-"""D1a — the DARK SC streaming honest resolver seat in ApplicationRuntime.
+-
+-The resolver runs alongside the legacy OutcomeTracker at the same lifecycle points
+-(activation / hot-swap / reset), registers every prediction the tracker registers
+-(off the TOUCH anchors carried on the observation chain), advances from the same
+-closed-bars hook, and accumulates into a parallel dark ring consumed only by the
+-gate-B characterization harness — never by any RuntimeUpdate/snapshot/DTO surface.
+-"""
+-
+-from __future__ import annotations
+-
+-import logging
+-from datetime import UTC, datetime, timedelta
+-from pathlib import Path
+-from types import MappingProxyType
+-
+-import pytest
+-from strategy_core import StreamDrop, StreamResolution, load_strategy_contract
+-
+-from trade_lab.domain.events import TradeEvent, TradeSide
+-from trade_lab.domain.levels import LevelDirection, LevelKind, TouchEvent
+-from trade_lab.domain.sessions import SessionName
+-from trade_lab.services.inference.inference_engine import Prediction
+-from trade_lab.services.runtime import ApplicationRuntime, RuntimeSnapshot, RuntimeUpdate
+-
+-_FIXTURE_STRATEGY = Path(__file__).parent / "fixtures" / "strategy.json"
+-# 14:00 UTC = 10:00 ET on a weekday: inside NY, decision (+5m) well before flatten.
+-_TOUCH_TS = datetime(2026, 1, 5, 14, 0, tzinfo=UTC)
+-_LEVEL_TICKS = 68_000
+-
+-
+-class _FakeEngine:
+-    """The minimal engine surface ApplicationRuntime consumes (duck-typed)."""
+-
+-    def __init__(self, contract) -> None:
+-        self.active_contract = contract
+-        self.has_active_model = True
+-        self._counter = 0
+-
+-    def active(self):  # model_status() probe; not under test here.
+-        return None
+-
+-    def predict_for_observation(self, observation, market_context) -> Prediction:
+-        self._counter += 1
+-        return Prediction(
+-            prediction_id=f"pred-{self._counter}",
+-            touch_id=observation.originating_touch_id,
+-            observation_id=observation.observation_id,
+-            event_ts_utc=observation.scheduled_end_ts_utc,
+-            predicted_class="tradeable_reversal",
+-            probabilities=MappingProxyType({"tradeable_reversal": 1.0}),
+-            feature_values=MappingProxyType({}),
+-            level_kind=observation.level_kind.value,
+-            level_price_ticks=observation.level_price_ticks,
+-            direction="long",
+-            session="ny",
+-            is_eligible=True,
+-            model_id="m-1",
+-            contract_id="NQ_test",
+-            nan_count=0,
+-        )
+-
+-
+-def _runtime(*, engine=None, tick_timeframes=(147,), observation_duration_seconds=300):
+-    return ApplicationRuntime(
+-        requested_symbol="NQ.c.0",
+-        tick_timeframes=tick_timeframes,
+-        observation_duration_seconds=observation_duration_seconds,
+-        inference_engine=engine,
+-    )
+-
+-
+-def _trade(ts: datetime, price_ticks: int) -> TradeEvent:
+-    return TradeEvent(
+-        event_ts_utc=ts,
+-        receive_ts_utc=None,
+-        instrument_id=1,
+-        requested_symbol="NQ.c.0",
+-        raw_symbol=None,
+-        price_ticks=price_ticks,
+-        size=1,
+-        side=TradeSide.UNKNOWN,
+-        source_schema="trades",
+-    )
+-
+-
+-def _touch(ts: datetime = _TOUCH_TS) -> TouchEvent:
+-    return TouchEvent(
+-        touch_id="touch-1",
+-        event_ts_utc=ts,
+-        trading_day=ts.date(),
+-        session=SessionName.NY,
+-        level_kind=LevelKind.NY_LOW,
+-        level_price_ticks=_LEVEL_TICKS,
+-        trade_price_ticks=_LEVEL_TICKS,
+-        requested_symbol="NQ.c.0",
+-        raw_symbol=None,
+-        instrument_id=1,
+-        direction=LevelDirection.LONG,
+-    )
+-
+-
+-def _drive_registration(runtime) -> None:
+-    """Seed the ring, start an observation from a touch, and expire it into a prediction."""
+-
+-    runtime.observations.start_from_touch(_touch())
+-    # Prints before the decision instant feed the SC trade ring the resolver queries.
+-    runtime.process_market_event(_trade(_TOUCH_TS + timedelta(seconds=60), _LEVEL_TICKS + 4))
+-    # The first trade at/after scheduled_end (touch + 300s) expires the observation,
+-    # produces the prediction, and registers BOTH the tracker and the dark resolver.
+-    runtime.process_market_event(_trade(_TOUCH_TS + timedelta(seconds=301), _LEVEL_TICKS + 6))
+-
+-
+-def test_registration_mirrors_tracker_and_resolves_dark() -> None:
+-    engine = _FakeEngine(load_strategy_contract(_FIXTURE_STRATEGY))
+-    runtime = _runtime(engine=engine)
+-    _drive_registration(runtime)
+-
+-    assert runtime._outcome_tracker is not None and runtime._outcome_tracker.open_count == 1
+-    assert runtime._honest_resolver is not None and runtime._honest_resolver.open_count == 1
+-    assert runtime.dark_outcomes == ()  # live setup, no registration-time drop
+-
+-    # 147 trades spiking +16 points close a 147t bar inside the forward window -> TP
+-    # on both paths; the dark resolution carries the ring entry (the +4-tick print at
+-    # the decision instant), not the level price.
+-    ts = _TOUCH_TS + timedelta(seconds=310)
+-    for i in range(147):
+-        runtime.process_market_event(_trade(ts + timedelta(seconds=i), _LEVEL_TICKS + 64))
+-    dark = runtime.dark_outcomes
+-    assert len(dark) == 1
+-    resolution = dark[0]
+-    assert isinstance(resolution, StreamResolution)
+-    assert resolution.key == "pred-1"
+-    assert resolution.result.label == "tradeable_reversal"
+-    assert resolution.entry_price == (_LEVEL_TICKS + 4) * 0.25
+-    assert runtime._honest_resolver.open_count == 0
+-    # The legacy tracker resolved the same prediction on its own (level-price) path.
+-    assert len(runtime.outcomes) == 1
+-
+-
+-def test_registration_time_drop_lands_in_dark_ring() -> None:
+-    engine = _FakeEngine(load_strategy_contract(_FIXTURE_STRATEGY))
+-    runtime = _runtime(engine=engine)
+-    # 21:36 UTC = 16:36 ET; decision (+5m) = 16:41 ET >= 16:40 flatten -> drop.
+-    late = datetime(2026, 1, 5, 21, 36, tzinfo=UTC)
+-    runtime.observations.start_from_touch(_touch(ts=late))
+-    runtime.process_market_event(_trade(late + timedelta(seconds=60), _LEVEL_TICKS))
+-    runtime.process_market_event(_trade(late + timedelta(seconds=301), _LEVEL_TICKS))
+-
+-    dark = runtime.dark_outcomes
+-    assert len(dark) == 1
+-    assert isinstance(dark[0], StreamDrop) and dark[0].reason == "flatten"
+-    assert runtime._honest_resolver.open_count == 0
+-    # The legacy tracker has no flatten concept: it keeps the prediction open.
+-    assert runtime._outcome_tracker.open_count == 1
+-
+-
+-def test_reset_and_hot_swap_clear_dark_state() -> None:
+-    engine = _FakeEngine(load_strategy_contract(_FIXTURE_STRATEGY))
+-    runtime = _runtime(engine=engine)
+-    _drive_registration(runtime)
+-    assert runtime._honest_resolver.open_count == 1
+-
+-    runtime.reset()
+-    assert runtime._honest_resolver.open_count == 0
+-    assert runtime.dark_outcomes == ()
+-
+-    _drive_registration(runtime)
+-    assert runtime._honest_resolver.open_count == 1
+-    runtime.set_inference_engine(engine)  # hot-swap rebuilds the resolver
+-    assert runtime._honest_resolver.open_count == 0
+-    assert runtime.dark_outcomes == ()
+-
+-
+-def test_dark_ring_is_isolated_from_update_snapshot_and_outcomes() -> None:
+-    engine = _FakeEngine(load_strategy_contract(_FIXTURE_STRATEGY))
+-    runtime = _runtime(engine=engine)
+-    _drive_registration(runtime)
+-    ts = _TOUCH_TS + timedelta(seconds=310)
+-    update = None
+-    for i in range(147):
+-        update = runtime.process_market_event(_trade(ts + timedelta(seconds=i), _LEVEL_TICKS + 64))
+-    assert len(runtime.dark_outcomes) == 1
+-    # No dark field exists on any emitted surface, and the dark resolution never
+-    # leaks into the legacy outcome stream (which carries TL Outcome objects only).
+-    assert "dark_outcomes" not in {f for f in RuntimeUpdate.__dataclass_fields__}
+-    assert "dark_outcomes" not in {f for f in RuntimeSnapshot.__dataclass_fields__}
+-    assert all(type(o).__name__ == "Outcome" for o in update.outcomes)
+-    assert all(type(o).__name__ == "Outcome" for o in runtime.snapshot().outcomes)
+-
+-
+-def test_offset_mismatch_warns_once_at_activation(caplog: pytest.LogCaptureFixture) -> None:
+-    engine = _FakeEngine(load_strategy_contract(_FIXTURE_STRATEGY))
+-    with caplog.at_level(logging.WARNING, logger="trade_lab.services.runtime"):
+-        runtime = _runtime(engine=engine, observation_duration_seconds=600)
+-    hits = [r for r in caplog.records if "decision_offset_minutes" in r.getMessage()]
+-    assert len(hits) == 1  # once at activation, not per prediction
+-    assert runtime._honest_resolver is not None
+-
+-
+-def test_forward_timeframe_not_configured_fails_loud_at_activation() -> None:
+-    engine = _FakeEngine(load_strategy_contract(_FIXTURE_STRATEGY))
+-    with pytest.raises(ValueError, match="forward timeframe"):
+-        _runtime(engine=engine, tick_timeframes=(2,))
+-
+-
+-def test_no_engine_means_no_resolver_and_empty_dark_ring() -> None:
+-    runtime = _runtime(engine=None)
+-    assert runtime._honest_resolver is None
+-    runtime.observations.start_from_touch(_touch())
+-    runtime.process_market_event(_trade(_TOUCH_TS + timedelta(seconds=301), _LEVEL_TICKS))
+-    assert runtime.dark_outcomes == ()
+diff --git a/backend/tests/test_honest_resolver_serving.py b/backend/tests/test_honest_resolver_serving.py
+new file mode 100644
+index 0000000..e3423d8
+--- /dev/null
++++ b/backend/tests/test_honest_resolver_serving.py
+@@ -0,0 +1,285 @@
++"""D1b — the SC streaming honest resolver IS the served outcome path.
++
++The resolver (promoted from its D1a dark seat) registers every prediction off the
++TOUCH anchors carried on the observation chain, advances from the closed-bars
++hook, and its emissions are served through the resolution adapter: resolutions
++become ``Outcome``s (honest entry, TL-side correctness, 0-based bars) on
++``RuntimeUpdate.outcomes``/the snapshot; drops become ``DroppedPrediction``s on
++the new ``dropped`` surfaces and the ``prediction.dropped`` WS frame. The legacy
++level-anchored OutcomeTracker is deleted.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++from datetime import UTC, datetime, timedelta
++from pathlib import Path
++from types import MappingProxyType
++
++import pytest
++from strategy_core import load_strategy_contract
++
++from trade_lab.domain.events import TradeEvent, TradeSide
++from trade_lab.domain.levels import LevelDirection, LevelKind, TouchEvent
++from trade_lab.domain.outcomes import DroppedPrediction, Outcome, ResolutionType
++from trade_lab.domain.sessions import SessionName
++from trade_lab.services.broadcaster import WebSocketBroadcaster
++from trade_lab.services.inference.inference_engine import Prediction
++from trade_lab.services.runtime import ApplicationRuntime, RuntimeSnapshot, RuntimeUpdate
++
++_FIXTURE_STRATEGY = Path(__file__).parent / "fixtures" / "strategy.json"
++# 14:00 UTC = 10:00 ET on a weekday: inside NY, decision (+5m) well before flatten.
++_TOUCH_TS = datetime(2026, 1, 5, 14, 0, tzinfo=UTC)
++_LEVEL_TICKS = 68_000
++
++
++class _FakeEngine:
++    """The minimal engine surface ApplicationRuntime consumes (duck-typed)."""
++
++    def __init__(self, contract) -> None:
++        self.active_contract = contract
++        self.has_active_model = True
++        self._counter = 0
++
++    def active(self):  # model_status() probe; not under test here.
++        return None
++
++    def predict_for_observation(self, observation, market_context) -> Prediction:
++        self._counter += 1
++        return Prediction(
++            prediction_id=f"pred-{self._counter}",
++            touch_id=observation.originating_touch_id,
++            observation_id=observation.observation_id,
++            event_ts_utc=observation.scheduled_end_ts_utc,
++            predicted_class="tradeable_reversal",
++            probabilities=MappingProxyType({"tradeable_reversal": 1.0}),
++            feature_values=MappingProxyType({}),
++            level_kind=observation.level_kind.value,
++            level_price_ticks=observation.level_price_ticks,
++            direction="long",
++            session="ny",
++            is_eligible=True,
++            model_id="m-1",
++            contract_id="NQ_test",
++            nan_count=0,
++        )
++
++
++def _runtime(*, engine=None, tick_timeframes=(147,), observation_duration_seconds=300):
++    return ApplicationRuntime(
++        requested_symbol="NQ.c.0",
++        tick_timeframes=tick_timeframes,
++        observation_duration_seconds=observation_duration_seconds,
++        inference_engine=engine,
++    )
++
++
++def _trade(ts: datetime, price_ticks: int) -> TradeEvent:
++    return TradeEvent(
++        event_ts_utc=ts,
++        receive_ts_utc=None,
++        instrument_id=1,
++        requested_symbol="NQ.c.0",
++        raw_symbol=None,
++        price_ticks=price_ticks,
++        size=1,
++        side=TradeSide.UNKNOWN,
++        source_schema="trades",
++    )
++
++
++def _touch(ts: datetime = _TOUCH_TS) -> TouchEvent:
++    return TouchEvent(
++        touch_id="touch-1",
++        event_ts_utc=ts,
++        trading_day=ts.date(),
++        session=SessionName.NY,
++        level_kind=LevelKind.NY_LOW,
++        level_price_ticks=_LEVEL_TICKS,
++        trade_price_ticks=_LEVEL_TICKS,
++        requested_symbol="NQ.c.0",
++        raw_symbol=None,
++        instrument_id=1,
++        direction=LevelDirection.LONG,
++    )
++
++
++def _drive_registration(runtime) -> None:
++    """Seed the ring, start an observation from a touch, and expire it into a prediction."""
++
++    runtime.observations.start_from_touch(_touch())
++    # Prints before the decision instant feed the SC trade ring the resolver queries.
++    runtime.process_market_event(_trade(_TOUCH_TS + timedelta(seconds=60), _LEVEL_TICKS + 4))
++    # The first trade at/after scheduled_end (touch + 300s) expires the observation,
++    # produces the prediction, and registers it with the resolver.
++    runtime.process_market_event(_trade(_TOUCH_TS + timedelta(seconds=301), _LEVEL_TICKS + 6))
++
++
++def _spike_to_resolution(runtime) -> RuntimeUpdate:
++    """Close one 147t bar at +16 points inside the forward window (TP on the first bar).
++
++    Returns the update that carried the resolution (the bar closes mid-spike once
++    147 trades accumulate, not on the final trade).
++    """
++
++    ts = _TOUCH_TS + timedelta(seconds=310)
++    carrying = RuntimeUpdate()
++    for i in range(147):
++        update = runtime.process_market_event(
++            _trade(ts + timedelta(seconds=i), _LEVEL_TICKS + 64)
++        )
++        if update.outcomes:
++            carrying = update
++    return carrying
++
++
++def test_resolution_is_served_with_honest_entry_and_zero_based_bars() -> None:
++    engine = _FakeEngine(load_strategy_contract(_FIXTURE_STRATEGY))
++    runtime = _runtime(engine=engine)
++    _drive_registration(runtime)
++
++    assert runtime._honest_resolver is not None and runtime._honest_resolver.open_count == 1
++    assert runtime.outcomes == () and runtime.dropped == ()
++
++    update = _spike_to_resolution(runtime)
++    assert len(runtime.outcomes) == 1
++    outcome = runtime.outcomes[0]
++    assert isinstance(outcome, Outcome)
++    assert outcome.prediction_id == "pred-1"
++    assert outcome.touch_id == "touch-1"
++    assert outcome.actual_class == "tradeable_reversal"
++    assert outcome.resolution_type is ResolutionType.TP_HIT
++    assert outcome.correct is True  # predicted == actual, computed TL-side
++    # The honest fill: the ring entry (the +4-tick print at the decision instant),
++    # NOT the level price the retired tracker anchored on.
++    assert outcome.entry_price == (_LEVEL_TICKS + 4) * 0.25
++    # ZERO-BASED bars: the FIRST in-window forward bar resolves at index 0 (the
++    # retired tracker would have served a 1-based count of 1).
++    assert outcome.bars_to_resolution == 0
++    assert outcome.resolved_ts_utc is not None
++    assert runtime._honest_resolver.open_count == 0
++    assert runtime._open_predictions == {}
++    # The resolution rode the RuntimeUpdate (the prediction.resolved path) and snapshot.
++    assert update.outcomes == (outcome,)
++    assert runtime.snapshot().outcomes == (outcome,)
++
++
++def test_registration_time_drop_is_served_and_broadcast_end_to_end() -> None:
++    engine = _FakeEngine(load_strategy_contract(_FIXTURE_STRATEGY))
++    runtime = _runtime(engine=engine)
++    broadcaster = WebSocketBroadcaster(runtime)
++    # 21:36 UTC = 16:36 ET; decision (+5m) = 16:41 ET >= 16:40 flatten -> drop.
++    late = datetime(2026, 1, 5, 21, 36, tzinfo=UTC)
++    runtime.observations.start_from_touch(_touch(ts=late))
++    runtime.process_market_event(_trade(late + timedelta(seconds=60), _LEVEL_TICKS))
++    update = runtime.process_market_event(_trade(late + timedelta(seconds=301), _LEVEL_TICKS))
++
++    assert len(update.dropped) == 1
++    dropped = update.dropped[0]
++    assert isinstance(dropped, DroppedPrediction)
++    assert dropped.reason == "flatten"
++    assert dropped.prediction_id == "pred-1"
++    assert dropped.touch_id == "touch-1"
++    assert dropped.entry_price is None  # registration-time drop: no fill was queried
++    assert runtime._honest_resolver.open_count == 0
++    assert runtime.dropped == (dropped,)
++    assert runtime.outcomes == ()  # a drop never enters the outcome stream
++    assert runtime.snapshot().dropped == (dropped,)
++
++    # End-to-end: the drop rides a prediction.dropped WS frame off the same update.
++    envelopes = [json.loads(raw) for raw in broadcaster.messages_for_update(update)]
++    frames = [e for e in envelopes if e["type"] == "prediction.dropped"]
++    assert len(frames) == 1
++    payload = frames[0]["payload"]["dropped"]
++    assert payload["prediction_id"] == "pred-1"
++    assert payload["touch_id"] == "touch-1"
++    assert payload["reason"] == "flatten"
++    assert payload["entry_price"] is None
++    assert payload["decision_ts_utc"] is not None
++
++
++def test_reset_and_hot_swap_clear_serving_state() -> None:
++    engine = _FakeEngine(load_strategy_contract(_FIXTURE_STRATEGY))
++    runtime = _runtime(engine=engine)
++    _drive_registration(runtime)
++    assert runtime._honest_resolver.open_count == 1
++    assert runtime._open_predictions != {}
++
++    runtime.reset()
++    assert runtime._honest_resolver.open_count == 0
++    assert runtime._open_predictions == {}
++    assert runtime.outcomes == () and runtime.dropped == ()
++
++    _drive_registration(runtime)
++    assert runtime._honest_resolver.open_count == 1
++    runtime.set_inference_engine(engine)  # hot-swap rebuilds the resolver
++    assert runtime._honest_resolver.open_count == 0
++    assert runtime._open_predictions == {}
++    assert runtime.outcomes == () and runtime.dropped == ()
++
++
++def test_dark_seat_surfaces_are_gone_and_streams_stay_typed() -> None:
++    engine = _FakeEngine(load_strategy_contract(_FIXTURE_STRATEGY))
++    runtime = _runtime(engine=engine)
++    _drive_registration(runtime)
++    update = _spike_to_resolution(runtime)
++    # The dark ring died WITH the flip: the resolver serves, nothing accumulates darkly.
++    assert not hasattr(runtime, "dark_outcomes")
++    assert "dropped" in RuntimeUpdate.__dataclass_fields__
++    assert "dropped" in RuntimeSnapshot.__dataclass_fields__
++    # Served streams carry exactly the domain types (no SC envelope leaks).
++    assert all(type(o).__name__ == "Outcome" for o in update.outcomes)
++    assert all(type(o).__name__ == "Outcome" for o in runtime.snapshot().outcomes)
++    assert all(type(d).__name__ == "DroppedPrediction" for d in runtime.snapshot().dropped)
++
++
++def test_failing_adaptation_never_breaks_the_hot_path(
++    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
++) -> None:
++    """The serving seat keeps D1a's swallow posture: an emission that cannot be
++    adapted is logged and lost, but the trade event, the bar's other emissions,
++    and the RuntimeUpdate all survive (the docstring's hot-path invariant)."""
++
++    engine = _FakeEngine(load_strategy_contract(_FIXTURE_STRATEGY))
++    runtime = _runtime(engine=engine)
++    _drive_registration(runtime)
++
++    def _boom(resolution, prediction):
++        raise ValueError("synthetic adapter failure")
++
++    monkeypatch.setattr("trade_lab.services.runtime.resolution_to_outcome", _boom)
++    with caplog.at_level(logging.WARNING, logger="trade_lab.services.runtime"):
++        update = _spike_to_resolution(runtime)
++    # The resolution was lost (logged), not served — and nothing raised.
++    assert runtime.outcomes == () and update.outcomes == ()
++    assert any("could not be served" in r.getMessage() for r in caplog.records)
++    # The hot path kept flowing: subsequent trades still process normally.
++    follow_up = runtime.process_market_event(
++        _trade(_TOUCH_TS + timedelta(seconds=600), _LEVEL_TICKS + 64)
++    )
++    assert follow_up.feed_status is not None
++
++
++def test_offset_mismatch_warns_once_at_activation(caplog: pytest.LogCaptureFixture) -> None:
++    engine = _FakeEngine(load_strategy_contract(_FIXTURE_STRATEGY))
++    with caplog.at_level(logging.WARNING, logger="trade_lab.services.runtime"):
++        runtime = _runtime(engine=engine, observation_duration_seconds=600)
++    hits = [r for r in caplog.records if "decision_offset_minutes" in r.getMessage()]
++    assert len(hits) == 1  # once at activation, not per prediction
++    assert runtime._honest_resolver is not None
++
++
++def test_forward_timeframe_not_configured_fails_loud_at_activation() -> None:
++    engine = _FakeEngine(load_strategy_contract(_FIXTURE_STRATEGY))
++    with pytest.raises(ValueError, match="forward timeframe"):
++        _runtime(engine=engine, tick_timeframes=(2,))
++
++
++def test_no_engine_means_no_resolver_and_no_outcome_tracking() -> None:
++    runtime = _runtime(engine=None)
++    assert runtime._honest_resolver is None
++    runtime.observations.start_from_touch(_touch())
++    update = runtime.process_market_event(_trade(_TOUCH_TS + timedelta(seconds=301), _LEVEL_TICKS))
++    assert update.outcomes == () and update.dropped == ()
++    assert runtime.outcomes == () and runtime.dropped == ()
+diff --git a/backend/tests/test_inference_api.py b/backend/tests/test_inference_api.py
+index a97811d..3d18dc4 100644
+--- a/backend/tests/test_inference_api.py
++++ b/backend/tests/test_inference_api.py
+@@ -432,6 +432,7 @@ def test_resolved_outcome_envelope_validates_when_a_forward_bar_closes(tmp_path:
+         max_mae_pts=2.0,
+         bars_to_resolution=3,
+         resolved_ts_utc=day0 + timedelta(minutes=10),
++        entry_price=17_002.75,
+     )
+     raw = broadcaster.envelope_bytes("prediction.resolved", outcome_payload(sample))
+     envelope = json.loads(raw)
+@@ -439,6 +440,57 @@ def test_resolved_outcome_envelope_validates_when_a_forward_bar_closes(tmp_path:
+     assert envelope["version"] == MESSAGE_VERSION
+     assert envelope["type"] == "prediction.resolved"
+     assert envelope["payload"]["outcome"] == outcome_to_dto(sample).model_dump(mode="json")
++    # D1b: the served shape carries the honest fill the excursions were anchored on.
++    assert set(envelope["payload"]["outcome"]) == {
++        "outcome_id",
++        "prediction_id",
++        "touch_id",
++        "resolution_type",
++        "actual_class",
++        "predicted_class",
++        "correct",
++        "max_mfe_pts",
++        "max_mae_pts",
++        "bars_to_resolution",
++        "resolved_ts_utc",
++        "entry_price",
++    }
++    assert envelope["payload"]["outcome"]["entry_price"] == 17_002.75
++    _assert_no_secret_text(envelope)
++    _assert_no_temp_path(envelope, tmp_path)
++
++
++def test_dropped_prediction_envelope_validates(tmp_path: Path) -> None:
++    _client, _runtime, broadcaster = _runtime_app_with_active_model(tmp_path)
++
++    # Synthesize a drop envelope the same way the resolved test does, validating the
++    # D1b prediction.dropped frame shape without depending on flatten-window timing.
++    from trade_lab.api.dto import dropped_payload, dropped_to_dto
++    from trade_lab.domain.outcomes import DroppedPrediction
++
++    day0 = datetime(2026, 1, 5, 21, 41, tzinfo=UTC)
++    sample = DroppedPrediction(
++        prediction_id="prediction-1",
++        touch_id="touch-1",
++        reason="flatten",
++        decision_ts_utc=day0,
++        entry_price=None,
++    )
++    raw = broadcaster.envelope_bytes("prediction.dropped", dropped_payload(sample))
++    envelope = json.loads(raw)
++
++    assert envelope["version"] == MESSAGE_VERSION
++    assert envelope["type"] == "prediction.dropped"
++    assert envelope["payload"]["dropped"] == dropped_to_dto(sample).model_dump(mode="json")
++    assert set(envelope["payload"]["dropped"]) == {
++        "prediction_id",
++        "touch_id",
++        "reason",
++        "decision_ts_utc",
++        "entry_price",
++    }
++    assert envelope["payload"]["dropped"]["reason"] == "flatten"
++    assert envelope["payload"]["dropped"]["entry_price"] is None
+     _assert_no_secret_text(envelope)
+     _assert_no_temp_path(envelope, tmp_path)
+ 
+diff --git a/backend/tests/test_outcome_tracker.py b/backend/tests/test_outcome_tracker.py
+deleted file mode 100644
+index b2121d0..0000000
+--- a/backend/tests/test_outcome_tracker.py
++++ /dev/null
+@@ -1,405 +0,0 @@
+-"""Stage 4 — MAE-first OutcomeTracker on contract forward bars (147t).
+-
+-Pure Python: no CatBoost is loaded here. A frozen :class:`Prediction` is built
+-by hand (Stage 3's shape) and resolved against synthetic 147t :class:`Candle`s.
+-The ladder mirrors ``dashboard_utility_labeling`` exactly: MAE is checked FIRST,
+-so a bar that breaches both the stop and the target resolves to the LOSS.
+-
+-Thresholds come from the fixture contract: tp 15 / sl 30 / trap_mfe_min 5 pts,
+-tick_size 0.25, forward_bar_type 147t, RTH cutoff 16:15 US/Eastern.
+-"""
+-
+-from __future__ import annotations
+-
+-from datetime import UTC, datetime, timedelta
+-from pathlib import Path
+-from types import MappingProxyType
+-
+-from strategy_core import load_strategy_contract
+-
+-from trade_lab.domain.candles import Candle, CandleCloseReason
+-from trade_lab.domain.outcomes import ResolutionType
+-from trade_lab.services.inference.inference_engine import Prediction
+-from trade_lab.services.inference.outcome_tracker import OutcomeTracker
+-
+-_FIXTURE_STRATEGY = Path(__file__).parent / "fixtures" / "strategy.json"
+-_TICK_SIZE = 0.25
+-# 68_000 ticks * 0.25 = 17_000.0 points entry reference.
+-_LEVEL_TICKS = 68_000
+-# A 14:30Z touch sits well inside RTH (≈09:30 ET), comfortably before the cutoff.
+-_TOUCH_TS = datetime(2026, 1, 5, 14, 30, tzinfo=UTC)
+-
+-
+-def _contract():
+-    return load_strategy_contract(_FIXTURE_STRATEGY)
+-
+-
+-def _points_to_ticks(points: float) -> int:
+-    return round(points / _TICK_SIZE)
+-
+-
+-def _prediction(
+-    *,
+-    direction: str = "long",
+-    predicted_class: str = "tradeable_reversal",
+-    level_ticks: int = _LEVEL_TICKS,
+-    touch_ts: datetime = _TOUCH_TS,
+-    prediction_id: str = "pred-1",
+-    touch_id: str = "touch-1",
+-) -> Prediction:
+-    return Prediction(
+-        prediction_id=prediction_id,
+-        touch_id=touch_id,
+-        observation_id="obs-1",
+-        event_ts_utc=touch_ts,
+-        predicted_class=predicted_class,
+-        probabilities=MappingProxyType({predicted_class: 1.0}),
+-        feature_values=MappingProxyType({}),
+-        level_kind="ny_low" if direction == "long" else "ny_high",
+-        level_price_ticks=level_ticks,
+-        direction=direction,
+-        session="ny",
+-        is_eligible=True,
+-        model_id="m-1",
+-        contract_id="NQ_test",
+-        nan_count=0,
+-    )
+-
+-
+-def _bar(
+-    *,
+-    high_pts: float,
+-    low_pts: float,
+-    close_ts: datetime,
+-    timeframe_ticks: int = 147,
+-    entry_pts: float = 17_000.0,
+-) -> Candle:
+-    """Build a 147t bar whose high/low are entry ± the given point offsets.
+-
+-    ``high_pts``/``low_pts`` are absolute point levels relative to the 17_000 entry
+-    so callers express MFE/MAE directly.
+-    """
+-
+-    high_ticks = _points_to_ticks(high_pts)
+-    low_ticks = _points_to_ticks(low_pts)
+-    return Candle(
+-        timeframe_ticks=timeframe_ticks,
+-        trading_day=close_ts.date(),
+-        bar_index=0,
+-        bar_id=f"{timeframe_ticks}t:{close_ts.date().isoformat()}:0",
+-        open_ts_utc=close_ts - timedelta(seconds=30),
+-        close_ts_utc=close_ts,
+-        open_ticks=_points_to_ticks(entry_pts),
+-        high_ticks=high_ticks,
+-        low_ticks=low_ticks,
+-        close_ticks=high_ticks,
+-        volume=147,
+-        trade_count=147,
+-        is_complete=True,
+-        is_partial=False,
+-        close_reason=CandleCloseReason.COMPLETE,
+-    )
+-
+-
+-# --------------------------------------------------------------------------- #
+-# MAE-first ladder
+-# --------------------------------------------------------------------------- #
+-
+-
+-def test_same_bar_breaching_both_sl_and_tp_resolves_to_loss() -> None:
+-    """A single bar satisfying BOTH SL and TP must resolve to the LOSS, not the win.
+-
+-    This is the crux of MAE-first: MAE is checked before MFE, so the stop wins.
+-    With MFE 16 >= trap_mfe_min 5 the loss is a trap_reversal.
+-    """
+-
+-    tracker = OutcomeTracker(_contract())
+-    tracker.register(_prediction(direction="long"))
+-    bar = _bar(
+-        high_pts=17_000 + 16,  # MFE 16 >= tp 15
+-        low_pts=17_000 - 31,  # MAE 31 >= sl 30
+-        close_ts=_TOUCH_TS + timedelta(minutes=2),
+-    )
+-
+-    outcomes = tracker.on_bar_close(bar)
+-
+-    assert len(outcomes) == 1
+-    outcome = outcomes[0]
+-    assert outcome.resolution_type is ResolutionType.SL_HIT
+-    assert outcome.actual_class == "trap_reversal"  # mfe>=trap_min -> trap, not tradeable
+-    assert outcome.max_mae_pts == 31.0
+-    assert outcome.max_mfe_pts == 16.0
+-    assert tracker.open_count == 0
+-
+-
+-def test_sl_hit_with_low_mfe_is_aggressive_blowthrough() -> None:
+-    tracker = OutcomeTracker(_contract())
+-    tracker.register(_prediction(direction="long", predicted_class="aggressive_blowthrough"))
+-    bar = _bar(
+-        high_pts=17_000 + 3,  # MFE 3 < trap_mfe_min 5
+-        low_pts=17_000 - 30,  # MAE 30 >= sl 30
+-        close_ts=_TOUCH_TS + timedelta(minutes=2),
+-    )
+-
+-    outcomes = tracker.on_bar_close(bar)
+-
+-    assert len(outcomes) == 1
+-    assert outcomes[0].resolution_type is ResolutionType.SL_HIT
+-    assert outcomes[0].actual_class == "aggressive_blowthrough"
+-    assert outcomes[0].correct is True  # predicted == actual
+-
+-
+-def test_trap_vs_blowthrough_split_at_trap_mfe_min() -> None:
+-    """Exactly at trap_mfe_min the loss is a trap; just below it is a blowthrough."""
+-
+-    contract = _contract()
+-
+-    at_min = OutcomeTracker(contract)
+-    at_min.register(_prediction(direction="long"))
+-    trap = at_min.on_bar_close(
+-        _bar(high_pts=17_000 + 5, low_pts=17_000 - 30, close_ts=_TOUCH_TS + timedelta(minutes=1))
+-    )
+-    assert trap[0].actual_class == "trap_reversal"
+-
+-    below_min = OutcomeTracker(contract)
+-    below_min.register(_prediction(direction="long"))
+-    blow = below_min.on_bar_close(
+-        _bar(high_pts=17_000 + 4, low_pts=17_000 - 30, close_ts=_TOUCH_TS + timedelta(minutes=1))
+-    )
+-    assert blow[0].actual_class == "aggressive_blowthrough"
+-
+-
+-def test_tp_hit_when_only_target_is_reached() -> None:
+-    tracker = OutcomeTracker(_contract())
+-    tracker.register(_prediction(direction="long", predicted_class="tradeable_reversal"))
+-    bar = _bar(
+-        high_pts=17_000 + 15,  # MFE 15 >= tp 15
+-        low_pts=17_000 - 10,  # MAE 10 < sl 30
+-        close_ts=_TOUCH_TS + timedelta(minutes=2),
+-    )
+-
+-    outcomes = tracker.on_bar_close(bar)
+-
+-    assert len(outcomes) == 1
+-    assert outcomes[0].resolution_type is ResolutionType.TP_HIT
+-    assert outcomes[0].actual_class == "tradeable_reversal"
+-    assert outcomes[0].correct is True
+-
+-
+-def test_running_max_accumulates_across_bars() -> None:
+-    """MFE/MAE accumulate across bars; neither bar alone hits a threshold."""
+-
+-    tracker = OutcomeTracker(_contract())
+-    tracker.register(_prediction(direction="long"))
+-
+-    first = tracker.on_bar_close(
+-        _bar(high_pts=17_000 + 8, low_pts=17_000 - 8, close_ts=_TOUCH_TS + timedelta(minutes=1))
+-    )
+-    assert first == ()  # neither tp(15) nor sl(30) hit yet
+-    assert tracker.open_count == 1
+-
+-    second = tracker.on_bar_close(
+-        _bar(high_pts=17_000 + 16, low_pts=17_000 - 2, close_ts=_TOUCH_TS + timedelta(minutes=2))
+-    )
+-    assert len(second) == 1
+-    assert second[0].resolution_type is ResolutionType.TP_HIT
+-    assert second[0].bars_to_resolution == 2  # both bars scanned
+-
+-
+-# --------------------------------------------------------------------------- #
+-# Direction
+-# --------------------------------------------------------------------------- #
+-
+-
+-def test_short_direction_inverts_mfe_and_mae() -> None:
+-    """For a SHORT, favorable = entry-low and adverse = high-entry."""
+-
+-    tracker = OutcomeTracker(_contract())
+-    tracker.register(_prediction(direction="short", predicted_class="tradeable_reversal"))
+-    # Price falls 15 below entry (MFE 15 for a short) and only rises 5 (MAE 5).
+-    bar = _bar(
+-        high_pts=17_000 + 5,
+-        low_pts=17_000 - 15,
+-        close_ts=_TOUCH_TS + timedelta(minutes=2),
+-    )
+-
+-    outcomes = tracker.on_bar_close(bar)
+-
+-    assert len(outcomes) == 1
+-    assert outcomes[0].resolution_type is ResolutionType.TP_HIT
+-    assert outcomes[0].max_mfe_pts == 15.0
+-    assert outcomes[0].max_mae_pts == 5.0
+-
+-
+-def test_short_sl_hit_is_a_loss() -> None:
+-    tracker = OutcomeTracker(_contract())
+-    tracker.register(_prediction(direction="short"))
+-    # Price rises 30 above entry (MAE 30 for a short) -> stop hit; small favorable.
+-    bar = _bar(
+-        high_pts=17_000 + 30,
+-        low_pts=17_000 - 6,
+-        close_ts=_TOUCH_TS + timedelta(minutes=2),
+-    )
+-
+-    outcomes = tracker.on_bar_close(bar)
+-
+-    assert outcomes[0].resolution_type is ResolutionType.SL_HIT
+-    assert outcomes[0].actual_class == "trap_reversal"  # mfe 6 >= trap_min 5
+-
+-
+-# --------------------------------------------------------------------------- #
+-# Entry reference + correctness flag
+-# --------------------------------------------------------------------------- #
+-
+-
+-def test_entry_reference_is_the_level_price() -> None:
+-    """A different level price shifts the entry, so the same bar resolves differently."""
+-
+-    contract = _contract()
+-    # Level at 68_060 ticks = 17_015 points. A bar topping at 17_015 has MFE 0,
+-    # bottoming at 16_985 has MAE 30 -> stop. (Same absolute bar, higher entry.)
+-    tracker = OutcomeTracker(contract)
+-    tracker.register(_prediction(direction="long", level_ticks=68_060))
+-    bar = _bar(
+-        high_pts=17_015,  # == entry -> MFE 0
+-        low_pts=17_015 - 30,  # MAE 30 -> stop
+-        close_ts=_TOUCH_TS + timedelta(minutes=2),
+-    )
+-
+-    outcomes = tracker.on_bar_close(bar)
+-
+-    assert outcomes[0].resolution_type is ResolutionType.SL_HIT
+-    assert outcomes[0].max_mfe_pts == 0.0
+-    assert outcomes[0].max_mae_pts == 30.0
+-
+-
+-def test_correct_flag_is_false_on_misprediction() -> None:
+-    tracker = OutcomeTracker(_contract())
+-    # Predicted a win, actual is a stop loss -> correct is False.
+-    tracker.register(_prediction(direction="long", predicted_class="tradeable_reversal"))
+-    bar = _bar(
+-        high_pts=17_000 + 1,
+-        low_pts=17_000 - 30,
+-        close_ts=_TOUCH_TS + timedelta(minutes=2),
+-    )
+-
+-    outcomes = tracker.on_bar_close(bar)
+-
+-    assert outcomes[0].actual_class == "aggressive_blowthrough"
+-    assert outcomes[0].predicted_class == "tradeable_reversal"
+-    assert outcomes[0].correct is False
+-
+-
+-# --------------------------------------------------------------------------- #
+-# Session-end forced resolution
+-# --------------------------------------------------------------------------- #
+-
+-
+-def test_session_end_forces_resolution_at_rth_close() -> None:
+-    """A bar closing at/after 16:15 ET forces resolution even if neither hit.
+-
+-    16:15 US/Eastern in January is 21:15 UTC. Neither tp nor sl is reached, so the
+-    forced ladder classifies on MFE alone: mfe<trap_min -> blowthrough.
+-    """
+-
+-    tracker = OutcomeTracker(_contract())
+-    tracker.register(_prediction(direction="long"))
+-    cutoff_close = datetime(2026, 1, 5, 21, 15, tzinfo=UTC)  # 16:15 ET
+-    bar = _bar(
+-        high_pts=17_000 + 2,  # mfe 2 < trap_min 5
+-        low_pts=17_000 - 2,  # mae 2 < sl 30
+-        close_ts=cutoff_close,
+-    )
+-
+-    outcomes = tracker.on_bar_close(bar)
+-
+-    assert len(outcomes) == 1
+-    assert outcomes[0].resolution_type is ResolutionType.SESSION_END
+-    assert outcomes[0].actual_class == "aggressive_blowthrough"
+-    assert tracker.open_count == 0
+-
+-
+-def test_session_end_classifies_trap_when_mfe_clears_trap_min() -> None:
+-    tracker = OutcomeTracker(_contract())
+-    tracker.register(_prediction(direction="long"))
+-    cutoff_close = datetime(2026, 1, 5, 21, 20, tzinfo=UTC)  # past 16:15 ET
+-    bar = _bar(
+-        high_pts=17_000 + 7,  # mfe 7 >= trap_min 5
+-        low_pts=17_000 - 3,  # mae 3 < sl 30
+-        close_ts=cutoff_close,
+-    )
+-
+-    outcomes = tracker.on_bar_close(bar)
+-
+-    assert outcomes[0].resolution_type is ResolutionType.SESSION_END
+-    assert outcomes[0].actual_class == "trap_reversal"
+-
+-
+-def test_session_end_still_prefers_real_sl_hit_over_forced() -> None:
+-    """At the cutoff a genuine stop is an sl_hit, not a session_end."""
+-
+-    tracker = OutcomeTracker(_contract())
+-    tracker.register(_prediction(direction="long"))
+-    cutoff_close = datetime(2026, 1, 5, 21, 15, tzinfo=UTC)
+-    bar = _bar(
+-        high_pts=17_000 + 1,
+-        low_pts=17_000 - 30,  # real stop
+-        close_ts=cutoff_close,
+-    )
+-
+-    outcomes = tracker.on_bar_close(bar)
+-
+-    assert outcomes[0].resolution_type is ResolutionType.SL_HIT
+-
+-
+-# --------------------------------------------------------------------------- #
+-# Bar filtering + lifecycle
+-# --------------------------------------------------------------------------- #
+-
+-
+-def test_touch_bar_and_earlier_bars_are_excluded() -> None:
+-    """A bar closing at/before the touch never advances the tracker."""
+-
+-    tracker = OutcomeTracker(_contract())
+-    tracker.register(_prediction(direction="long"))
+-    before = _bar(
+-        high_pts=17_000 + 50,
+-        low_pts=17_000 - 50,
+-        close_ts=_TOUCH_TS - timedelta(seconds=1),
+-    )
+-
+-    assert tracker.on_bar_close(before) == ()
+-    assert tracker.open_count == 1  # still open, the early bar was ignored
+-
+-
+-def test_non_forward_timeframe_bars_are_ignored() -> None:
+-    tracker = OutcomeTracker(_contract())
+-    tracker.register(_prediction(direction="long"))
+-    other = _bar(
+-        high_pts=17_000 + 50,
+-        low_pts=17_000 - 50,
+-        close_ts=_TOUCH_TS + timedelta(minutes=1),
+-        timeframe_ticks=987,  # not the contract's 147t forward bar
+-    )
+-
+-    assert tracker.on_bar_close(other) == ()
+-    assert tracker.open_count == 1
+-
+-
+-def test_reset_drops_open_trackers() -> None:
+-    tracker = OutcomeTracker(_contract())
+-    tracker.register(_prediction(direction="long"))
+-    assert tracker.open_count == 1
+-
+-    tracker.reset()
+-
+-    assert tracker.open_count == 0
+-    # A later bar produces nothing because the prediction was dropped.
+-    assert tracker.on_bar_close(
+-        _bar(high_pts=17_000 + 16, low_pts=17_000, close_ts=_TOUCH_TS + timedelta(minutes=1))
+-    ) == ()
+-
+-
+-def test_forward_timeframe_matches_contract_bar_type() -> None:
+-    tracker = OutcomeTracker(_contract())
+-    assert tracker.forward_timeframe_ticks == 147
+diff --git a/backend/tests/test_resolution_adapter.py b/backend/tests/test_resolution_adapter.py
+new file mode 100644
+index 0000000..09b49af
+--- /dev/null
++++ b/backend/tests/test_resolution_adapter.py
+@@ -0,0 +1,141 @@
++"""D1b resolution adapter: SC streaming emissions -> served TL domain shapes.
++
++Pins the ratified mapping table (label -> ResolutionType), TL-side correctness,
++field passthrough (0-based bars, honest entry, resolving-bar timestamp), the drop
++mapping, and the relocated ``parse_bar_type`` (regex + ValueError semantics
++carried intact from the deleted ``outcome_tracker`` module).
++"""
++
++from __future__ import annotations
++
++from datetime import UTC, datetime
++from types import MappingProxyType
++
++import pytest
++from strategy_core import StreamDrop, StreamResolution
++from strategy_core.decisions.outcomes import OutcomeResult
++
++from trade_lab.domain.outcomes import ResolutionType
++from trade_lab.services.inference.inference_engine import Prediction
++from trade_lab.services.inference.resolution_adapter import (
++    drop_to_dropped,
++    parse_bar_type,
++    resolution_to_outcome,
++)
++
++_DECISION_TS = datetime(2026, 1, 5, 14, 5, tzinfo=UTC)
++_RESOLVED_TS = datetime(2026, 1, 5, 14, 20, tzinfo=UTC)
++
++
++def _prediction(predicted_class: str = "tradeable_reversal") -> Prediction:
++    return Prediction(
++        prediction_id="pred-1",
++        touch_id="touch-1",
++        observation_id="obs-1",
++        event_ts_utc=_DECISION_TS,
++        predicted_class=predicted_class,
++        probabilities=MappingProxyType({predicted_class: 1.0}),
++        feature_values=MappingProxyType({}),
++        level_kind="ny_low",
++        level_price_ticks=68_000,
++        direction="long",
++        session="ny",
++        is_eligible=True,
++        model_id="m-1",
++        contract_id="NQ_test",
++        nan_count=0,
++    )
++
++
++def _resolution(label: str, *, bars: int = 3) -> StreamResolution:
++    return StreamResolution(
++        key="pred-1",
++        decision_ts_utc=_DECISION_TS,
++        entry_price=17_001.25,
++        resolved_ts_utc=_RESOLVED_TS,
++        result=OutcomeResult(
++            label=label,
++            label_encoded=None,
++            max_mfe=16.0,
++            max_mae=2.5,
++            bars_to_resolution=bars,
++        ),
++    )
++
++
++def test_tradeable_reversal_maps_to_tp_hit_and_correct_when_predicted() -> None:
++    outcome = resolution_to_outcome(_resolution("tradeable_reversal"), _prediction())
++    assert outcome.resolution_type is ResolutionType.TP_HIT
++    assert outcome.actual_class == "tradeable_reversal"
++    assert outcome.correct is True
++    assert outcome.prediction_id == "pred-1"
++    assert outcome.touch_id == "touch-1"
++    assert outcome.predicted_class == "tradeable_reversal"
++    # Passthrough: honest entry, 4dp extremes, ZERO-BASED bars, resolving-bar close.
++    assert outcome.entry_price == 17_001.25
++    assert (outcome.max_mfe_pts, outcome.max_mae_pts) == (16.0, 2.5)
++    assert outcome.bars_to_resolution == 3
++    assert outcome.resolved_ts_utc == _RESOLVED_TS
++
++
++def test_aggressive_blowthrough_maps_to_sl_hit_and_incorrect_vs_tradeable() -> None:
++    outcome = resolution_to_outcome(_resolution("aggressive_blowthrough"), _prediction())
++    assert outcome.resolution_type is ResolutionType.SL_HIT
++    assert outcome.actual_class == "aggressive_blowthrough"
++    assert outcome.correct is False  # predicted tradeable_reversal
++
++
++def test_trap_reversal_maps_to_sl_hit_and_correct_when_predicted() -> None:
++    outcome = resolution_to_outcome(
++        _resolution("trap_reversal"), _prediction(predicted_class="trap_reversal")
++    )
++    assert outcome.resolution_type is ResolutionType.SL_HIT
++    assert outcome.actual_class == "trap_reversal"
++    assert outcome.correct is True
++
++
++def test_unmapped_label_fails_loud() -> None:
++    with pytest.raises(ValueError, match="unmapped resolution label"):
++        resolution_to_outcome(_resolution("session_end"), _prediction())
++
++
++def test_outcome_ids_are_unique_per_adaptation() -> None:
++    first = resolution_to_outcome(_resolution("tradeable_reversal"), _prediction())
++    second = resolution_to_outcome(_resolution("tradeable_reversal"), _prediction())
++    assert first.outcome_id != second.outcome_id
++
++
++def test_registration_drop_maps_without_entry() -> None:
++    drop = StreamDrop(reason="flatten", key="pred-1", decision_ts_utc=_DECISION_TS)
++    dropped = drop_to_dropped(drop, _prediction())
++    assert dropped.prediction_id == "pred-1"
++    assert dropped.touch_id == "touch-1"
++    assert dropped.reason == "flatten"
++    assert dropped.decision_ts_utc == _DECISION_TS
++    assert dropped.entry_price is None
++
++
++def test_terminal_drop_carries_the_honest_entry() -> None:
++    drop = StreamDrop(
++        reason="no_resolution",
++        key="pred-1",
++        decision_ts_utc=_DECISION_TS,
++        entry_price=17_001.25,
++        max_mfe=3.0,
++        max_mae=2.0,
++        bars_to_resolution=-1,
++    )
++    dropped = drop_to_dropped(drop, _prediction())
++    assert dropped.reason == "no_resolution"
++    assert dropped.entry_price == 17_001.25
++
++
++def test_parse_bar_type_maps_tick_counts() -> None:
++    assert parse_bar_type("147t") == 147
++    assert parse_bar_type(" 2T ") == 2  # strip + lower, exactly the tracker's semantics
++
++
++@pytest.mark.parametrize("bad", ["147", "t147", "", "147s", "1.5t"])
++def test_parse_bar_type_rejects_non_tick_forms(bad: str) -> None:
++    with pytest.raises(ValueError, match="unsupported forward_bar_type"):
++        parse_bar_type(bad)
+diff --git a/backend/tests/test_strategy_core_acceptance.py b/backend/tests/test_strategy_core_acceptance.py
+index ad49da2..78c1f4c 100644
+--- a/backend/tests/test_strategy_core_acceptance.py
++++ b/backend/tests/test_strategy_core_acceptance.py
+@@ -94,8 +94,6 @@ def test_deleted_shadow_engines_stay_deleted_across_backend_src() -> None:
+         context; its Chicago-clock divergence from Strategy-Core's ET sessions is a
+         named debt). It may use ``SessionClassifier``/``make_bar_id`` but never the
+         deleted engines.
+-      * ``services/inference/outcome_tracker.py`` — the tracker's local RTH-cutoff
+-        wall-clock math (contract-parameterized) dies WITH the tracker at D1b.
+       * ``services/strategy_core_service.py`` — display-flag re-derivation
+         (``is_eligible``/``is_developing`` off Strategy-Core ``available_from``) on
+         the DTO seam.
+diff --git a/backend/validation/d1_characterization_harness.py b/backend/validation/d1_characterization_harness.py
+deleted file mode 100644
+index 1af4cff..0000000
+--- a/backend/validation/d1_characterization_harness.py
++++ /dev/null
+@@ -1,255 +0,0 @@
+-"""GATE B (D1a) — characterization, NOT pass/fail: old tracker vs dark honest resolver.
+-
+-Replays the 9 real store days 2025-07-10 -> 2025-07-22 through the FULL
+-``ApplicationRuntime`` with the real bundle ``NQ_20260604_015413`` activated through
+-the registry (contract -> checksum -> CatBoost -> feature validation), live-like
+-(no per-day reset; the SC engine rolls trading days itself). Every prediction the
+-runtime produces is tracked by BOTH paths exactly as wired in production: the legacy
+-level-anchored ``OutcomeTracker`` (the served stream) and the DARK SC streaming
+-honest resolver (the D1a seat). Emits ``D1_CHARACTERIZATION.md`` beside ``backend/``.
+-
+-Scope notes (honest): the replay feeds TRADE prints only (the b3 store-window
+-convention: front-month, action 't', price>0, WIRE order, prev-18:00 -> 18:00 ET);
+-quote-dependent approach features are NaN under the contract's model_native NaN
+-policy, so prediction COUNTS and resolution semantics are characterized, not
+-quote-fidelity feature values. bars_to_resolution deltas are reported with the
+-old path's 1-based count normalized to the new path's 0-based index (old-1 vs new).
+-
+-Run: python validation/d1_characterization_harness.py   (from backend/, PYTHONPATH=src)
+-"""
+-
+-from __future__ import annotations
+-
+-import sys
+-from collections import Counter
+-from datetime import date, timedelta
+-from pathlib import Path
+-
+-import pandas as pd
+-
+-BACKEND = Path(__file__).resolve().parents[1]
+-sys.path.insert(0, str(BACKEND / "src"))
+-
+-from strategy_core import StreamDrop, StreamResolution  # noqa: E402
+-
+-from trade_lab.domain.events import TradeEvent, TradeSide  # noqa: E402
+-from trade_lab.services.inference.inference_engine import InferenceEngine  # noqa: E402
+-from trade_lab.services.model_registry import ModelRegistry  # noqa: E402
+-from trade_lab.services.runtime import ApplicationRuntime  # noqa: E402
+-
+-DATA_DIR = Path(r"C:/Users/gonza/Documents/Trade-Dashboard/data/databento")
+-MODELS_ROOT = Path(r"C:/Users/gonza/Documents/Claude-Quant-Lab/models")
+-MODEL_ID = "NQ_20260604_015413"
+-SYMBOL = "NQ"
+-TICK_SIZE = 0.25
+-DAYS = [
+-    "2025-07-10", "2025-07-11", "2025-07-14", "2025-07-15", "2025-07-16",
+-    "2025-07-17", "2025-07-18", "2025-07-21", "2025-07-22",
+-]
+-_SIDE = {"B": TradeSide.BUY, "A": TradeSide.SELL}
+-OUT_MD = BACKEND / "D1_CHARACTERIZATION.md"
+-
+-
+-def _window(day: str):
+-    d = date.fromisoformat(day)
+-    prev = d - timedelta(days=1)
+-    start = pd.Timestamp(f"{prev} 18:00:00", tz="America/New_York").tz_convert("UTC")
+-    end = pd.Timestamp(f"{d} 18:00:00", tz="America/New_York").tz_convert("UTC")
+-    return prev, start, end
+-
+-
+-def _read_trade_events(day: str) -> list[TradeEvent]:
+-    """The b3 store-window trade extraction, emitted as TL TradeEvents."""
+-    prev, start, end = _window(day)
+-    files = [DATA_DIR / SYMBOL / prev.isoformat() / "mbp10.parquet",
+-             DATA_DIR / SYMBOL / day / "mbp10.parquet"]
+-    frames = [pd.read_parquet(f, columns=["ts_event", "action", "price", "size", "side", "symbol"])
+-              for f in files if f.exists()]
+-    if not frames:
+-        return []
+-    raw = pd.concat(frames, ignore_index=True)
+-    ts = pd.to_datetime(raw["ts_event"], utc=True)
+-    inwin = (ts >= start) & (ts < end) & (~raw["symbol"].astype(str).str.contains("-"))
+-    if not inwin.any():
+-        return []
+-    fm = raw.loc[inwin, "symbol"].value_counts().idxmax()
+-    mask = inwin & (raw["symbol"] == fm) & (raw["action"].astype(str).str.lower() == "t") \
+-        & raw["price"].notna() & (raw["price"] > 0)
+-    sub = raw[mask].copy()
+-    sub["ts_event"] = pd.to_datetime(sub["ts_event"], utc=True)
+-    sub = sub.sort_values("ts_event", kind="stable").reset_index(drop=True)
+-    ts_arr = sub["ts_event"].to_numpy()
+-    px = sub["price"].to_numpy("float64")
+-    sz = sub["size"].to_numpy("int64")
+-    side = sub["side"].astype(str).to_numpy()
+-    return [
+-        TradeEvent(
+-            event_ts_utc=pd.Timestamp(ts_arr[i]).to_pydatetime(),
+-            receive_ts_utc=None,
+-            instrument_id=1,
+-            requested_symbol="NQ.c.0",
+-            raw_symbol=str(fm),
+-            price_ticks=round(px[i] / TICK_SIZE),
+-            size=int(sz[i]),
+-            side=_SIDE.get(side[i], TradeSide.UNKNOWN),
+-            source_schema="mbp-10",
+-        )
+-        for i in range(len(sub))
+-    ]
+-
+-
+-def main() -> None:
+-    registry = ModelRegistry(MODELS_ROOT)
+-    active = registry.activate(MODEL_ID)
+-    engine = InferenceEngine(registry)
+-    runtime = ApplicationRuntime(
+-        requested_symbol="NQ.c.0",
+-        tick_timeframes=(147, 987, 2000),  # production defaults (config.py)
+-        observation_duration_seconds=300,
+-    )
+-    runtime.set_inference_engine(engine)
+-    policy = active.contract.label_policy
+-    lines: list[str] = []
+-    lines.append("# D1 CHARACTERIZATION — old tracker vs dark honest resolver (GATE B)\n")
+-    lines.append(f"Bundle: `{MODEL_ID}` activated through the registry "
+-                 f"(engine_version `{active.contract.engine_version}`); label_policy: "
+-                 f"tp={policy.tp_points} sl={policy.sl_points} trap={policy.trap_mfe_min} "
+-                 f"forward={policy.forward_bar_type} offset={policy.decision_offset_minutes}m "
+-                 f"cutoff=`{policy.forward_cutoff}`.")
+-    lines.append(f"Days: {DAYS[0]} -> {DAYS[-1]} (9 store days, trades-only, live-like "
+-                 "continuous replay — no per-day reset; see harness docstring for scope).\n")
+-
+-    predictions: dict[str, object] = {}
+-    old_by_pred: dict[str, object] = {}
+-    per_day_rows: list[tuple[str, int, int, Counter, int, Counter]] = []
+-    dark_seen = 0
+-
+-    for day in DAYS:
+-        events = _read_trade_events(day)
+-        if not events:
+-            per_day_rows.append((day, 0, 0, Counter(), 0, Counter()))
+-            continue
+-        day_preds = 0
+-        day_old = Counter()
+-        n_trades = 0
+-        for ev in events:
+-            update = runtime.process_market_event(ev)
+-            n_trades += 1
+-            for p in update.predictions:
+-                predictions[p.prediction_id] = p
+-                day_preds += 1
+-            for o in update.outcomes:
+-                old_by_pred[o.prediction_id] = o
+-                day_old[o.resolution_type.value] += 1
+-        dark_now = runtime.dark_outcomes
+-        day_dark = Counter()
+-        for item in dark_now[dark_seen:]:
+-            day_dark[_dark_kind(item)] += 1
+-        dark_delta = len(dark_now) - dark_seen
+-        dark_seen = len(dark_now)
+-        per_day_rows.append((day, n_trades, day_preds, day_old, dark_delta, day_dark))
+-
+-    # Harness end: flush the dark resolver past the last day's window so still-open
+-    # setups finalize exactly as the streaming cutoff rule dictates.
+-    _, _, last_end = _window(DAYS[-1])
+-    resolver = runtime._honest_resolver  # gate-B harness owns the dark seat
+-    flushed = resolver.flush(last_end.to_pydatetime()) if resolver is not None else ()
+-    if flushed:
+-        runtime._append_dark(flushed)
+-    old_still_open = (
+-        runtime._outcome_tracker.open_count if runtime._outcome_tracker is not None else 0
+-    )
+-    dark = {item.key: item for item in runtime.dark_outcomes}
+-
+-    lines.append("## Per-day\n")
+-    lines.append(
+-        "| day | trades | predictions | old outcomes (by type) | dark events | dark (by kind) |"
+-    )
+-    lines.append("|---|---|---|---|---|---|")
+-    for day, n_trades, day_preds, day_old, dark_delta, day_dark in per_day_rows:
+-        lines.append(f"| {day} | {n_trades} | {day_preds} | {dict(day_old) or '-'} "
+-                     f"| {dark_delta} | {dict(day_dark) or '-'} |")
+-    if flushed:
+-        lines.append(f"| (harness flush) | - | - | - | {len(flushed)} | "
+-                     f"{dict(Counter(_dark_kind(i) for i in flushed))} |")
+-
+-    total_preds = len(predictions)
+-    old_types = Counter(o.resolution_type.value for o in old_by_pred.values())
+-    new_kinds = Counter(_dark_kind(i) for i in dark.values())
+-    lines.append("\n## Totals\n")
+-    lines.append(f"- predictions registered (both paths, one-for-one): **{total_preds}**")
+-    lines.append(f"- OLD path resolutions: **{sum(old_types.values())}** by type "
+-                 f"{dict(old_types)}; still open at harness end: {old_still_open}")
+-    lines.append(f"- NEW path events: **{len(dark)}** by kind {dict(new_kinds)}; "
+-                 f"still open after flush: {resolver.open_count if resolver else 0}")
+-
+-    # Pairwise characterization.
+-    entry_deltas: list[float] = []
+-    flips = 0
+-    both_resolved = 0
+-    bars_deltas = Counter()
+-    session_end_map = Counter()
+-    old_to_new = Counter()
+-    for pid, old in old_by_pred.items():
+-        new = dark.get(pid)
+-        if new is None:
+-            old_to_new[(old.resolution_type.value, "STILL-OPEN/MISSING")] += 1
+-            continue
+-        new_kind = _dark_kind(new)
+-        old_to_new[(old.resolution_type.value, new_kind)] += 1
+-        if old.resolution_type.value == "session_end":
+-            session_end_map[new_kind] += 1
+-        pred = predictions.get(pid)
+-        old_entry = pred.level_price_ticks * TICK_SIZE if pred is not None else None
+-        new_entry = getattr(new, "entry_price", None)
+-        if old_entry is not None and new_entry is not None:
+-            entry_deltas.append((new_entry - old_entry) / TICK_SIZE)
+-        if isinstance(new, StreamResolution) and pred is not None:
+-            both_resolved += 1
+-            old_correct = old.correct
+-            new_correct = new.result.label == pred.predicted_class
+-            if old_correct != new_correct:
+-                flips += 1
+-            bars_deltas[(old.bars_to_resolution - 1) - new.result.bars_to_resolution] += 1
+-
+-    lines.append("\n## Old -> new mapping (per prediction with an OLD outcome)\n")
+-    lines.append("| old resolution | new kind | count |")
+-    lines.append("|---|---|---|")
+-    for (o, n), c in sorted(old_to_new.items()):
+-        lines.append(f"| {o} | {n} | {c} |")
+-    lines.append(f"\n- SESSION_END -> new-kind mapping: {dict(session_end_map) or 'none'}")
+-    lines.append(f"- correctness flips among both-resolved pairs: **{flips}** of {both_resolved}")
+-    if entry_deltas:
+-        s = pd.Series(entry_deltas)
+-        lines.append(
+-            f"- entry-price delta (new trade print - old level price), ticks: count={len(s)} "
+-            f"mean={s.mean():.2f} mean|.|={s.abs().mean():.2f} max|.|={s.abs().max():.0f} "
+-            f"min={s.min():.0f} max={s.max():.0f}"
+-        )
+-    else:
+-        lines.append("- entry-price delta: no comparable pairs")
+-    lines.append(f"- bars_to_resolution deltas (old-1 minus new, both-resolved): "
+-                 f"{dict(bars_deltas) or 'none'}")
+-
+-    new_only = {k: _dark_kind(v) for k, v in dark.items() if k not in old_by_pred}
+-    lines.append(f"\n- predictions with a NEW event but NO old outcome (tracker still open "
+-                 f"or never resolved): {dict(Counter(new_only.values())) or 'none'}")
+-
+-    OUT_MD.write_text("\n".join(lines) + "\n", encoding="utf-8")
+-    print("\n".join(lines))
+-    print(f"\nwritten: {OUT_MD}")
+-
+-
+-def _dark_kind(item) -> str:
+-    if isinstance(item, StreamResolution):
+-        return f"resolved:{item.result.label}"
+-    if isinstance(item, StreamDrop):
+-        return f"drop:{item.reason}"
+-    return type(item).__name__
+-
+-
+-if __name__ == "__main__":
+-    import warnings
+-
+-    warnings.simplefilter("ignore")
+-    main()
+diff --git a/frontend/src/chart/viewModels.test.ts b/frontend/src/chart/viewModels.test.ts
+index 2f5dbc9..a298fca 100644
+--- a/frontend/src/chart/viewModels.test.ts
++++ b/frontend/src/chart/viewModels.test.ts
+@@ -239,6 +239,7 @@ describe('chart view model normalization', () => {
+     contractId: 'contract-1',
+     nanCount: 0,
+     outcome: null,
++    dropped: null,
+     ...overrides,
+   });
+ 
+@@ -254,6 +255,7 @@ describe('chart view model normalization', () => {
+     maxMaePts: 3.25,
+     barsToResolution: 8,
+     timeUtc: '2026-05-21T14:05:00Z',
++    entryPrice: 19000.25,
+     ...overrides,
+   });
+ 
+diff --git a/frontend/src/components/ChartWorkspace.test.tsx b/frontend/src/components/ChartWorkspace.test.tsx
+index 3d1bc6f..38aaac3 100644
+--- a/frontend/src/components/ChartWorkspace.test.tsx
++++ b/frontend/src/components/ChartWorkspace.test.tsx
+@@ -119,6 +119,7 @@ const outcomeDto: OutcomeDTO = {
+   max_mae_pts: 3.25,
+   bars_to_resolution: 8,
+   resolved_ts_utc: '2026-05-21T14:05:00Z',
++  entry_price: 19000.25,
+ };
+ 
+ const feedStatus = (state = 'connected'): FeedStatusDTO => ({
+diff --git a/frontend/src/components/IntelligencePanel.test.tsx b/frontend/src/components/IntelligencePanel.test.tsx
+index 828b560..d649093 100644
+--- a/frontend/src/components/IntelligencePanel.test.tsx
++++ b/frontend/src/components/IntelligencePanel.test.tsx
+@@ -20,6 +20,7 @@ const prediction = (overrides: Partial<Prediction> = {}): Prediction => ({
+   contractId: 'contract-1',
+   nanCount: 0,
+   outcome: null,
++  dropped: null,
+   ...overrides,
+ });
+ 
+@@ -35,6 +36,7 @@ const outcome = (overrides: Partial<Outcome> = {}): Outcome => ({
+   maxMaePts: 3.25,
+   barsToResolution: 8,
+   timeUtc: '2026-05-21T14:05:00Z',
++  entryPrice: 19000.25,
+   ...overrides,
+ });
+ 
+@@ -97,4 +99,21 @@ describe('IntelligencePanel', () => {
+     expect(screen.getByText('incorrect')).toBeInTheDocument();
+     expect(screen.getByText('actual down')).toBeInTheDocument();
+   });
++
++  it('renders a dropped prediction with a distinct dropped badge and its reason', () => {
++    predictionStore.setState({
++      predictions: [
++        prediction({
++          dropped: { predictionId: 'pred-1', touchId: 'touch-1', reason: 'no_fill', decisionTsUtc: '2026-05-21T14:05:00Z', entryPrice: null },
++        }),
++      ],
++    });
++    render(<IntelligencePanel />);
++
++    expect(screen.getByText('dropped')).toBeInTheDocument();
++    expect(screen.getByText('no fill')).toBeInTheDocument();
++    // A drop is not a resolution: no correctness badge renders.
++    expect(screen.queryByText('correct')).not.toBeInTheDocument();
++    expect(screen.queryByText('incorrect')).not.toBeInTheDocument();
++  });
+ });
+diff --git a/frontend/src/components/IntelligencePanel.tsx b/frontend/src/components/IntelligencePanel.tsx
+index 667ef76..890a984 100644
+--- a/frontend/src/components/IntelligencePanel.tsx
++++ b/frontend/src/components/IntelligencePanel.tsx
+@@ -48,6 +48,7 @@ export function IntelligencePanel() {
+ function PredictionRow({ prediction }: { prediction: Prediction }) {
+   const probEntries = Object.entries(prediction.probabilities).sort(([, a], [, b]) => b - a);
+   const outcome = prediction.outcome;
++  const dropped = prediction.dropped;
+   return (
+     <div className="intel-prediction">
+       <div className="intel-prediction-head">
+@@ -68,6 +69,12 @@ function PredictionRow({ prediction }: { prediction: Prediction }) {
+           <span>{outcome.resolutionType.replaceAll('_', ' ')}</span>
+         </div>
+       )}
++      {dropped && (
++        <div className="intel-outcome">
++          <span className="intel-badge dropped">dropped</span>
++          <span>{dropped.reason.replaceAll('_', ' ')}</span>
++        </div>
++      )}
+     </div>
+   );
+ }
+diff --git a/frontend/src/domain/models.ts b/frontend/src/domain/models.ts
+index d47d69a..1017162 100644
+--- a/frontend/src/domain/models.ts
++++ b/frontend/src/domain/models.ts
+@@ -130,6 +130,7 @@ export type Prediction = {
+   contractId: string;
+   nanCount: number;
+   outcome: Outcome | null;
++  dropped: DroppedPrediction | null;
+ };
+ 
+ export type Outcome = {
+@@ -144,6 +145,15 @@ export type Outcome = {
+   maxMaePts: number;
+   barsToResolution: number;
+   timeUtc: string;
++  entryPrice: number;
++};
++
++export type DroppedPrediction = {
++  predictionId: string;
++  touchId: string;
++  reason: string;
++  decisionTsUtc: string;
++  entryPrice: number | null;
+ };
+ 
+ export type ModelStatus = {
+diff --git a/frontend/src/domain/normalize.test.ts b/frontend/src/domain/normalize.test.ts
+index a1cfd81..3cb6deb 100644
+--- a/frontend/src/domain/normalize.test.ts
++++ b/frontend/src/domain/normalize.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, expect, it } from 'vitest';
+-import { normalizeBar, normalizeLevel, normalizeModelBundle, normalizeModelStatus, normalizeOutcome, normalizePrediction, normalizeRuntimeStatus, normalizeWarning } from './normalize';
++import { normalizeBar, normalizeDropped, normalizeLevel, normalizeModelBundle, normalizeModelStatus, normalizeOutcome, normalizePrediction, normalizeRuntimeStatus, normalizeWarning } from './normalize';
+ import type { ModelBundleDTO, RuntimeStatusDTO } from '../api/types';
+ import type { BarDTO, DisplayLevelDTO, ModelStatusDTO, OutcomeDTO, PredictionDTO } from '../realtime/types';
+ 
+@@ -126,6 +126,7 @@ describe('inference DTO normalization', () => {
+       max_mae_pts: 3.0,
+       bars_to_resolution: 8,
+       resolved_ts_utc: '2026-05-21T14:10:00Z',
++      entry_price: 19000.25,
+     };
+ 
+     expect(normalizeOutcome(dto)).toEqual({
+@@ -140,6 +141,25 @@ describe('inference DTO normalization', () => {
+       maxMaePts: 3.0,
+       barsToResolution: 8,
+       timeUtc: '2026-05-21T14:10:00Z',
++      entryPrice: 19000.25,
++    });
++  });
++
++  it('maps dropped predictions to domain shape', () => {
++    expect(
++      normalizeDropped({
++        prediction_id: 'pred-1',
++        touch_id: 'touch-1',
++        reason: 'flatten',
++        decision_ts_utc: '2026-05-21T20:41:00Z',
++        entry_price: null,
++      }),
++    ).toEqual({
++      predictionId: 'pred-1',
++      touchId: 'touch-1',
++      reason: 'flatten',
++      decisionTsUtc: '2026-05-21T20:41:00Z',
++      entryPrice: null,
+     });
+   });
+ 
+diff --git a/frontend/src/domain/normalize.ts b/frontend/src/domain/normalize.ts
+index 317ae36..cb19f7b 100644
+--- a/frontend/src/domain/normalize.ts
++++ b/frontend/src/domain/normalize.ts
+@@ -1,6 +1,6 @@
+ import type { LiveStatusDTO, ModelBundleDTO, ReplaySourceDTO, ReplayStatusDTO, RuntimeStatusDTO } from '../api/types';
+-import type { BarDTO, DataQualityWarningDTO, DisplayLevelDTO, ModelStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, TouchDTO } from '../realtime/types';
+-import type { LiveStatus, MarketBar, MarketLevel, MarketTouch, ModelBundle, ModelStatus, Observation, Outcome, Prediction, ReplaySource, ReplayStatus, RuntimeSummary, Timeframe, Warning, WarningMetadata } from './models';
++import type { BarDTO, DataQualityWarningDTO, DisplayLevelDTO, DroppedPredictionDTO, ModelStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, TouchDTO } from '../realtime/types';
++import type { DroppedPrediction, LiveStatus, MarketBar, MarketLevel, MarketTouch, ModelBundle, ModelStatus, Observation, Outcome, Prediction, ReplaySource, ReplayStatus, RuntimeSummary, Timeframe, Warning, WarningMetadata } from './models';
+ 
+ // API DTOs stay at the transport boundary; components consume these narrower
+ // workstation models so future backend contract changes do not leak everywhere.
+@@ -129,6 +129,7 @@ export const normalizePrediction = (dto: PredictionDTO): Prediction => ({
+   contractId: dto.contract_id,
+   nanCount: dto.nan_count,
+   outcome: null,
++  dropped: null,
+ });
+ 
+ export const normalizeOutcome = (dto: OutcomeDTO): Outcome => ({
+@@ -143,6 +144,15 @@ export const normalizeOutcome = (dto: OutcomeDTO): Outcome => ({
+   maxMaePts: dto.max_mae_pts,
+   barsToResolution: dto.bars_to_resolution,
+   timeUtc: dto.resolved_ts_utc,
++  entryPrice: dto.entry_price,
++});
++
++export const normalizeDropped = (dto: DroppedPredictionDTO): DroppedPrediction => ({
++  predictionId: dto.prediction_id,
++  touchId: dto.touch_id,
++  reason: dto.reason,
++  decisionTsUtc: dto.decision_ts_utc,
++  entryPrice: dto.entry_price ?? null,
+ });
+ 
+ export const normalizeModelStatus = (dto: ModelStatusDTO): ModelStatus => ({
+diff --git a/frontend/src/realtime/client.test.ts b/frontend/src/realtime/client.test.ts
+index 741f647..fda9166 100644
+--- a/frontend/src/realtime/client.test.ts
++++ b/frontend/src/realtime/client.test.ts
+@@ -1,7 +1,7 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+ import { RealtimeClient } from './client';
+ import { blotterStore, connectionStore, intelligenceStore, liveStore, marketStore, predictionStore, replayStore, runtimeStore } from '../state/stores';
+-import type { BarDTO, DataQualityWarningDTO, Envelope, FeedStatusDTO, ModelStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, SnapshotPayloadDTO, TouchDTO } from './types';
++import type { BarDTO, DataQualityWarningDTO, DroppedPredictionDTO, Envelope, FeedStatusDTO, ModelStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, SnapshotPayloadDTO, TouchDTO } from './types';
+ import { MAX_BARS_PER_TIMEFRAME } from '../chart/viewModels';
+ import { normalizeBar, normalizeWarning } from '../domain/normalize';
+ 
+@@ -145,6 +145,16 @@ const outcome = (overrides: Partial<OutcomeDTO> = {}): OutcomeDTO => ({
+   max_mae_pts: 3.0,
+   bars_to_resolution: 8,
+   resolved_ts_utc: '2026-05-21T14:10:00Z',
++  entry_price: 19000.25,
++  ...overrides,
++});
++
++const droppedDto = (overrides: Partial<DroppedPredictionDTO> = {}): DroppedPredictionDTO => ({
++  prediction_id: 'pred-1',
++  touch_id: 'touch-1',
++  reason: 'flatten',
++  decision_ts_utc: '2026-05-21T20:41:00Z',
++  entry_price: null,
+   ...overrides,
+ });
+ 
+@@ -272,6 +282,18 @@ describe('RealtimeClient', () => {
+     expect(blotterStore.getSnapshot().events.some((event) => event.message === 'Model status updated')).toBe(true);
+   });
+ 
++  it('routes prediction.dropped deltas into the dropped ring and annotates the prediction', () => {
++    client.start();
++
++    sockets[0].message(envelope('prediction.created', { prediction: prediction() }));
++    sockets[0].message(envelope('prediction.dropped', { dropped: droppedDto() }));
++
++    expect(predictionStore.getSnapshot().dropped[0]).toMatchObject({ predictionId: 'pred-1', reason: 'flatten', entryPrice: null });
++    expect(predictionStore.getSnapshot().predictions[0]).toMatchObject({ id: 'pred-1', outcome: null, dropped: expect.objectContaining({ reason: 'flatten' }) });
++    expect(predictionStore.getSnapshot().outcomes).toHaveLength(0);
++    expect(blotterStore.getSnapshot().events.some((event) => event.message === 'Prediction dropped (flatten)')).toBe(true);
++  });
++
+   it('bounds recent predictions and outcomes to the newest entries', () => {
+     client.start();
+ 
+@@ -294,6 +316,7 @@ describe('RealtimeClient', () => {
+ 
+     expect(predictionStore.getSnapshot().predictions).toHaveLength(0);
+     expect(predictionStore.getSnapshot().outcomes).toHaveLength(0);
++    expect(predictionStore.getSnapshot().dropped).toHaveLength(0);
+   });
+ 
+   it('converts provider warning metadata into blotter code, source, and safe details only', () => {
+diff --git a/frontend/src/realtime/client.ts b/frontend/src/realtime/client.ts
+index 5d4ec0c..e3db6ef 100644
+--- a/frontend/src/realtime/client.ts
++++ b/frontend/src/realtime/client.ts
+@@ -1,9 +1,9 @@
+ import { config } from '../config';
+ import { MAX_BARS_PER_TIMEFRAME, barKey, isSupportedTimeframe } from '../chart/viewModels';
+-import { addBlotterEvent, addOutcome, addPrediction, clearPredictions, connectionStore, intelligenceStore, liveStore, marketStore, predictionStore, replayStore, runtimeStore, setModelStatus } from '../state/stores';
+-import { normalizeBar, normalizeLevel, normalizeModelStatus, normalizeObservation, normalizeOutcome, normalizePrediction, normalizeTouch, normalizeWarning } from '../domain/normalize';
++import { addBlotterEvent, addDropped, addOutcome, addPrediction, clearPredictions, connectionStore, intelligenceStore, liveStore, marketStore, predictionStore, replayStore, runtimeStore, setModelStatus } from '../state/stores';
++import { normalizeBar, normalizeDropped, normalizeLevel, normalizeModelStatus, normalizeObservation, normalizeOutcome, normalizePrediction, normalizeTouch, normalizeWarning } from '../domain/normalize';
+ import type { MarketBar } from '../domain/models';
+-import type { BarDTO, DataQualityWarningDTO, DisplayLevelDTO, Envelope, FeedStatusDTO, ModelStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, SnapshotPayloadDTO, TouchDTO } from './types';
++import type { BarDTO, DataQualityWarningDTO, DisplayLevelDTO, DroppedPredictionDTO, Envelope, FeedStatusDTO, ModelStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, SnapshotPayloadDTO, TouchDTO } from './types';
+ 
+ type WebSocketFactory = (url: string) => WebSocket;
+ 
+@@ -138,6 +138,12 @@ export class RealtimeClient {
+         addOutcome(normalizeOutcome((envelope.payload as { outcome: OutcomeDTO }).outcome));
+         addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'observation', severity: 'info', message: 'Prediction resolved', sequence: envelope.sequence });
+         break;
++      case 'prediction.dropped': {
++        const dropped = normalizeDropped((envelope.payload as { dropped: DroppedPredictionDTO }).dropped);
++        addDropped(dropped);
++        addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'observation', severity: 'info', message: `Prediction dropped (${dropped.reason})`, sequence: envelope.sequence });
++        break;
++      }
+       case 'model.status':
+         setModelStatus(normalizeModelStatus(envelope.payload as ModelStatusDTO));
+         addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'system', severity: 'info', message: 'Model status updated', sequence: envelope.sequence });
+@@ -156,19 +162,26 @@ export class RealtimeClient {
+       warnings: payload.warnings.map(normalizeWarning).slice(0, 100),
+       touches: [],
+     });
+-    // Seed predictions/outcomes newest-first and annotate each prediction with any
+-    // already-resolved outcome so the snapshot matches the running delta state.
++    // Seed predictions/outcomes/drops newest-first and annotate each prediction with
++    // any already-resolved outcome (or drop) so the snapshot matches the running
++    // delta state. Drops never enter `prediction.outcome`, so no chart marker.
+     const outcomes = (payload.outcomes ?? []).map(normalizeOutcome).slice(0, 100);
++    const dropped = (payload.dropped ?? []).map(normalizeDropped).slice(0, 100);
+     const outcomeByPrediction = new Map(outcomes.map((outcome) => [outcome.predictionId, outcome]));
++    const droppedByPrediction = new Map(dropped.map((drop) => [drop.predictionId, drop]));
+     const predictions = (payload.predictions ?? []).map((dto) => {
+       const prediction = normalizePrediction(dto);
+-      const outcome = outcomeByPrediction.get(prediction.id);
+-      return outcome ? { ...prediction, outcome } : prediction;
++      return {
++        ...prediction,
++        outcome: outcomeByPrediction.get(prediction.id) ?? null,
++        dropped: droppedByPrediction.get(prediction.id) ?? null,
++      };
+     }).slice(0, 100);
+     predictionStore.setState((current) => ({
+       ...current,
+       predictions,
+       outcomes,
++      dropped,
+       modelStatus: payload.model_status ? normalizeModelStatus(payload.model_status) : current.modelStatus,
+     }));
+     runtimeStore.setState((current) => ({ ...current, session: payload.session ?? null, tradingDay: payload.trading_day ?? null }));
+diff --git a/frontend/src/realtime/types.ts b/frontend/src/realtime/types.ts
+index 0f63f06..f13c6ed 100644
+--- a/frontend/src/realtime/types.ts
++++ b/frontend/src/realtime/types.ts
+@@ -10,6 +10,7 @@ export type MessageType =
+   | 'observation.updated'
+   | 'prediction.created'
+   | 'prediction.resolved'
++  | 'prediction.dropped'
+   | 'model.status';
+ 
+ export type BarDTO = {
+@@ -117,6 +118,15 @@ export type OutcomeDTO = {
+   max_mae_pts: number;
+   bars_to_resolution: number;
+   resolved_ts_utc: string;
++  entry_price: number;
++};
++
++export type DroppedPredictionDTO = {
++  prediction_id: string;
++  touch_id: string;
++  reason: string;
++  decision_ts_utc: string;
++  entry_price: number | null;
+ };
+ 
+ export type ModelStatusDTO = {
+@@ -140,6 +150,7 @@ export type SnapshotPayloadDTO = {
+   warnings: DataQualityWarningDTO[];
+   predictions: PredictionDTO[];
+   outcomes: OutcomeDTO[];
++  dropped?: DroppedPredictionDTO[];
+   model_status: ModelStatusDTO;
+   session: string | null;
+   trading_day: string | null;
+diff --git a/frontend/src/state/stores.test.ts b/frontend/src/state/stores.test.ts
+index ed4fd9b..c148d80 100644
+--- a/frontend/src/state/stores.test.ts
++++ b/frontend/src/state/stores.test.ts
+@@ -1,6 +1,6 @@
+ import { afterEach, describe, expect, it } from 'vitest';
+-import { addBlotterEvent, addOutcome, addPrediction, blotterStore, clearPredictions, connectionStore, intelligenceStore, marketStore, predictionStore, runtimeStore, setModelStatus } from './stores';
+-import type { Outcome, Prediction } from '../domain/models';
++import { addBlotterEvent, addDropped, addOutcome, addPrediction, blotterStore, clearPredictions, connectionStore, intelligenceStore, marketStore, predictionStore, runtimeStore, setModelStatus } from './stores';
++import type { DroppedPrediction, Outcome, Prediction } from '../domain/models';
+ 
+ const resetStores = () => {
+   runtimeStore.reset();
+@@ -27,6 +27,7 @@ const makePrediction = (id: string): Prediction => ({
+   contractId: 'NQM6',
+   nanCount: 0,
+   outcome: null,
++  dropped: null,
+ });
+ 
+ const makeOutcome = (predictionId: string): Outcome => ({
+@@ -41,6 +42,15 @@ const makeOutcome = (predictionId: string): Outcome => ({
+   maxMaePts: 3.0,
+   barsToResolution: 8,
+   timeUtc: '2026-05-21T14:10:00Z',
++  entryPrice: 19000.25,
++});
++
++const makeDropped = (predictionId: string): DroppedPrediction => ({
++  predictionId,
++  touchId: 'touch-1',
++  reason: 'flatten',
++  decisionTsUtc: '2026-05-21T20:41:00Z',
++  entryPrice: null,
+ });
+ 
+ describe('workstation stores', () => {
+@@ -127,15 +137,43 @@ describe('workstation stores', () => {
+     expect(predictionStore.getSnapshot().outcomes.filter((entry) => entry.predictionId === 'pred-104')).toHaveLength(1);
+   });
+ 
+-  it('clears predictions and outcomes while keeping model status', () => {
++  it('annotates the matching prediction when it is dropped, leaving outcome null', () => {
++    addPrediction(makePrediction('pred-1'));
++    addPrediction(makePrediction('pred-2'));
++
++    addDropped(makeDropped('pred-1'));
++
++    const state = predictionStore.getSnapshot();
++    expect(state.dropped[0]).toMatchObject({ predictionId: 'pred-1', reason: 'flatten' });
++    expect(state.predictions.find((entry) => entry.id === 'pred-1')?.dropped).toMatchObject({ reason: 'flatten' });
++    expect(state.predictions.find((entry) => entry.id === 'pred-1')?.outcome).toBeNull();
++    expect(state.predictions.find((entry) => entry.id === 'pred-2')?.dropped).toBeNull();
++  });
++
++  it('bounds dropped history to the newest 100 and de-dupes by prediction id', () => {
++    for (let index = 0; index < 105; index += 1) {
++      addDropped(makeDropped(`pred-${index}`));
++    }
++
++    const dropped = predictionStore.getSnapshot().dropped;
++    expect(dropped).toHaveLength(100);
++    expect(dropped[0]).toMatchObject({ predictionId: 'pred-104' });
++
++    addDropped(makeDropped('pred-104'));
++    expect(predictionStore.getSnapshot().dropped.filter((entry) => entry.predictionId === 'pred-104')).toHaveLength(1);
++  });
++
++  it('clears predictions, outcomes, and dropped while keeping model status', () => {
+     addPrediction(makePrediction('pred-1'));
+     addOutcome(makeOutcome('pred-1'));
++    addDropped(makeDropped('pred-2'));
+     setModelStatus({ loaded: true, modelId: 'model-a', strategyId: null, trainingMode: null, instrument: null, featureNames: [], classMap: {}, validationOk: true, validationDetail: null });
+ 
+     clearPredictions();
+ 
+     expect(predictionStore.getSnapshot().predictions).toEqual([]);
+     expect(predictionStore.getSnapshot().outcomes).toEqual([]);
++    expect(predictionStore.getSnapshot().dropped).toEqual([]);
+     expect(predictionStore.getSnapshot().modelStatus).toMatchObject({ loaded: true, modelId: 'model-a' });
+   });
+ 
+diff --git a/frontend/src/state/stores.ts b/frontend/src/state/stores.ts
+index 2cc7afd..558234e 100644
+--- a/frontend/src/state/stores.ts
++++ b/frontend/src/state/stores.ts
+@@ -1,12 +1,14 @@
+ import { createStore, useStore } from './createStore';
+-import type { BlotterEvent, LiveStatus, MarketBar, MarketLevel, MarketTouch, ModelBundle, ModelStatus, Observation, Outcome, Prediction, ReplaySource, ReplayStatus, RuntimeSummary, Timeframe, Warning } from '../domain/models';
++import type { BlotterEvent, DroppedPrediction, LiveStatus, MarketBar, MarketLevel, MarketTouch, ModelBundle, ModelStatus, Observation, Outcome, Prediction, ReplaySource, ReplayStatus, RuntimeSummary, Timeframe, Warning } from '../domain/models';
+ 
+ const MAX_PREDICTIONS = 100;
+ const MAX_OUTCOMES = 100;
++const MAX_DROPPED = 100;
+ 
+ export type PredictionState = {
+   predictions: Prediction[];
+   outcomes: Outcome[];
++  dropped: DroppedPrediction[];
+   modelStatus: ModelStatus | null;
+   bundles: ModelBundle[];
+ };
+@@ -109,17 +111,19 @@ export const liveStore = createStore({
+ export const predictionStore = createStore<PredictionState>({
+   predictions: [],
+   outcomes: [],
++  dropped: [],
+   modelStatus: null,
+   bundles: [],
+ });
+ 
+ // Newest-first, bounded prediction history; the matching prediction is annotated
+-// with its outcome by prediction_id when one resolves so the UI can render the
+-// resolved state without a second lookup.
++// with its outcome (or drop) by prediction_id when one arrives so the UI can
++// render the resolved/dropped state without a second lookup.
+ export const addPrediction = (prediction: Prediction) => {
+   predictionStore.setState((current) => {
+     const existingOutcome = current.outcomes.find((outcome) => outcome.predictionId === prediction.id) ?? null;
+-    const annotated = existingOutcome ? { ...prediction, outcome: existingOutcome } : prediction;
++    const existingDrop = current.dropped.find((drop) => drop.predictionId === prediction.id) ?? null;
++    const annotated = { ...prediction, outcome: existingOutcome, dropped: existingDrop };
+     const without = current.predictions.filter((entry) => entry.id !== prediction.id);
+     return { ...current, predictions: [annotated, ...without].slice(0, MAX_PREDICTIONS) };
+   });
+@@ -135,6 +139,18 @@ export const addOutcome = (outcome: Outcome) => {
+   });
+ };
+ 
++// Drops mirror outcomes (newest-first, capped, de-duped by prediction id) but stay
++// out of `prediction.outcome` so they can never produce a chart outcome marker.
++export const addDropped = (dropped: DroppedPrediction) => {
++  predictionStore.setState((current) => {
++    const withoutDrop = current.dropped.filter((entry) => entry.predictionId !== dropped.predictionId);
++    const predictions = current.predictions.map((prediction) =>
++      prediction.id === dropped.predictionId ? { ...prediction, dropped } : prediction,
++    );
++    return { ...current, dropped: [dropped, ...withoutDrop].slice(0, MAX_DROPPED), predictions };
++  });
++};
++
+ export const setModelStatus = (modelStatus: ModelStatus) => {
+   predictionStore.setState((current) => ({ ...current, modelStatus }));
+ };
+@@ -144,7 +160,7 @@ export const setModelBundles = (bundles: ModelBundle[]) => {
+ };
+ 
+ export const clearPredictions = () => {
+-  predictionStore.setState((current) => ({ ...current, predictions: [], outcomes: [] }));
++  predictionStore.setState((current) => ({ ...current, predictions: [], outcomes: [], dropped: [] }));
+ };
+ 
+ export const useRuntime = <T = RuntimeSummary>(selector?: (state: RuntimeSummary) => T) => useStore(runtimeStore, selector ?? ((state) => state as T));
+@@ -156,6 +172,7 @@ export const useReplay = <T = ReturnType<typeof replayStore.getSnapshot>>(select
+ export const useLive = <T = ReturnType<typeof liveStore.getSnapshot>>(selector?: (state: ReturnType<typeof liveStore.getSnapshot>) => T) => useStore(liveStore, selector ?? ((state) => state as T));
+ export const usePredictions = <T = Prediction[]>(selector?: (predictions: Prediction[]) => T) => useStore(predictionStore, (state) => (selector ? selector(state.predictions) : (state.predictions as T)));
+ export const useOutcomes = <T = Outcome[]>(selector?: (outcomes: Outcome[]) => T) => useStore(predictionStore, (state) => (selector ? selector(state.outcomes) : (state.outcomes as T)));
++export const useDropped = <T = DroppedPrediction[]>(selector?: (dropped: DroppedPrediction[]) => T) => useStore(predictionStore, (state) => (selector ? selector(state.dropped) : (state.dropped as T)));
+ export const useModelStatus = <T = ModelStatus | null>(selector?: (modelStatus: ModelStatus | null) => T) => useStore(predictionStore, (state) => (selector ? selector(state.modelStatus) : (state.modelStatus as T)));
+ export const useBundles = <T = ModelBundle[]>(selector?: (bundles: ModelBundle[]) => T) => useStore(predictionStore, (state) => (selector ? selector(state.bundles) : (state.bundles as T)));
+ 
+diff --git a/frontend/src/styles.css b/frontend/src/styles.css
+index 391f8b2..cbd1a7a 100644
+--- a/frontend/src/styles.css
++++ b/frontend/src/styles.css
+@@ -107,6 +107,7 @@ button { font: inherit; }
+ .intel-badge.ineligible { color:var(--amber); border-color:rgba(242,184,75,.45); background:rgba(242,184,75,.08); }
+ .intel-badge.correct { color:var(--green); border-color:rgba(54,211,153,.45); background:rgba(54,211,153,.08); }
+ .intel-badge.incorrect { color:var(--red); border-color:rgba(255,107,107,.45); background:rgba(255,107,107,.08); }
++.intel-badge.dropped { color:var(--muted); border-color:rgba(148,163,184,.45); background:rgba(148,163,184,.08); }
+ .intel-probs { display:flex; flex-wrap:wrap; gap:8px; margin-top:4px; color:var(--muted); font-size:11px; font-variant-numeric: tabular-nums; }
+ .intel-prediction-meta { margin-top:4px; color:var(--muted); font-size:11px; }
+ .intel-outcome { margin-top:4px; display:flex; flex-wrap:wrap; gap:8px; align-items:center; font-size:11px; color:var(--muted); }

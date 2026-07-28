@@ -1,0 +1,2245 @@
+diff --git a/backend/pyproject.toml b/backend/pyproject.toml
+index 8bc9623..eb9cce2 100644
+--- a/backend/pyproject.toml
++++ b/backend/pyproject.toml
+@@ -20,6 +20,15 @@ dependencies = [
+ ]
+ 
+ [project.optional-dependencies]
++live = [
++  # WEDGE fix floor (WEDGE_CAPTURE.md at the repo root): databento 0.79.0 is the first
++  # release that marshals Live.start()/terminate() onto the SDK session loop instead of
++  # writing to its transport from the calling thread (the silent post-drain wedge);
++  # subscribe() still writes caller-thread as of 0.81.0, which the adapter facade
++  # marshals itself (adapters/databento.py connect_session/_run_on_session_loop). The
++  # SDK stays optional — tests run offline with fakes; the live host installs .[live].
++  "databento>=0.79",
++]
+ dev = [
+   # starlette 1.x's TestClient backend (cold CI resolves starlette>=1.x, whose
+   # testclient imports `httpx2 as httpx`); sole consumers are the TestClient tests,
+diff --git a/backend/src/trade_lab/adapters/databento.py b/backend/src/trade_lab/adapters/databento.py
+index 4337a61..828d786 100644
+--- a/backend/src/trade_lab/adapters/databento.py
++++ b/backend/src/trade_lab/adapters/databento.py
+@@ -12,6 +12,7 @@ import heapq
+ import importlib.util
+ import logging
+ import re
++import threading
+ from collections.abc import AsyncIterator, Callable, Iterable, Iterator
+ from datetime import UTC, datetime, timedelta
+ from decimal import Decimal
+@@ -59,6 +60,12 @@ _QUOTE_SCHEMA_ALIASES = {"mbp-1", "cmbp-1", "bbo", "tbbo", "cbbo", "tcbbo"}
+ # Warm-start replays this many FULL prior trading days, plus the current (in-progress) one — so
+ # 2 loads two full trading days of history onto the chart (the live session is always partial).
+ _WARM_START_PRIOR_TRADING_DAYS = 2
++# WARM-FIX P4: slack added to the effective market-context retention when scoping the
++# quote-schema warm fetch. Quotes only feed the rolling context buffer (WARM_PERF_RECON
++# §3: every other survivor of the drain is trades-only or latest-wins), so fetching
++# quotes beyond retention+slack is pure eviction fodder — 96.9% of the measured 20-min
++# warm was full-span mbp-1.
++_QUOTE_WARM_SLACK = timedelta(minutes=10)
+ _QUOTE_MESSAGE_ALIASES = {"bbomsg", "mbp1msg", "cmbp1msg", "tbbomsg", "cbbomsg", "tcbbomsg"}
+ _CONTEXT_SCHEMAS = {"definition", "status", "statistics"}
+ 
+@@ -67,6 +74,12 @@ _CONTEXT_SCHEMAS = {"definition", "status", "statistics"}
+ #: clear a burst instead of paying asyncio.wait_for timer setup for every message.
+ _PROVIDER_BATCH_LIMIT = 256
+ 
++#: WEDGE fix: upper bound on one marshaled subscribe/start call executing on the SDK
++#: session loop. The loop runs these in microseconds when healthy (proven by stop()'s
++#: 1 ms call_soon_threadsafe turnaround mid-wedge, WEDGE_CAPTURE.md §C.5); a miss
++#: means the session loop is dead and the connect must fail LOUDLY, never wedge.
++_SESSION_LOOP_CALL_TIMEOUT_SECONDS = 10.0
++
+ 
+ def is_databento_sdk_available() -> bool:
+     """Return whether the optional Databento SDK appears importable.
+@@ -118,6 +131,35 @@ class _DatabentoSdkFacade:
+             )
+         client.add_callback(callback)
+ 
++    def connect_session(self, client: Any, *, dataset: str) -> None:
++        """WEDGE fix: force the gateway connect+auth with ZERO subscription writes.
++
++        The SDK connects lazily inside ``subscribe()``, whose post-connect
++        subscription write then executes on the CALLING thread — an unsynchronized
++        write to a transport owned by the SDK's private session loop, which is the
++        silent post-drain wedge (WEDGE_CAPTURE.md §C.4: auth writes on the loop
++        thread succeeded; the six caller-thread subscribe/start writes never reached
++        the wire). Connecting first from the caller thread (the SDK's ``_connect``
++        blocks through connect+auth via ``run_coroutine_threadsafe`` — safe from any
++        non-loop thread) lets every subsequent subscribe/start run ON the session
++        loop. The private-handle access is guarded: an SDK whose internals moved
++        fails LOUDLY here at connect time instead of silently falling back to the
++        calling-thread write (databento 0.71.0 and 0.81.0 both expose this shape;
++        upstream fixed only ``start()``/``terminate()`` marshaling in 0.79.0 —
++        ``subscribe()`` still writes caller-thread as of 0.81.0).
++        """
++
++        session = getattr(client, "_session", None)
++        connect = getattr(session, "_connect", None)
++        if session is None or not callable(connect) or self._session_loop(client) is None:
++            raise DatabentoUnavailableError(
++                "Databento Live client does not expose the session/loop handles the "
++                "wedge-safe connect requires (client._session._connect and a session "
++                "event loop). Refusing to fall back to calling-thread subscription "
++                "writes; pin a databento version with the expected Live client shape."
++            )
++        connect(dataset=dataset)
++
+     def subscribe(
+         self,
+         client: Any,
+@@ -134,28 +176,92 @@ class _DatabentoSdkFacade:
+             )
+         # W2 P1b: ``start`` engages the gateway's intraday replay (warm start). It is
+         # only forwarded when set so fakes/older clients keep the narrow signature.
+-        if start is None:
+-            client.subscribe(dataset=dataset, schema=schema, symbols=[symbol], stype_in=stype_in)
+-        else:
+-            client.subscribe(
+-                dataset=dataset,
+-                schema=schema,
+-                symbols=[symbol],
+-                stype_in=stype_in,
+-                start=start,
+-            )
++        kwargs: dict[str, Any] = {
++            "dataset": dataset,
++            "schema": schema,
++            "symbols": [symbol],
++            "stype_in": stype_in,
++        }
++        if start is not None:
++            kwargs["start"] = start
++        # WEDGE fix: the subscription request write must execute on the session loop.
++        self._run_on_session_loop(
++            client, lambda: client.subscribe(**kwargs), label=f"subscribe({schema})"
++        )
+ 
+     def start(self, client: Any) -> None:
+-        if hasattr(client, "start"):
+-            client.start()
+-            return
+-        if hasattr(client, "run"):
+-            client.run()
+-            return
++        for name in ("start", "run"):
++            method = getattr(client, name, None)
++            if method is not None:
++                # WEDGE fix: the SessionStart write must execute on the session loop
++                # (0.79.0 marshals it upstream; running the whole call there is safe
++                # on 0.79+ — call_soon_threadsafe from the loop thread is call_soon —
++                # and also repairs the pre-0.79 caller-thread write).
++                self._run_on_session_loop(client, method, label=name)
++                return
+         raise DatabentoUnavailableError(
+             "Databento Live client does not expose start/run. Upgrade the databento SDK."
+         )
+ 
++    def _session_loop(self, client: Any) -> asyncio.AbstractEventLoop | None:
++        session = getattr(client, "_session", None)
++        loop = getattr(session, "_loop", None)
++        if loop is None:
++            # databento keeps one shared session loop as a Live class attribute.
++            loop = getattr(type(client), "_loop", None)
++        return loop if isinstance(loop, asyncio.AbstractEventLoop) else None
++
++    def _run_on_session_loop(
++        self, client: Any, action: Callable[[], Any], *, label: str
++    ) -> None:
++        """Execute ``action`` on the SDK session loop and wait for it (bounded).
++
++        The wait blocks the calling thread — normally sub-millisecond per call when
++        the session loop is healthy, though the surrounding connect sequence as a
++        whole blocks ~1-2 s (dominated by the gateway connect+auth RTT, exactly as
++        the pre-fix inline connect did) and is bounded by the SDK's connect/auth
++        timeouts plus this call timeout per marshaled operation. Raises loudly on
++        timeout instead of leaving a silently-wedged session.
++        """
++
++        loop = self._session_loop(client)
++        if loop is None:
++            raise DatabentoUnavailableError(
++                f"Databento Live client exposes no session event loop; cannot marshal "
++                f"{label} onto it. Refusing the wedge-prone calling-thread write."
++            )
++        try:
++            running = asyncio.get_running_loop()
++        except RuntimeError:
++            running = None
++        if running is loop:
++            action()
++            return
++        if not loop.is_running():
++            raise DatabentoUnavailableError(
++                f"Databento session event loop is not running; cannot marshal {label}."
++            )
++        done = threading.Event()
++        failure: list[BaseException] = []
++
++        def _invoke() -> None:
++            try:
++                action()
++            except BaseException as exc:
++                failure.append(exc)
++            finally:
++                done.set()
++
++        loop.call_soon_threadsafe(_invoke)
++        if not done.wait(_SESSION_LOOP_CALL_TIMEOUT_SECONDS):
++            raise DatabentoUnavailableError(
++                f"Databento session loop did not execute {label} within "
++                f"{_SESSION_LOOP_CALL_TIMEOUT_SECONDS:.0f}s; treating the live session "
++                "as wedged instead of continuing silently."
++            )
++        if failure:
++            raise failure[0]
++
+     def stop(self, client: Any) -> None:
+         for name in ("stop", "close"):
+             method = getattr(client, name, None)
+@@ -184,6 +290,7 @@ class DatabentoMarketDataFeed:
+         intraday_replay: bool = False,
+         historical_source: "DatabentoHistoricalSource | None" = None,
+         now_provider: Callable[[], datetime] | None = None,
++        quote_warm_retention_provider: Callable[[], timedelta] | None = None,
+     ) -> None:
+         if not api_key:
+             raise ValueError("Databento API key must be configured in backend environment")
+@@ -218,6 +325,19 @@ class DatabentoMarketDataFeed:
+         self._intraday_replay = intraday_replay
+         self._historical_source = historical_source
+         self._now = now_provider or (lambda: datetime.now(UTC))
++        # WARM-FIX P4: when set, the quote schema's warm fetch is scoped to the last
++        # (provider() + slack) instead of the full trades span. The provider is read
++        # at FETCH time (the live service's runtime handle carries the contract-driven
++        # retention); None keeps the legacy both-schemas-full-span shape.
++        self._quote_warm_retention_provider = quote_warm_retention_provider
++        # Verify fix (adversarial-verify major): wall-clock stamp of the LAST provider
++        # callback of any kind — including SystemMsg heartbeats and symbology
++        # mappings that the consumer later drops as control messages. This is the
++        # liveness watchdog's healthy-vs-wedge discriminator (WEDGE_CAPTURE.md §C.4:
++        # a started session heartbeats every 30 s even with zero market data; the
++        # wedge had zero inbound bytes). Written from the SDK callback thread;
++        # single reference assignment, safe to read from the event loop.
++        self.last_provider_activity_utc: datetime | None = None
+         # W2 P1b FALLBACK: per-schema historical record streams staged by start()
+         # when the gateway rejects the replay-start subscribe; drained by events()
+         # BEFORE the live subscription so the queue can never overflow on history.
+@@ -239,7 +359,26 @@ class DatabentoMarketDataFeed:
+             for _ in range(_WARM_START_PRIOR_TRADING_DAYS):
+                 day = prior_trading_day(day)
+             replay_start = trading_day_start_utc(day)
+-            self._warm_start_streams = await self._fetch_warm_start_streams(replay_start)
++            quote_start, quote_retention = self._quote_warm_start(replay_start)
++            if quote_retention is None:
++                logger.info(
++                    "warm fetch: trades from %s, quotes from %s (full span; no "
++                    "retention provider)",
++                    replay_start.isoformat(),
++                    quote_start.isoformat(),
++                )
++            else:
++                logger.info(
++                    "warm fetch: trades from %s, quotes from %s (retention %dm + "
++                    "%dm slack)",
++                    replay_start.isoformat(),
++                    quote_start.isoformat(),
++                    int(quote_retention.total_seconds() // 60),
++                    int(_QUOTE_WARM_SLACK.total_seconds() // 60),
++                )
++            self._warm_start_streams = await self._fetch_warm_start_streams(
++                ((self.trade_schema, replay_start), (self.quote_schema, quote_start))
++            )
+             if self._warm_start_streams is not None:
+                 self._loop = asyncio.get_running_loop()
+                 self._started = True
+@@ -258,6 +397,10 @@ class DatabentoMarketDataFeed:
+             self._client = client
+             self._loop = asyncio.get_running_loop()
+             self._sdk_facade.add_callback(client, self._provider_callback)
++            # WEDGE fix (WEDGE_CAPTURE.md): connect+auth FIRST with zero subscription
++            # writes, so every subscribe below and the start marshal onto the SDK's
++            # session loop instead of writing to its transport from this thread.
++            self._sdk_facade.connect_session(client, dataset=self.dataset)
+             replayable = {self.trade_schema.lower(), self.quote_schema.lower()}
+             for schema in _unique_schemas(
+                 (self.trade_schema, self.quote_schema, *self.context_schemas)
+@@ -286,8 +429,32 @@ class DatabentoMarketDataFeed:
+             raise
+ 
+ 
++    def _quote_warm_start(self, replay_start: datetime) -> tuple[datetime, timedelta | None]:
++        """WARM-FIX P4: the quote schema's scoped warm-fetch anchor (+ retention used).
++
++        Quotes only survive the drain inside the rolling market-context buffer
++        (WARM_PERF_RECON §3 — everything else is trades-only or latest-wins), so
++        the quote span is now - (effective retention + 10 min slack), floored at
++        the trades anchor. Trades keep the full ``_WARM_START_PRIOR_TRADING_DAYS``
++        span (owner-ruled constant: bars/levels/touches need the full days).
++
++        Staleness caveat: the retention provider is read at FETCH time. A LATER
++        hot-swap to a contract with wider retention does not refetch — the buffer
++        simply starts that contract with the narrower already-fetched window
++        (exactly like a mid-session activation today).
++        """
++
++        provider = self._quote_warm_retention_provider
++        if provider is None:
++            return replay_start, None
++        retention = provider()
++        quote_start = self._now() - retention - _QUOTE_WARM_SLACK
++        if quote_start < replay_start:
++            return replay_start, retention
++        return quote_start, retention
++
+     async def _fetch_warm_start_streams(
+-        self, replay_start: datetime
++        self, schema_starts: tuple[tuple[str, datetime], ...]
+     ) -> tuple[tuple[str, Iterable[Any]], ...] | None:
+         source = self._historical_source
+         if source is None or not source.available:
+@@ -299,9 +466,8 @@ class DatabentoMarketDataFeed:
+         try:
+             return await asyncio.to_thread(
+                 source.dbn_record_streams,
+-                start=replay_start,
+                 end=self._now(),
+-                schemas=(self.trade_schema, self.quote_schema),
++                schema_starts=schema_starts,
+             )
+         except asyncio.CancelledError:
+             raise
+@@ -477,6 +643,7 @@ class DatabentoMarketDataFeed:
+         # Databento invokes callbacks from SDK-managed threads. Keep this function
+         # tiny and thread-safe: enqueue provider records only. The async iterator
+         # later normalizes them and feeds ApplicationRuntime on the event loop.
++        self.last_provider_activity_utc = datetime.now(UTC)
+         schema = _optional_str(kwargs, "schema") if kwargs else None
+         message: Any
+         if "record" in kwargs:
+diff --git a/backend/src/trade_lab/adapters/databento_historical.py b/backend/src/trade_lab/adapters/databento_historical.py
+index 09977fd..d799b65 100644
+--- a/backend/src/trade_lab/adapters/databento_historical.py
++++ b/backend/src/trade_lab/adapters/databento_historical.py
+@@ -4,9 +4,12 @@ D-P-03: the Historical API exists solely for the live warm-start slice. Two
+ consumers remain after the Chicago display seed retired (W2 P1e):
+ 
+ * ``dbn_record_streams`` — the warm-start FALLBACK when the live gateway rejects
+-  the intraday replay-start subscribe: raw DBN records (trades + MBP-1) for
+-  ``[trading-day 18:00 ET, now)``, fed through the SAME
+-  ``normalize_provider_message`` path live records take.
++  the intraday replay-start subscribe: raw DBN records fed through the SAME
++  ``normalize_provider_message`` path live records take. WARM-FIX P4: spans are
++  per-schema — trades keep ``[trading-day 18:00 ET, now)`` while the quote schema
++  is scoped to the market-context retention window (quotes only survive the
++  drain inside that rolling buffer). The retention is read at fetch time; a
++  later hot-swap to a wider-retention contract does NOT refetch.
+ * ``ohlcv_frame`` — the tiny prior-trading-day ohlcv-1h request reduced to
+   (max high, min low) for ``runtime.load_prior_day_summary`` (W2 P1c), the same
+   seed path research and cold replay use.
+@@ -16,6 +19,7 @@ fetch method runs, and ``record_fetcher``/``ohlcv_fetcher`` can be injected so
+ tests run without the SDK or network.
+ """
+ 
++import logging
+ from collections.abc import Callable, Iterable
+ from datetime import UTC, datetime
+ from typing import TYPE_CHECKING, Any
+@@ -25,6 +29,8 @@ from trade_lab.adapters.databento import DatabentoUnavailableError, is_databento
+ if TYPE_CHECKING:
+     import pandas as pd
+ 
++logger = logging.getLogger(__name__)
++
+ # (schema, start, end) -> iterable of DBN records for that schema.
+ RecordFetcher = Callable[[str, datetime, datetime], Iterable[Any]]
+ # (start, end) -> ohlcv DataFrame with at least high/low columns.
+@@ -66,34 +72,68 @@ class DatabentoHistoricalSource:
+         return self._api_key is not None and is_databento_sdk_available()
+ 
+     def dbn_record_streams(
+-        self, *, start: datetime, end: datetime, schemas: tuple[str, ...]
++        self, *, end: datetime, schema_starts: tuple[tuple[str, datetime], ...]
+     ) -> tuple[tuple[str, Iterable[Any]], ...]:
+-        """Per-schema DBN record streams over ``[start, end)`` for warm start."""
++        """Per-schema DBN record streams over ``[start_of(schema), end)`` for warm start.
++
++        WARM-FIX P4: each schema carries its own start (trades full-span, quotes
++        retention-scoped), and the ``end <= start`` guard plus the availability
++        clamp apply PER SCHEMA — a quote window that the availability lag has
++        entirely swallowed yields an empty stream while trades still fetch.
++        ``heapq.merge`` in the adapter drain tolerates the asymmetric spans (each
++        stream is individually sorted; trades simply yield alone until the quote
++        head appears).
++        """
+ 
+         if self._record_fetcher is not None:
+             self.last_stream_end = end
+-            return tuple((schema, self._record_fetcher(schema, start, end)) for schema in schemas)
++            return tuple(
++                (schema, () if end <= start else self._record_fetcher(schema, start, end))
++                for schema, start in schema_starts
++            )
+         client = self._client()
+         # Historical data lags real time by minutes; an unclamped end (≈ now)
+-        # triggers a 422 data_end_after_available_end error.
+-        end = self._clamp_end_to_available(client, end, schemas[0])
+-        self.last_stream_end = end
+-        if end <= start:
+-            return tuple((schema, ()) for schema in schemas)
+-        return tuple(
+-            (
+-                schema,
+-                client.timeseries.get_range(
+-                    dataset=self._dataset,
+-                    schema=schema,
+-                    symbols=[self._requested_symbol],
+-                    stype_in=self._stype_in,
+-                    start=start,
+-                    end=end,
+-                ),
++        # triggers a 422 data_end_after_available_end error. One metadata call
++        # serves every schema's clamp.
++        availability = self._dataset_availability(client)
++        streams: list[tuple[str, Iterable[Any]]] = []
++        effective_ends: list[datetime] = []
++        for schema, start in schema_starts:
++            schema_end = self._clamped_end(availability, end, schema)
++            effective_ends.append(schema_end)
++            if schema_end <= start:
++                streams.append((schema, ()))
++                continue
++            streams.append(
++                (
++                    schema,
++                    client.timeseries.get_range(
++                        dataset=self._dataset,
++                        schema=schema,
++                        symbols=[self._requested_symbol],
++                        stype_in=self._stype_in,
++                        start=start,
++                        end=schema_end,
++                    ),
++                )
+             )
+-            for schema in schemas
+-        )
++        # The seam-gap warning reads the latest end any schema actually used.
++        # Verify fix: with per-schema clamps the ends can DIVERGE (e.g. an mbp-1
++        # ingestion hiccup lags its availability behind trades') and the shared
++        # seam warning would then understate the laggard's hole — surface it.
++        self.last_stream_end = max(effective_ends) if effective_ends else end
++        if effective_ends:
++            newest = max(effective_ends)
++            for (schema, _start), schema_end in zip(schema_starts, effective_ends, strict=True):
++                lag = (newest - schema_end).total_seconds()
++                if lag > 60:
++                    logger.warning(
++                        "warm-fetch availability for schema %s lags the freshest "
++                        "schema by %.0f s; that schema's warm slice ends early",
++                        schema,
++                        lag,
++                    )
++        return tuple(streams)
+ 
+     def ohlcv_frame(self, *, start: datetime, end: datetime) -> "pd.DataFrame":
+         """Hourly ohlcv bars over ``[start, end)`` (the prior-day summary input)."""
+@@ -125,19 +165,23 @@ class DatabentoHistoricalSource:
+ 
+         return databento.Historical(self._api_key)
+ 
+-    def _clamp_end_to_available(self, client: Any, end: datetime, schema: str) -> datetime:
+-        import pandas as pd
+-
++    def _dataset_availability(self, client: Any) -> Any:
+         try:
+-            available = client.metadata.get_dataset_range(self._dataset)
++            return client.metadata.get_dataset_range(self._dataset)
+         except Exception:
++            return None
++
++    def _clamped_end(self, availability: Any, end: datetime, schema: str) -> datetime:
++        import pandas as pd
++
++        if availability is None:
+             return end
+         raw_end = None
+-        schema_ranges = available.get("schema") if isinstance(available, dict) else None
++        schema_ranges = availability.get("schema") if isinstance(availability, dict) else None
+         if isinstance(schema_ranges, dict) and isinstance(schema_ranges.get(schema), dict):
+             raw_end = schema_ranges[schema].get("end")
+-        if raw_end is None and isinstance(available, dict):
+-            raw_end = available.get("end")
++        if raw_end is None and isinstance(availability, dict):
++            raw_end = availability.get("end")
+         if raw_end is None:
+             return end
+         available_end = pd.Timestamp(raw_end).to_pydatetime()
+diff --git a/backend/src/trade_lab/api/__main__.py b/backend/src/trade_lab/api/__main__.py
+index 44945b1..f5181e9 100644
+--- a/backend/src/trade_lab/api/__main__.py
++++ b/backend/src/trade_lab/api/__main__.py
+@@ -1,17 +1,72 @@
+ """Run with: python -m trade_lab.api"""
+ 
++import logging
++import sys
++import time
++
+ import uvicorn
+ 
+ from trade_lab.config import load_settings
+ 
++#: Marker attribute so repeated configure_logging calls never stack handlers.
++_HANDLER_MARKER = "_trade_lab_log_handler"
++
++
++def configure_logging(level_name: str) -> None:
++    """WARM-FIX P5: give the backend a real logging surface (WEDGE_CAPTURE.md §A.2).
++
++    Pre-fix the dev server ran uvicorn with no log config: only uvicorn's own
++    loggers had handlers, everything else (trade_lab.*, the databento SDK — the
++    entire live subscribe handshake) fell through to Python's WARNING-only
++    lastResort handler, so the live wedge was silent by construction.
++
++    Shape: root -> stderr with UTC timestamps at ``level_name`` (default INFO,
++    env ``TRADE_LAB_LOG_LEVEL``); ``uvicorn.access`` capped at WARNING (request
++    noise); the ``databento`` logger at INFO, raised to DEBUG only when the env
++    level is DEBUG (the full session-handshake trace used by the wedge capture).
++    Idempotent: repeat calls re-level but never stack handlers.
++
++    Verify fix: ``main()`` passes ``log_config=None`` to ``uvicorn.run`` —
++    uvicorn's DEFAULT dictConfig would re-level every logger it names (it sets
++    ``uvicorn.access`` back to INFO with its own handler; ``disable_existing_
++    loggers=False`` only protects loggers it does NOT name), silently undoing
++    the access cap. With no uvicorn log config, uvicorn's loggers propagate to
++    the root handler configured here and the caps hold.
++    """
++
++    level = getattr(logging, level_name.strip().upper(), None)
++    if not isinstance(level, int):
++        level = logging.INFO
++    root = logging.getLogger()
++    root.setLevel(level)
++    if not any(getattr(handler, _HANDLER_MARKER, False) for handler in root.handlers):
++        handler = logging.StreamHandler(sys.stderr)
++        formatter = logging.Formatter(
++            "%(asctime)s.%(msecs)03dZ %(levelname)s %(name)s: %(message)s",
++            datefmt="%Y-%m-%dT%H:%M:%S",
++        )
++        formatter.converter = time.gmtime
++        handler.setFormatter(formatter)
++        setattr(handler, _HANDLER_MARKER, True)
++        root.addHandler(handler)
++    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
++    logging.getLogger("databento").setLevel(
++        logging.DEBUG if level <= logging.DEBUG else logging.INFO
++    )
++
+ 
+ def main() -> None:
+     settings = load_settings()
++    configure_logging(settings.log_level)
+     uvicorn.run(
+         "trade_lab.api.app:create_app",
+         factory=True,
+         host=settings.backend_host,
+         port=settings.backend_port,
++        # Verify fix: uvicorn's default dictConfig would reset uvicorn.access to
++        # INFO (it names that logger explicitly). None -> uvicorn loggers propagate
++        # to the root handler configure_logging installed, and the caps hold.
++        log_config=None,
+     )
+ 
+ 
+diff --git a/backend/src/trade_lab/api/app.py b/backend/src/trade_lab/api/app.py
+index 75737b5..6c71a0a 100644
+--- a/backend/src/trade_lab/api/app.py
++++ b/backend/src/trade_lab/api/app.py
+@@ -4,6 +4,7 @@ import hmac
+ import ipaddress
+ import re
+ from contextlib import asynccontextmanager
++from datetime import timedelta
+ from pathlib import Path
+ from urllib.parse import urlsplit
+ 
+@@ -307,6 +308,16 @@ def create_app(
+             stype_in=settings.databento_stype_in,
+         )
+ 
++        def _quote_warm_retention() -> timedelta:
++            # WARM-FIX P4: effective quote retention at FETCH time — the runtime's
++            # contract-driven buffer retention (runtime.py W1 P3b) floored at the
++            # settings baseline. A post-start hot-swap to a wider-retention
++            # contract does NOT refetch (see the adapter docstring caveat).
++            return max(
++                runtime.market_context.retention,
++                timedelta(minutes=settings.market_context_retention_minutes),
++            )
++
+         def live_feed_factory(config: LiveConfig):
+             if settings.databento_api_key is None:
+                 raise RuntimeError("Databento API key is not configured")
+@@ -322,6 +333,8 @@ def create_app(
+                 # through the same adapter path before flowing into real time.
+                 intraday_replay=True,
+                 historical_source=historical_source,
++                # WARM-FIX P4: scope the mbp-1 warm fetch to retention + slack.
++                quote_warm_retention_provider=_quote_warm_retention,
+             )
+ 
+         live = LiveMarketDataService(
+@@ -333,6 +346,11 @@ def create_app(
+             # doesn't flood the browser (dropped frames -> chart gaps); per-event
+             # streaming resumes once the frontier reaches real time.
+             throttle_warm_start=True,
++            # WARM-FIX P2: post-drain silence -> DEGRADED + single-attempt reconnect.
++            watchdog_seconds=settings.live_watchdog_seconds,
++            # Verify fix: the internal reconnect honors the same live/replay mutual
++            # exclusion the endpoints enforce (audit #NN-2).
++            replay_active=lambda: _replay_is_active(replay),
+         )
+     if not live.has_update_callback:
+         live.set_update_callback(broadcaster.broadcast_update)
+diff --git a/backend/src/trade_lab/config.py b/backend/src/trade_lab/config.py
+index 2c19dc8..60f9b22 100644
+--- a/backend/src/trade_lab/config.py
++++ b/backend/src/trade_lab/config.py
+@@ -26,6 +26,12 @@ class Settings(BaseSettings):
+ 
+     backend_host: str = "127.0.0.1"
+     backend_port: int = 8001
++
++    # WARM-FIX P5 (WEDGE_CAPTURE.md §A.2: the deployment had NO logging surface —
++    # app/SDK records below WARNING went nowhere, which kept the wedge invisible).
++    # Root logging level for the dev-server entrypoint; DEBUG also raises the
++    # databento SDK logger to DEBUG (soak-evidence instrumentation).
++    log_level: str = Field(default="INFO", min_length=1, max_length=16)
+     allowed_origins: str = "http://localhost:5174,http://127.0.0.1:5174"
+     data_path: Path | None = None
+ 
+@@ -57,6 +63,11 @@ class Settings(BaseSettings):
+     observation_duration_seconds: int = 300
+     tick_timeframes: tuple[int, ...] = (147, 987, 2000)
+ 
++    # WARM-FIX P2 (WEDGE_CAPTURE.md): live liveness watchdog — seconds of
++    # post-drain silence (zero provider messages after the live subscribe) before
++    # the feed is marked DEGRADED and the D-P-06 single-attempt reconnect runs.
++    live_watchdog_seconds: float = Field(default=120.0, gt=0, le=3600)
++
+     # Rolling L1/L0 context retention for pre-touch order-flow features. Inference
+     # fires at observation completion (~interaction window after the touch) but
+     # approach features reach back approach_window before the touch, so retention must
+diff --git a/backend/src/trade_lab/services/live.py b/backend/src/trade_lab/services/live.py
+index 51ec19c..286a1f7 100644
+--- a/backend/src/trade_lab/services/live.py
++++ b/backend/src/trade_lab/services/live.py
+@@ -53,6 +53,14 @@ _LIVE_LAG_SECONDS = 5.0
+ _WARMING_LAG_SECONDS = 30.0
+ _WARM_SNAPSHOT_MIN_INTERVAL_SECONDS = 1.0
+ 
++#: WARM-FIX P2 liveness watchdog default: if ZERO provider messages arrive within
++#: this many seconds after the post-drain live subscribe (the drain's last item),
++#: the feed is marked DEGRADED and the single-attempt D-P-06 reconnect runs. The
++#: wedge this catches (WEDGE_CAPTURE.md): an authenticated-but-silent session that
++#: neither the SDK's own monitor (blind before the first record) nor the status
++#: surface (CONNECTED-by-construction, "warming" forever) will ever report.
++_DEFAULT_WATCHDOG_SECONDS = 120.0
++
+ 
+ class LiveState(StrEnum):
+     IDLE = "idle"
+@@ -120,6 +128,8 @@ class LiveMarketDataService:
+         reconnect_delay_seconds: float = 1.0,
+         now_provider: Callable[[], datetime] | None = None,
+         throttle_warm_start: bool = False,
++        watchdog_seconds: float = _DEFAULT_WATCHDOG_SECONDS,
++        replay_active: Callable[[], bool] | None = None,
+     ) -> None:
+         self.runtime = runtime
+         self.config = config
+@@ -156,6 +166,20 @@ class LiveMarketDataService:
+         # path (reset + prior-day seed + trading-day replay), killing the old
+         # wipe-without-recovery behavior.
+         self._reconnect_task: asyncio.Task[None] | None = None
++        # WARM-FIX P2: post-subscribe liveness watchdog. Armed on every (re)start,
++        # disarmed by the warm->live flip (the first real gateway message); strikes
++        # survive a WATCHDOG reconnect so a second silence turns FAILED (D-P-06
++        # single retry), and reset on flip, operator stop, and any OPERATOR start
++        # (verify fix: a stale strike must not deny a fresh session its retry).
++        self._watchdog_seconds = max(watchdog_seconds, 0.01)
++        self._watchdog_task: asyncio.Task[None] | None = None
++        self._watchdog_strikes = 0
++        self._last_item_wall_utc: datetime | None = None
++        # Verify fix (adversarial-verify major): the internal reconnect path must
++        # honor the same live/replay mutual exclusion the HTTP endpoints enforce
++        # (audit #NN-2) — a reconnect firing under an active replay would reset the
++        # shared runtime and arm the warm gate underneath it.
++        self._replay_active = replay_active
+ 
+     @property
+     def has_update_callback(self) -> bool:
+@@ -208,7 +232,7 @@ class LiveMarketDataService:
+             warm_start_events=self._warm_start_events,
+         )
+ 
+-    async def start(self) -> None:
++    async def start(self, *, _preserve_watchdog_strikes: bool = False) -> None:
+         async with self._lock:
+             if self._state in {LiveState.CONNECTING, LiveState.RUNNING} or (
+                 self._task is not None and not self._task.done()
+@@ -220,6 +244,11 @@ class LiveMarketDataService:
+                 raise RuntimeError("Databento API key is not configured in backend environment")
+             self._state = LiveState.CONNECTING
+             self._last_error = None
++            # Verify fix: an OPERATOR start begins a fresh watchdog episode (full
++            # DEGRADED + single-retry contract); only the watchdog's own D-P-06
++            # reconnect carries its strike forward so a second silence turns FAILED.
++            if not _preserve_watchdog_strikes:
++                self._watchdog_strikes = 0
+             self._events_processed = 0
+             self._last_event_ts_utc = None
+             self._started_at_utc = datetime.now(UTC)
+@@ -239,6 +268,12 @@ class LiveMarketDataService:
+             self._warm_anchor_utc = self._now()
+             self._warm_start_state = "warming"
+             self._warm_start_events = 0
++            # WARM-FIX P3 (verify fix: anchor-based): observations originating from
++            # touches BEFORE this instant never predict/register/journal — during
++            # the drain AND when their window crosses into the live phase. The
++            # anchor stays set for the whole session; live-originated touches are
++            # unaffected by it.
++            self.runtime.set_live_warm_inference_gate(self._warm_anchor_utc)
+             # Each (re)start re-runs the warm-start replay, so re-arm the throttle.
+             self._live_streaming = False
+             self._last_warm_snapshot_at = None
+@@ -260,6 +295,7 @@ class LiveMarketDataService:
+             except Exception as exc:
+                 self._state = LiveState.FAILED
+                 self._last_error = type(exc).__name__
++                self.runtime.set_live_warm_inference_gate(None)
+                 if feed is not None:
+                     with suppress(Exception):
+                         await feed.stop()
+@@ -284,9 +320,14 @@ class LiveMarketDataService:
+             self._state = LiveState.RUNNING
+             await self._emit_status(FeedConnectionState.CONNECTED, "live feed running")
+             self._task = asyncio.create_task(self._wait_strategy_core_live())
++            # WARM-FIX P2: (re)arm the liveness watchdog for this start's live phase.
++            self._last_item_wall_utc = self._now()
++            self._arm_watchdog()
+ 
+     async def stop(self) -> None:
+         async with self._lock:
++            await self._disarm_watchdog()
++            self._watchdog_strikes = 0
+             if self._reconnect_task is not None and not self._reconnect_task.done():
+                 self._reconnect_task.cancel()
+                 with suppress(asyncio.CancelledError):
+@@ -303,6 +344,9 @@ class LiveMarketDataService:
+             self._feed = None
+             self._state = LiveState.STOPPED
+             self._stopped_at_utc = datetime.now(UTC)
++            # WARM-FIX P3: a stop must not leave the shared runtime gated
++            # (the next replay/live start resets anyway; this is belt-and-braces).
++            self.runtime.set_live_warm_inference_gate(None)
+             # W2 P2a (F10): finalize open setups whose cutoff has already passed;
+             # the flushed drops ride the normal drop -> DroppedPrediction surface.
+             await self._emit(self.runtime.flush_resolver(datetime.now(UTC)))
+@@ -339,6 +383,10 @@ class LiveMarketDataService:
+             )
+ 
+     def _process_live_item(self, item: object) -> RuntimeUpdate:
++        # WARM-FIX P2: any provider item advances the liveness clock (during the
++        # warm drain this keeps the watchdog quiet; after the drain only real
++        # gateway traffic does).
++        self._last_item_wall_utc = self._now()
+         if isinstance(item, FeedStatus):
+             self._market_update_lag = None
+             return self.runtime.set_feed_status(item)
+@@ -362,6 +410,11 @@ class LiveMarketDataService:
+             self._warm_start_events += 1
+         elif self._warm_start_state != "live":
+             self._warm_start_state = "live"
++            # WARM-FIX P2: the live phase delivered — the watchdog loop disarms on
++            # this flip, and a fresh silence episode starts from zero strikes.
++            # (P3's anchor deliberately stays set: warm-originated observations
++            # whose windows cross the seam must still produce nothing.)
++            self._watchdog_strikes = 0
+ 
+     async def _wait_strategy_core_live(self) -> None:
+         core = self.strategy_core_live
+@@ -404,9 +457,23 @@ class LiveMarketDataService:
+         await asyncio.sleep(self._reconnect_delay_seconds)
+         if self._state != LiveState.DISCONNECTED:
+             return
++        # Verify fix (adversarial-verify major): a replay may legitimately have
++        # started during the reconnect delay (DISCONNECTED is not an active live
++        # state for the endpoint 409 guard). Reconnecting now would reset the
++        # shared runtime and arm the warm gate underneath the running replay —
++        # honor audit #NN-2's mutual exclusion on this internal path too.
++        if self._replay_active is not None and self._replay_active():
++            logger.warning(
++                "live auto-reconnect skipped: a replay is active on the shared "
++                "runtime (audit #NN-2 mutual exclusion); restart live manually "
++                "after the replay finishes"
++            )
++            return
+         logger.info("live feed reconnecting from the trading-day start (D-P-06)")
+         try:
+-            await self.start()
++            # D-P-06: the watchdog's single retry carries its strike into this
++            # start so a second silent episode turns FAILED; operator starts reset.
++            await self.start(_preserve_watchdog_strikes=True)
+         except Exception as exc:
+             logger.error(
+                 "live auto-reconnect failed: exception_type=%s message=%s",
+@@ -414,6 +481,116 @@ class LiveMarketDataService:
+                 _redact_configured_secrets(str(exc), self.config.secret_values),
+             )
+ 
++    def _arm_watchdog(self) -> None:
++        stale = self._watchdog_task
++        if stale is not None and not stale.done():
++            stale.cancel()
++        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
++
++    async def _disarm_watchdog(self) -> None:
++        task = self._watchdog_task
++        self._watchdog_task = None
++        if task is not None and not task.done():
++            task.cancel()
++            with suppress(asyncio.CancelledError):
++                await task
++
++    async def _watchdog_loop(self) -> None:
++        """WARM-FIX P2: post-subscribe liveness watchdog (WEDGE_CAPTURE.md).
++
++        The wedge signature this exists for: state=running, warm_start_state
++        stuck at "warming", event counters frozen at the warm total, feed
++        "connected", zero live messages — with no error from the SDK (its own
++        monitor is blind before the first record) and none from TL. The loop
++        disarms on the first received live message (the warm->live flip) and is
++        re-armed by every (re)start; wall-clock silence beyond the threshold
++        triggers the D-P-06 single-attempt reconnect, and a second silent episode
++        marks the feed FAILED for the operator.
++        """
++
++        interval = min(max(self._watchdog_seconds / 4.0, 0.01), 1.0)
++        while True:
++            await asyncio.sleep(interval)
++            if self._state is not LiveState.RUNNING:
++                return
++            if self._warm_start_state == "live":
++                return
++            last = self._effective_liveness_stamp()
++            if last is None:
++                continue
++            silent_for = (self._now() - last).total_seconds()
++            if silent_for <= self._watchdog_seconds:
++                continue
++            await self._handle_watchdog_timeout(silent_for)
++            return
++
++    def _effective_liveness_stamp(self) -> datetime | None:
++        """The freshest evidence the live session is alive.
++
++        Verify fix (adversarial-verify major): processed items alone are
++        heartbeat-blind — the adapter drops gateway SystemMsg heartbeats and
++        symbology mappings as control messages BEFORE they reach
++        ``_process_live_item``, yet those records are exactly the healthy-vs-wedge
++        discriminator (WEDGE_CAPTURE.md §C.4: a started session heartbeats every
++        30 s even with zero market data; the wedge had zero inbound bytes). The
++        Databento feed therefore exposes ``last_provider_activity_utc``, stamped
++        on EVERY provider callback; folding it in keeps a quiet-but-healthy
++        market (weekend/halt start) from being torn down as a wedge, while a true
++        wedge (no callbacks at all) still trips the watchdog.
++        """
++
++        stamps = [self._last_item_wall_utc]
++        feed_activity = getattr(self._feed, "last_provider_activity_utc", None)
++        if isinstance(feed_activity, datetime):
++            stamps.append(feed_activity)
++        present = [stamp for stamp in stamps if stamp is not None]
++        return max(present) if present else None
++
++    async def _handle_watchdog_timeout(self, silent_for: float) -> None:
++        async with self._lock:
++            if self._state is not LiveState.RUNNING or self._warm_start_state == "live":
++                return
++            self._watchdog_strikes += 1
++            strike = self._watchdog_strikes
++            logger.error(
++                "live liveness watchdog: ZERO provider messages for %.0f s after the "
++                "post-drain live subscribe (wedge signature: state=running, "
++                "warm_start_state=warming, events frozen at the warm total — "
++                "WEDGE_CAPTURE.md); %s",
++                silent_for,
++                "forcing the D-P-06 single-attempt reconnect"
++                if strike == 1
++                else "second silent episode — marking the live feed FAILED",
++            )
++            # Tear the wedged session down. core.stop() stops the feed it owns
++            # (mirrors stop()); dropping the core handle makes status() report from
++            # this service's state instead of the stopped core's.
++            core = self.strategy_core_live
++            self.strategy_core_live = None
++            if core is not None:
++                with suppress(Exception):
++                    await core.stop()
++            elif self._feed is not None:
++                with suppress(Exception):
++                    await self._feed.stop()
++            self._feed = None
++            if strike >= 2:
++                self._state = LiveState.FAILED
++                self._last_error = "live_watchdog_silent_after_reconnect"
++                self.runtime.set_live_warm_inference_gate(None)
++                await self._emit_status(
++                    FeedConnectionState.DISCONNECTED,
++                    "live feed failed: watchdog found no live messages after reconnect",
++                )
++                return
++            self._state = LiveState.DISCONNECTED
++            await self._emit_status(
++                FeedConnectionState.DEGRADED,
++                "live feed degraded: no live messages after the warm drain "
++                "(wedge signature); reconnecting",
++            )
++            self._schedule_reconnect()
++
+     async def _emit_status(self, state: FeedConnectionState, message: str) -> None:
+         await self._emit(
+             self.runtime.set_feed_status(
+diff --git a/backend/src/trade_lab/services/runtime.py b/backend/src/trade_lab/services/runtime.py
+index 17d1a2a..8de298c 100644
+--- a/backend/src/trade_lab/services/runtime.py
++++ b/backend/src/trade_lab/services/runtime.py
+@@ -9,7 +9,7 @@ path and DTO mapping remains at the API edge.
+ import logging
+ import re
+ from dataclasses import dataclass, field
+-from datetime import date, timedelta
++from datetime import date, datetime, timedelta
+ from types import MappingProxyType
+ from typing import Any
+ 
+@@ -180,6 +180,15 @@ class ApplicationRuntime:
+         # Optional inference seam: when an InferenceEngine with an active model is set,
+         # completed observations produce Predictions attached to the RuntimeUpdate.
+         self._inference_engine = inference_engine
++        # WARM-FIX P3 (verify fix): while set, _run_inference suppresses production
++        # for observations whose ORIGINATING TOUCH predates this anchor — predict,
++        # resolver-register, and journal atomically (both are downstream of
++        # production). Anchor-based rather than a warm-phase boolean so a warm
++        # touch whose observation window crosses the drain's end cannot leak a
++        # duplicate row on the first post-flip event (adversarial-verify finding).
++        # Set ONLY by the live service; None (default) keeps replay and tests on
++        # unconditional predict-on-completion.
++        self._live_warm_inference_anchor: datetime | None = None
+         self._prediction_limit = prediction_limit
+         self._outcome_limit = outcome_limit
+         self._predictions: list[Prediction] = []
+@@ -253,6 +262,7 @@ class ApplicationRuntime:
+             timedelta(seconds=self._observation_duration_seconds)
+         )
+         self.market_context.reset()
++        self._live_warm_inference_anchor = None
+         self._predictions.clear()
+         self._outcomes.clear()
+         self._dropped.clear()
+@@ -280,6 +290,25 @@ class ApplicationRuntime:
+         self._feed_status = status
+         return RuntimeUpdate(feed_status=status)
+ 
++    def set_live_warm_inference_gate(self, anchor: datetime | None) -> None:
++        """WARM-FIX P3: gate warm-originated prediction production (anchor-based).
++
++        While ``anchor`` is set, :meth:`_run_inference` produces nothing for
++        observations whose originating touch (``start_ts_utc``) predates it,
++        suppressing predict + resolver-register + journal atomically. ALL other
++        processing — bars, levels, touches, observations, market context, PDH/PDL
++        banking — is untouched; a warm observation that expires (during the drain
++        OR on the first post-flip events — the seam-tail case the adversarial
++        verify confirmed) produces nothing, while any live-originated touch
++        predicts normally from the first post-anchor event. This kills the
++        restart-duplicate journal rows (a warm replay re-detects the prior days'
++        touches with fresh ids on every restart) and the mode="live" mislabeling
++        of replayed touches. The live service arms it at start and keeps it for
++        the whole session; it clears on stop/failure, and reset() also clears it.
++        """
++
++        self._live_warm_inference_anchor = anchor
++
+     def set_inference_engine(self, engine: InferenceEngine | None) -> None:
+         """Attach (or detach) the inference engine and clear prediction state.
+ 
+@@ -548,6 +577,16 @@ class ApplicationRuntime:
+         engine = self._inference_engine
+         if engine is None or not engine.has_active_model:
+             return (), ()
++        # WARM-FIX P3: observations originating from warm-replayed touches produce
++        # nothing (no predict, no resolver registration, no journal — atomically),
++        # even when their window expires only after the warm->live flip.
++        warm_anchor = self._live_warm_inference_anchor
++        if warm_anchor is not None:
++            changed_observations = tuple(
++                observation
++                for observation in changed_observations
++                if observation.start_ts_utc >= warm_anchor
++            )
+         produced: list[Prediction] = []
+         # (prediction, observation) pairs: the resolver registers off the TOUCH
+         # anchors carried on the observation chain, not off the prediction timestamps.
+diff --git a/backend/tests/live_sdk_fakes.py b/backend/tests/live_sdk_fakes.py
+new file mode 100644
+index 0000000..c6760f1
+--- /dev/null
++++ b/backend/tests/live_sdk_fakes.py
+@@ -0,0 +1,75 @@
++"""Shared fake Databento Live SDK client for adapter tests.
++
++WEDGE fix (see WEDGE_CAPTURE.md at the repo root): the SDK facade now (1) forces
++connect+auth through the guarded private session handle before any subscription
++and (2) marshals every subscribe/start onto the SDK session loop. Fakes therefore
++expose the same shape the facade's guarded getattr chain expects — a ``_session``
++with ``_connect(dataset=...)`` and ``_loop`` — where ``_loop`` is a REAL event
++loop on a REAL daemon thread (mirroring the SDK's shared class-level loop) so the
++``call_soon_threadsafe`` marshaling actually executes. Every recorded call carries
++the executing thread's name, enabling the thread-identity assertions that pin the
++wedge fix.
++"""
++
++import asyncio
++import threading
++
++FAKE_SESSION_THREAD_NAME = "fake_databento_live"
++
++_session_loop = asyncio.new_event_loop()
++_session_thread = threading.Thread(
++    target=_session_loop.run_forever, name=FAKE_SESSION_THREAD_NAME, daemon=True
++)
++_start_lock = threading.Lock()
++
++
++def fake_session_loop() -> asyncio.AbstractEventLoop:
++    """The shared fake session loop, started lazily (like databento's Live._loop)."""
++
++    with _start_lock:
++        if not _session_thread.is_alive():
++            _session_thread.start()
++    return _session_loop
++
++
++class FakeLiveSession:
++    """The private session shape the facade's wedge-safe connect requires."""
++
++    def __init__(self) -> None:
++        self._loop = fake_session_loop()
++        #: (dataset, executing thread name) per _connect call.
++        self.connect_calls: list[tuple[str, str]] = []
++
++    def _connect(self, *, dataset: str) -> None:
++        self.connect_calls.append((dataset, threading.current_thread().name))
++
++
++class FakeLiveClient:
++    """Recording fake Live client; every call records its executing thread name."""
++
++    def __init__(self, key: str) -> None:
++        self.key = key
++        self.callbacks: list[object] = []
++        self.subscriptions: list[dict[str, object]] = []
++        #: (operation label, executing thread name) in call order.
++        self.call_threads: list[tuple[str, str]] = []
++        self.started = False
++        self.stopped = False
++        self._session = FakeLiveSession()
++
++    def add_callback(self, callback: object) -> None:
++        self.call_threads.append(("add_callback", threading.current_thread().name))
++        self.callbacks.append(callback)
++
++    def subscribe(self, **kwargs: object) -> None:
++        self.call_threads.append(
++            (f"subscribe:{kwargs.get('schema')}", threading.current_thread().name)
++        )
++        self.subscriptions.append(kwargs)
++
++    def start(self) -> None:
++        self.call_threads.append(("start", threading.current_thread().name))
++        self.started = True
++
++    def stop(self) -> None:
++        self.stopped = True
+diff --git a/backend/tests/test_api_contract.py b/backend/tests/test_api_contract.py
+index 8b4a360..a9c8747 100644
+--- a/backend/tests/test_api_contract.py
++++ b/backend/tests/test_api_contract.py
+@@ -473,6 +473,9 @@ def test_api_module_entrypoint_imports_and_invokes_uvicorn_with_factory(monkeypa
+             "factory": True,
+             "host": "127.0.0.1",
+             "port": 8765,
++            # Verify fix (WARM-FIX P5): uvicorn's default dictConfig would re-level
++            # uvicorn.access back to INFO; None keeps configure_logging's caps.
++            "log_config": None,
+         }
+     ]
+ 
+diff --git a/backend/tests/test_live_databento.py b/backend/tests/test_live_databento.py
+index d328867..41841b3 100644
+--- a/backend/tests/test_live_databento.py
++++ b/backend/tests/test_live_databento.py
+@@ -10,6 +10,7 @@ from typing import ClassVar
+ import pytest
+ from fastapi.testclient import TestClient
+ 
++from live_sdk_fakes import FAKE_SESSION_THREAD_NAME, FakeLiveClient
+ from trade_lab.adapters.databento import (
+     DatabentoMarketDataFeed,
+     DatabentoUnavailableError,
+@@ -401,25 +402,8 @@ async def _capture_update(updates: list[object], update: object) -> None:
+     updates.append(update)
+ 
+ 
+-class FakeDatabentoClient:
+-    def __init__(self, key: str) -> None:
+-        self.key = key
+-        self.callbacks: list[object] = []
+-        self.subscriptions: list[dict[str, object]] = []
+-        self.started = False
+-        self.stopped = False
+-
+-    def add_callback(self, callback: object) -> None:
+-        self.callbacks.append(callback)
+-
+-    def subscribe(self, **kwargs: object) -> None:
+-        self.subscriptions.append(kwargs)
+-
+-    def start(self) -> None:
+-        self.started = True
+-
+-    def stop(self) -> None:
+-        self.stopped = True
++class FakeDatabentoClient(FakeLiveClient):
++    """The shared session-shaped fake (tests/live_sdk_fakes.py), local name kept."""
+ 
+ 
+ class FakeDatabentoSdk:
+@@ -488,6 +472,96 @@ def test_databento_adapter_subscribes_and_registers_callbacks_with_fake_sdk() ->
+     asyncio.run(run())
+ 
+ 
++def test_wedge_fix_subscribe_and_start_execute_on_the_session_loop_thread() -> None:
++    """WEDGE fix (P1c): the facade must connect first (caller thread, zero writes),
++    then run every subscribe and the start ON the SDK session loop — never on the
++    caller thread whose unsynchronized transport writes caused the silent wedge."""
++
++    async def run() -> None:
++        FakeDatabentoSdk.clients = []
++        feed = DatabentoMarketDataFeed(
++            api_key="db-secret",
++            requested_symbol="NQ.c.0",
++            dataset="GLBX.MDP3",
++            trade_schema="trades",
++            quote_schema="mbp-1",
++            context_schemas=("definition",),
++            sdk_module=FakeDatabentoSdk,
++        )
++        await feed.start()
++        client = FakeDatabentoSdk.clients[0]
++        caller = threading.current_thread().name
++
++        # Connect+auth was forced BEFORE any subscription, from the caller thread
++        # (the SDK's _connect is the blocking, thread-safe entry).
++        assert client._session.connect_calls == [("GLBX.MDP3", caller)]
++        # add_callback stays caller-thread (pre-connect list append, no transport).
++        assert ("add_callback", caller) in client.call_threads
++        # Every subscription write and the session start executed on the session loop.
++        marshaled = [
++            (label, thread)
++            for label, thread in client.call_threads
++            if label.startswith("subscribe:") or label == "start"
++        ]
++        assert [label for label, _ in marshaled] == [
++            "subscribe:trades",
++            "subscribe:mbp-1",
++            "subscribe:definition",
++            "start",
++        ]
++        assert all(thread == FAKE_SESSION_THREAD_NAME for _, thread in marshaled), marshaled
++        # And the subscriptions landed before the start, in schema order, post-connect.
++        assert client.started is True
++        await feed.stop()
++
++    asyncio.run(run())
++
++
++def test_wedge_fix_fails_loud_when_session_handles_are_missing() -> None:
++    """WEDGE fix (P1b): an SDK client without the session/loop handles must fail
++    LOUDLY at connect time — never silently fall back to calling-thread writes."""
++
++    class HandlelessClient:
++        def __init__(self, key: str) -> None:
++            self.key = key
++            self.stopped = False
++
++        def add_callback(self, callback: object) -> None:
++            pass
++
++        def subscribe(self, **kwargs: object) -> None:  # pragma: no cover - unreached
++            raise AssertionError("subscribe must not run without session marshaling")
++
++        def start(self) -> None:  # pragma: no cover - unreached
++            raise AssertionError("start must not run without session marshaling")
++
++        def stop(self) -> None:
++            self.stopped = True
++
++    class HandlelessSdk:
++        clients: ClassVar[list[HandlelessClient]] = []
++
++        class Live(HandlelessClient):
++            def __init__(self, key: str) -> None:
++                super().__init__(key)
++                HandlelessSdk.clients.append(self)
++
++    async def run() -> None:
++        HandlelessSdk.clients = []
++        feed = DatabentoMarketDataFeed(
++            api_key="db-secret",
++            requested_symbol="NQ.c.0",
++            dataset="GLBX.MDP3",
++            sdk_module=HandlelessSdk,
++        )
++        with pytest.raises(DatabentoUnavailableError, match="session/loop handles"):
++            await feed.start()
++        # The failed start cleaned up the client it created.
++        assert HandlelessSdk.clients[0].stopped is True
++
++    asyncio.run(run())
++
++
+ def test_app_creation_and_status_do_not_instantiate_or_connect_sdk(
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+diff --git a/backend/tests/test_live_warm_inference_gate.py b/backend/tests/test_live_warm_inference_gate.py
+new file mode 100644
+index 0000000..e12e940
+--- /dev/null
++++ b/backend/tests/test_live_warm_inference_gate.py
+@@ -0,0 +1,294 @@
++"""WARM-FIX P3: the live warm-start drain must not predict, register, or journal.
++
++WARM_PERF_RECON §2 proved the pre-fix behavior: the model predicts on warm-replay
++touches, journals them as mode="live" rows byte-indistinguishable from real-time
++rows, and every restart re-journals the two replayed prior days with fresh ids
++(measured up to 10 duplicates per touch). The gate suppresses production
++atomically at _run_inference while warming; everything else (bars, levels,
++touches, observations, market context) still builds, and the flip event itself
++predicts normally.
++"""
++
++import asyncio
++import json
++from collections.abc import AsyncIterator
++from datetime import UTC, datetime, timedelta
++from pathlib import Path
++from types import MappingProxyType, SimpleNamespace
++
++from strategy_core import load_strategy_contract
++
++from trade_lab.domain.events import TradeEvent, TradeSide
++from trade_lab.domain.levels import LevelDirection, LevelKind, TouchEvent
++from trade_lab.domain.sessions import SessionName
++from trade_lab.services.inference.inference_engine import Prediction
++from trade_lab.services.journal import PredictionJournal
++from trade_lab.services.live import LiveConfig, LiveMarketDataService
++from trade_lab.services.runtime import ApplicationRuntime
++
++_FIXTURE_STRATEGY = Path(__file__).parent / "fixtures" / "strategy.json"
++#: Live-start wall clock: 2026-01-05 (Monday) 15:00Z. Warm anchor == this instant.
++_NOW = datetime(2026, 1, 5, 15, 0, tzinfo=UTC)
++#: Warm-day touch: one hour before "now", i.e. replayed history.
++_WARM_TOUCH_TS = datetime(2026, 1, 5, 14, 0, tzinfo=UTC)
++#: Seam-tail touch: warm-originated, but its observation window (+300 s) crosses
++#: the drain's end and expires only AFTER the flip — the adversarial-verify
++#: residual-duplicate case; must still produce nothing (anchor-based gate).
++_SEAM_TOUCH_TS = _NOW - timedelta(seconds=100)
++#: Live touch: originates after the anchor; predicts normally.
++_LIVE_TOUCH_TS = _NOW + timedelta(seconds=1)
++_LEVEL_TICKS = 68_000
++
++
++class _FakeEngine:
++    """Minimal always-predicting engine (duck-typed, as in the resolver tests)."""
++
++    def __init__(self, contract) -> None:
++        self.active_contract = contract
++        self.has_active_model = True
++        self.predict_calls = 0
++
++    def active(self):
++        return SimpleNamespace(
++            contract=self.active_contract,
++            section=None,
++            model_id="m-1",
++            validation_ok=True,
++            validation_detail="fake",
++        )
++
++    def predict_for_observation(self, observation, market_context) -> Prediction:
++        self.predict_calls += 1
++        return Prediction(
++            prediction_id=f"pred-{self.predict_calls}",
++            touch_id=observation.originating_touch_id,
++            observation_id=observation.observation_id,
++            event_ts_utc=observation.scheduled_end_ts_utc,
++            predicted_class="tradeable_reversal",
++            probabilities=MappingProxyType({"tradeable_reversal": 1.0}),
++            feature_values=MappingProxyType({}),
++            level_kind=observation.level_kind.value,
++            level_price_ticks=observation.level_price_ticks,
++            direction="long",
++            session="ny",
++            is_eligible=True,
++            model_id="m-1",
++            contract_id="NQ_test",
++            nan_count=0,
++        )
++
++
++def _trade(ts: datetime, price_ticks: int = _LEVEL_TICKS + 4) -> TradeEvent:
++    return TradeEvent(
++        event_ts_utc=ts,
++        receive_ts_utc=None,
++        instrument_id=1,
++        requested_symbol="NQ.c.0",
++        raw_symbol=None,
++        price_ticks=price_ticks,
++        size=1,
++        side=TradeSide.UNKNOWN,
++        source_schema="trades",
++    )
++
++
++def _touch(touch_id: str, ts: datetime) -> TouchEvent:
++    return TouchEvent(
++        touch_id=touch_id,
++        event_ts_utc=ts,
++        trading_day=ts.date(),
++        session=SessionName.NY,
++        level_kind=LevelKind.NY_LOW,
++        level_price_ticks=_LEVEL_TICKS,
++        trade_price_ticks=_LEVEL_TICKS,
++        requested_symbol="NQ.c.0",
++        raw_symbol=None,
++        instrument_id=1,
++        direction=LevelDirection.LONG,
++    )
++
++
++class _ScriptedFeed:
++    """Yields a warm batch after ``begin``, a live batch after ``live_release``."""
++
++    def __init__(
++        self, warm: list[TradeEvent], live: list[TradeEvent] | None = None
++    ) -> None:
++        self._warm = warm
++        self._live = live or []
++        self.begin = asyncio.Event()
++        self.live_release = asyncio.Event()
++        self.hold = asyncio.Event()
++
++    async def start(self) -> None:
++        pass
++
++    async def stop(self) -> None:
++        self.begin.set()
++        self.live_release.set()
++        self.hold.set()
++
++    async def events(self) -> AsyncIterator[object]:
++        await self.begin.wait()
++        for trade in self._warm:
++            yield trade
++        if self._live:
++            await self.live_release.wait()
++            for trade in self._live:
++                yield trade
++        await self.hold.wait()
++
++
++def _service(runtime: ApplicationRuntime, factory) -> LiveMarketDataService:
++    config = LiveConfig(
++        requested_symbol="NQ.c.0",
++        dataset="GLBX.MDP3",
++        trade_schema="trades",
++        quote_schema="mbp-1",
++        context_schemas=("definition",),
++        api_key_configured=True,
++        enabled=True,
++    )
++    return LiveMarketDataService(runtime, config, factory, now_provider=lambda: _NOW)
++
++
++def _journal_rows(root: Path) -> list[dict]:
++    rows: list[dict] = []
++    if not root.exists():
++        return rows
++    for file in sorted(root.glob("*.jsonl")):
++        rows.extend(json.loads(line) for line in file.read_text().splitlines())
++    return rows
++
++
++async def _wait_for(predicate, *, timeout: float = 5.0) -> None:
++    deadline = asyncio.get_running_loop().time() + timeout
++    while asyncio.get_running_loop().time() < deadline:
++        if predicate():
++            return
++        await asyncio.sleep(0.01)
++    raise AssertionError("condition not reached within timeout")
++
++
++def test_warm_drain_is_gated_and_the_flip_event_predicts_normally(tmp_path: Path) -> None:
++    asyncio.run(_run_gate_then_flip(tmp_path))
++
++
++async def _run_gate_then_flip(tmp_path: Path) -> None:
++    engine = _FakeEngine(load_strategy_contract(_FIXTURE_STRATEGY))
++    journal_root = tmp_path / "journal"
++    runtime = ApplicationRuntime(
++        requested_symbol="NQ.c.0",
++        tick_timeframes=(147,),
++        observation_duration_seconds=300,
++        inference_engine=engine,
++        journal=PredictionJournal(journal_root),
++    )
++    feed = _ScriptedFeed(
++        warm=[
++            # Warm phase (ts < anchor): a print inside the warm observation window,
++            # then the trade that EXPIRES the warm observation -> gated, nothing.
++            _trade(_WARM_TOUCH_TS + timedelta(seconds=60)),
++            _trade(_WARM_TOUCH_TS + timedelta(seconds=301)),
++        ],
++        live=[
++            # Live phase: the first post-anchor event flips warming->live...
++            _trade(_NOW + timedelta(seconds=1)),
++            # ...this one expires the SEAM observation (warm-originated, window
++            # crossed the drain's end) -> still suppressed (anchor-based gate)...
++            _trade(_NOW + timedelta(seconds=201)),
++            # ...and this one expires the live-originated observation -> predicts.
++            _trade(_NOW + timedelta(seconds=302)),
++        ],
++    )
++    live = _service(runtime, lambda _config: feed)
++    await live.start()
++
++    # Seed the observations AFTER start() (its reset rebuilds the engine state).
++    runtime.observations.start_from_touch(_touch("touch-warm", _WARM_TOUCH_TS))
++    runtime.observations.start_from_touch(_touch("touch-seam", _SEAM_TOUCH_TS))
++    runtime.observations.start_from_touch(_touch("touch-live", _LIVE_TOUCH_TS))
++    feed.begin.set()
++
++    # Warm expiry happened once two warm events processed; nothing was produced.
++    await _wait_for(lambda: live.status().warm_start_events == 2)
++    assert engine.predict_calls == 0
++    assert runtime.predictions == ()
++    assert runtime._honest_resolver is not None
++    assert runtime._honest_resolver.open_count == 0
++    assert _journal_rows(journal_root) == []
++
++    feed.live_release.set()
++    # The live trades flip warm->live; the seam-tail observation expires post-flip
++    # and must STILL produce nothing; only the live-originated touch predicts.
++    await _wait_for(lambda: len(runtime.predictions) == 1)
++    assert live.status().warm_start_state == "live"
++    assert engine.predict_calls == 1
++    assert runtime.predictions[0].touch_id == "touch-live"
++    await _wait_for(
++        lambda: any(row["type"] == "prediction" for row in _journal_rows(journal_root))
++    )
++    prediction_rows = [r for r in _journal_rows(journal_root) if r["type"] == "prediction"]
++    assert len(prediction_rows) == 1
++    assert prediction_rows[0]["mode"] == "live"
++    assert prediction_rows[0]["touch_id"] == "touch-live"
++    # Neither the warm touch nor the seam-tail touch sneaked a row in.
++    assert all(
++        row["touch_id"] not in {"touch-warm", "touch-seam"}
++        for row in _journal_rows(journal_root)
++    )
++    await live.stop()
++
++
++def test_two_consecutive_warm_starts_journal_zero_rows_for_the_replayed_days(
++    tmp_path: Path,
++) -> None:
++    """The restart-duplicate kill, end-to-end: pre-fix each warm start re-journaled
++    the replayed days' touches as fresh mode="live" rows (WARM_PERF_RECON §2, up to
++    10 duplicates per touch); with the gate BOTH warm passes journal nothing."""
++
++    asyncio.run(_run_double_warm_start(tmp_path))
++
++
++async def _run_double_warm_start(tmp_path: Path) -> None:
++    engine = _FakeEngine(load_strategy_contract(_FIXTURE_STRATEGY))
++    journal_root = tmp_path / "journal"
++    runtime = ApplicationRuntime(
++        requested_symbol="NQ.c.0",
++        tick_timeframes=(147,),
++        observation_duration_seconds=300,
++        inference_engine=engine,
++        journal=PredictionJournal(journal_root),
++    )
++    def warm_fixture() -> _ScriptedFeed:
++        return _ScriptedFeed(
++            warm=[
++                _trade(_WARM_TOUCH_TS + timedelta(seconds=60)),
++                _trade(_WARM_TOUCH_TS + timedelta(seconds=301)),
++            ]
++        )
++
++    feeds = [warm_fixture(), warm_fixture()]
++    calls = 0
++
++    def factory(_config: LiveConfig):
++        nonlocal calls
++        calls += 1
++        return feeds[calls - 1]
++
++    live = _service(runtime, factory)
++    for cycle in range(2):
++        await live.start()
++        # The same warm fixture day replays on every restart (fresh touch ids each
++        # time — exactly the duplicate mechanism the gate kills).
++        runtime.observations.start_from_touch(
++            _touch(f"touch-warm-cycle-{cycle}", _WARM_TOUCH_TS)
++        )
++        feeds[cycle].begin.set()
++        await _wait_for(lambda: live.status().warm_start_events == 2)
++        await live.stop()
++        assert engine.predict_calls == 0
++        assert _journal_rows(journal_root) == [], f"cycle {cycle} journaled warm rows"
++
++    assert calls == 2
++    assert _journal_rows(journal_root) == []
+diff --git a/backend/tests/test_live_warm_start.py b/backend/tests/test_live_warm_start.py
+index 30c7890..68edbb8 100644
+--- a/backend/tests/test_live_warm_start.py
++++ b/backend/tests/test_live_warm_start.py
+@@ -3,11 +3,12 @@ PDH/PDL seeding, warm/live status marking, and disconnect auto-reconnect."""
+ 
+ import asyncio
+ from collections.abc import AsyncIterator
+-from datetime import UTC, datetime
++from datetime import UTC, datetime, timedelta
+ from types import SimpleNamespace
+ 
+ import pytest
+ 
++from live_sdk_fakes import FakeLiveClient
+ from trade_lab.adapters.databento import DatabentoMarketDataFeed, _DatabentoSdkFacade
+ from trade_lab.adapters.databento_historical import DatabentoHistoricalSource
+ from trade_lab.domain.events import TopOfBookEvent, TradeEvent
+@@ -41,26 +42,17 @@ def _live_config(*, key: bool = True, enabled: bool = True) -> LiveConfig:
+     )
+ 
+ 
+-class _RecordingClient:
++class _RecordingClient(FakeLiveClient):
++    """Session-shaped recording fake (WEDGE fix: the facade marshals onto its loop)."""
++
+     def __init__(self, *, reject_replay_start: bool = False) -> None:
++        super().__init__(key="")
+         self.reject_replay_start = reject_replay_start
+-        self.subscriptions: list[dict[str, object]] = []
+-        self.started = False
+-        self.stopped = False
+-
+-    def add_callback(self, callback: object) -> None:
+-        self.callback = callback
+ 
+     def subscribe(self, **kwargs: object) -> None:
+         if self.reject_replay_start and kwargs.get("start") is not None:
+             raise ValueError("gateway rejected the replay start parameter")
+-        self.subscriptions.append(kwargs)
+-
+-    def start(self) -> None:
+-        self.started = True
+-
+-    def stop(self) -> None:
+-        self.stopped = True
++        super().subscribe(**kwargs)
+ 
+ 
+ class _FakeSdk:
+@@ -215,6 +207,176 @@ async def _run_historical_warm_start(caplog: pytest.LogCaptureFixture) -> None:
+     ]
+ 
+ 
++def test_quote_warm_fetch_is_scoped_to_retention_plus_slack() -> None:
++    asyncio.run(_run_scoped_quote_fetch())
++
++
++async def _run_scoped_quote_fetch() -> None:
++    # WARM-FIX P4: trades keep the full 2-prior-trading-day span; the quote schema
++    # starts at now - (retention + 10 min slack) - here 30 + 10 = 40 minutes.
++    sdk = _FakeSdk()
++    fetch_calls: list[tuple[str, datetime, datetime]] = []
++    feed = _feed(
++        sdk,
++        intraday_replay=True,
++        historical_source=_historical_records(fetch_calls),
++        quote_warm_retention_provider=lambda: timedelta(minutes=30),
++    )
++    await feed.start()
++    assert [(schema, start) for schema, start, _end in fetch_calls] == [
++        ("trades", _WARM_START_ANCHOR),
++        ("mbp-1", _NOW - timedelta(minutes=40)),
++    ]
++    await feed.stop()
++
++
++def test_drain_merge_tolerates_asymmetric_schema_spans() -> None:
++    asyncio.run(_run_asymmetric_drain())
++
++
++async def _run_asymmetric_drain() -> None:
++    # WARM-FIX P4: heapq.merge only needs each stream individually sorted — with a
++    # scoped quote span the trades yield alone until the (later) quote head appears.
++    base_ns = 1_781_200_000_000_000_000
++
++    def record_fetcher(schema: str, start: datetime, end: datetime):
++        if schema == "trades":
++            return [
++                SimpleNamespace(
++                    ts_event=base_ns + i * 1_000_000_000,
++                    price=20_000_250_000_000,
++                    size=1,
++                    side="B",
++                )
++                for i in range(3)
++            ]
++        return [
++            SimpleNamespace(
++                ts_event=base_ns + 10_000_000_000,
++                levels=[
++                    SimpleNamespace(
++                        bid_px=20_000_000_000_000, bid_sz=3, ask_px=20_000_500_000_000, ask_sz=4
++                    )
++                ],
++            )
++        ]
++
++    source = DatabentoHistoricalSource(
++        api_key=None,
++        dataset="GLBX.MDP3",
++        requested_symbol="NQ.c.0",
++        stype_in="continuous",
++        record_fetcher=record_fetcher,
++    )
++    feed = _feed(_FakeSdk(), intraday_replay=True, historical_source=source)
++    await feed.start()
++
++    events: list[object] = []
++
++    async def consume() -> None:
++        async for item in feed.events():
++            events.append(item)
++
++    task = asyncio.create_task(consume())
++    for _ in range(300):
++        if len(events) >= 5:
++            break
++        await asyncio.sleep(0.01)
++    await feed.stop()
++    await task
++    # events[0] is the initial FeedStatus; then all three trades precede the quote.
++    assert [type(event).__name__ for event in events[1:5]] == [
++        "TradeEvent",
++        "TradeEvent",
++        "TradeEvent",
++        "TopOfBookEvent",
++    ]
++
++
++def test_dbn_record_streams_guards_end_le_start_per_schema() -> None:
++    # WARM-FIX P4: the end<=start guard is per schema — an entirely-swallowed quote
++    # window yields an empty stream while trades still fetch.
++    calls: list[str] = []
++
++    def record_fetcher(schema: str, start: datetime, end: datetime):
++        calls.append(schema)
++        return [SimpleNamespace(ts_event=1)]
++
++    source = DatabentoHistoricalSource(
++        api_key=None,
++        dataset="GLBX.MDP3",
++        requested_symbol="NQ.c.0",
++        stype_in="continuous",
++        record_fetcher=record_fetcher,
++    )
++    end = datetime(2026, 6, 11, 15, 0, tzinfo=UTC)
++    streams = dict(
++        source.dbn_record_streams(
++            end=end,
++            schema_starts=(("trades", end - timedelta(hours=2)), ("mbp-1", end)),
++        )
++    )
++    assert calls == ["trades"]
++    assert tuple(streams["mbp-1"]) == ()
++    assert source.last_stream_end == end
++
++
++def test_diverging_per_schema_availability_is_warned(
++    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
++) -> None:
++    # Verify fix: with per-schema clamps the availability ends can diverge (e.g.
++    # an mbp-1 ingestion hiccup); the laggard's early slice end must be surfaced,
++    # not silently absorbed into the max-based last_stream_end.
++    end = datetime(2026, 6, 11, 15, 0, tzinfo=UTC)
++    trades_end = end.isoformat()
++    quotes_end = (end - timedelta(minutes=30)).isoformat()
++
++    class _FakeStore:
++        def __iter__(self):
++            return iter(())
++
++    class _FakeClient:
++        class metadata:
++            @staticmethod
++            def get_dataset_range(_dataset):
++                return {
++                    "schema": {
++                        "trades": {"end": trades_end},
++                        "mbp-1": {"end": quotes_end},
++                    }
++                }
++
++        class timeseries:
++            @staticmethod
++            def get_range(**_kwargs):
++                return _FakeStore()
++
++    source = DatabentoHistoricalSource(
++        api_key="k" * 32,
++        dataset="GLBX.MDP3",
++        requested_symbol="NQ.c.0",
++        stype_in="continuous",
++    )
++    monkeypatch.setattr(source, "_client", lambda: _FakeClient())
++    with caplog.at_level("WARNING"):
++        source.dbn_record_streams(
++            end=end,
++            schema_starts=(
++                ("trades", end - timedelta(hours=2)),
++                ("mbp-1", end - timedelta(minutes=55)),
++            ),
++        )
++    assert source.last_stream_end == end
++    lag_warnings = [
++        record.message
++        for record in caplog.records
++        if "lags the freshest schema" in record.message
++    ]
++    assert len(lag_warnings) == 1
++    assert "mbp-1" in lag_warnings[0]
++    assert "1800 s" in lag_warnings[0]
++
++
+ def _ohlcv_source(calls: list[tuple[datetime, datetime]]) -> DatabentoHistoricalSource:
+     def ohlcv_fetcher(start: datetime, end: datetime):
+         import pandas as pd
+@@ -352,6 +514,47 @@ async def _run_warm_marking() -> None:
+     await live.stop()
+ 
+ 
++def test_authenticated_but_silent_session_never_reports_a_live_flip() -> None:
++    """WEDGE regression (P1c): a session that connects and authenticates but never
++    delivers a post-anchor message must NOT report a healthy warm->live flip — the
++    status must keep saying "warming" rather than lie "live"."""
++
++    asyncio.run(_run_silent_session())
++
++
++async def _run_silent_session() -> None:
++    class _SilentAfterDrainFeed:
++        def __init__(self) -> None:
++            self.release = asyncio.Event()
++
++        async def start(self) -> None:
++            pass
++
++        async def stop(self) -> None:
++            self.release.set()
++
++        async def events(self) -> AsyncIterator[object]:
++            # The replayed (warm) history drains fine...
++            yield _trade(datetime(2026, 6, 11, 14, 0, tzinfo=UTC))
++            # ...then the authenticated-but-silent live session delivers nothing.
++            await self.release.wait()
++
++    feed = _SilentAfterDrainFeed()
++    live = LiveMarketDataService(
++        _runtime(), _live_config(), lambda _config: feed, now_provider=lambda: _NOW
++    )
++    await live.start()
++    for _ in range(200):
++        if live.status().warm_start_events == 1:
++            break
++        await asyncio.sleep(0.01)
++    status = live.status()
++    assert status.warm_start_events == 1
++    assert status.warm_start_state == "warming"
++    assert status.state == LiveState.RUNNING
++    await live.stop()
++
++
+ def test_disconnect_reconnects_through_the_full_start_path() -> None:
+     asyncio.run(_run_reconnect())
+ 
+diff --git a/backend/tests/test_live_watchdog.py b/backend/tests/test_live_watchdog.py
+new file mode 100644
+index 0000000..cd11e74
+--- /dev/null
++++ b/backend/tests/test_live_watchdog.py
+@@ -0,0 +1,329 @@
++"""WARM-FIX P2: post-drain liveness watchdog (WEDGE_CAPTURE.md wedge signature).
++
++The watchdog exists because BOTH detection layers below TL are blind to a live
++session that authenticates but never delivers its first message: the databento
++SDK's own monitor only measures gaps after the first received record, and the
++TL status surface asserts CONNECTED before any live byte. These tests drive the
++service with real wall clocks and tiny thresholds.
++"""
++
++import asyncio
++from collections.abc import AsyncIterator
++from datetime import UTC, datetime, timedelta
++
++from trade_lab.domain.events import TradeEvent
++from trade_lab.domain.feed import FeedConnectionState
++from trade_lab.services.live import LiveConfig, LiveMarketDataService, LiveState
++from trade_lab.services.runtime import ApplicationRuntime, RuntimeUpdate
++
++
++def _runtime() -> ApplicationRuntime:
++    return ApplicationRuntime(
++        requested_symbol="NQ.c.0",
++        tick_timeframes=(2,),
++        observation_duration_seconds=300,
++    )
++
++
++def _live_config() -> LiveConfig:
++    return LiveConfig(
++        requested_symbol="NQ.c.0",
++        dataset="GLBX.MDP3",
++        trade_schema="trades",
++        quote_schema="mbp-1",
++        context_schemas=("definition",),
++        api_key_configured=True,
++        enabled=True,
++    )
++
++
++def _trade(ts: datetime, price_ticks: int = 80_000) -> TradeEvent:
++    return TradeEvent(ts, None, 1, "NQ.c.0", "NQM6", price_ticks, 1, source_schema="trades")
++
++
++class _WarmThenSilentFeed:
++    """Drains one warm (pre-anchor) trade, then delivers nothing — the wedge."""
++
++    def __init__(self) -> None:
++        self.release = asyncio.Event()
++
++    async def start(self) -> None:
++        pass
++
++    async def stop(self) -> None:
++        self.release.set()
++
++    async def events(self) -> AsyncIterator[object]:
++        yield _trade(datetime.now(UTC) - timedelta(hours=3))
++        await self.release.wait()
++
++
++class _LiveFlowingFeed:
++    """Delivers a real-time (post-anchor) trade immediately, then idles."""
++
++    def __init__(self) -> None:
++        self.release = asyncio.Event()
++
++    async def start(self) -> None:
++        pass
++
++    async def stop(self) -> None:
++        self.release.set()
++
++    async def events(self) -> AsyncIterator[object]:
++        yield _trade(datetime.now(UTC) + timedelta(seconds=1), 80_002)
++        await self.release.wait()
++
++
++async def _wait_for(predicate, *, timeout: float = 5.0) -> None:
++    deadline = asyncio.get_running_loop().time() + timeout
++    while asyncio.get_running_loop().time() < deadline:
++        if predicate():
++            return
++        await asyncio.sleep(0.01)
++    raise AssertionError("condition not reached within timeout")
++
++
++def test_silent_subscribe_goes_degraded_and_reconnects() -> None:
++    asyncio.run(_run_silent_subscribe())
++
++
++async def _run_silent_subscribe() -> None:
++    factory_calls = 0
++    feeds = [_WarmThenSilentFeed(), _LiveFlowingFeed()]
++    updates: list[RuntimeUpdate] = []
++
++    async def capture(update: RuntimeUpdate) -> None:
++        updates.append(update)
++
++    def factory(_config: LiveConfig):
++        nonlocal factory_calls
++        factory_calls += 1
++        return feeds[factory_calls - 1]
++
++    live = LiveMarketDataService(
++        _runtime(),
++        _live_config(),
++        factory,
++        on_update=capture,
++        reconnect_delay_seconds=0.02,
++        watchdog_seconds=0.08,
++    )
++    await live.start()
++    # Strike 1: the silent post-drain session must go DEGRADED and reconnect;
++    # the second feed flows, so the service ends RUNNING with a live flip.
++    await _wait_for(
++        lambda: factory_calls == 2 and live.status().warm_start_state == "live"
++    )
++    assert live.status().state == LiveState.RUNNING
++    degraded = [
++        update.feed_status.last_message
++        for update in updates
++        if update.feed_status is not None
++        and update.feed_status.state is FeedConnectionState.DEGRADED
++    ]
++    assert degraded and "wedge signature" in degraded[0]
++    await live.stop()
++
++
++def test_flowing_feed_never_trips_the_watchdog() -> None:
++    asyncio.run(_run_flowing_feed())
++
++
++async def _run_flowing_feed() -> None:
++    factory_calls = 0
++
++    def factory(_config: LiveConfig):
++        nonlocal factory_calls
++        factory_calls += 1
++        return _LiveFlowingFeed()
++
++    live = LiveMarketDataService(
++        _runtime(),
++        _live_config(),
++        factory,
++        reconnect_delay_seconds=0.02,
++        watchdog_seconds=0.08,
++    )
++    await live.start()
++    await _wait_for(lambda: live.status().warm_start_state == "live")
++    # Sit well past several watchdog periods: a flowing (flipped) feed must
++    # never be torn down even while subsequently idle.
++    await asyncio.sleep(0.4)
++    assert factory_calls == 1
++    assert live.status().state == LiveState.RUNNING
++    await live.stop()
++
++
++class _HeartbeatOnlyFeed(_WarmThenSilentFeed):
++    """Quiet-market shape: no yielded items post-drain, but the provider callback
++    keeps firing (gateway heartbeats) — exposed exactly like the Databento feed's
++    ``last_provider_activity_utc`` stamp."""
++
++    def __init__(self) -> None:
++        super().__init__()
++        self.last_provider_activity_utc: datetime | None = None
++        self._pulse_task: asyncio.Task[None] | None = None
++
++    async def start(self) -> None:
++        async def pulse() -> None:
++            while not self.release.is_set():
++                self.last_provider_activity_utc = datetime.now(UTC)
++                await asyncio.sleep(0.02)
++
++        self._pulse_task = asyncio.create_task(pulse())
++
++    async def stop(self) -> None:
++        await super().stop()
++        if self._pulse_task is not None:
++            self._pulse_task.cancel()
++
++
++def test_heartbeats_keep_a_quiet_market_alive() -> None:
++    """Verify fix: gateway heartbeats are dropped as control messages before
++    _process_live_item, so the watchdog folds in the feed's provider-activity
++    stamp — a healthy-but-quiet market (weekend/halt start) must NOT be torn
++    down as a wedge."""
++
++    asyncio.run(_run_heartbeat_quiet_market())
++
++
++async def _run_heartbeat_quiet_market() -> None:
++    factory_calls = 0
++
++    def factory(_config: LiveConfig):
++        nonlocal factory_calls
++        factory_calls += 1
++        return _HeartbeatOnlyFeed()
++
++    live = LiveMarketDataService(
++        _runtime(),
++        _live_config(),
++        factory,
++        reconnect_delay_seconds=0.02,
++        watchdog_seconds=0.08,
++    )
++    await live.start()
++    # Many watchdog periods with zero processed items but steady heartbeats:
++    # still warming, still RUNNING, no teardown, no reconnect.
++    await asyncio.sleep(0.5)
++    status = live.status()
++    assert factory_calls == 1
++    assert status.state == LiveState.RUNNING
++    assert status.warm_start_state == "warming"
++    await live.stop()
++
++
++def test_operator_start_after_failed_gets_a_fresh_watchdog_episode() -> None:
++    """Verify fix: strikes must not leak from a FAILED session into a fresh
++    operator start — the new session gets the full DEGRADED + single-retry
++    contract instead of failing terminally on its first silence."""
++
++    asyncio.run(_run_operator_restart_after_failed())
++
++
++async def _run_operator_restart_after_failed() -> None:
++    factory_calls = 0
++
++    def factory(_config: LiveConfig):
++        nonlocal factory_calls
++        factory_calls += 1
++        return _WarmThenSilentFeed()
++
++    live = LiveMarketDataService(
++        _runtime(),
++        _live_config(),
++        factory,
++        reconnect_delay_seconds=0.02,
++        watchdog_seconds=0.08,
++    )
++    await live.start()
++    await _wait_for(lambda: live.status().state == LiveState.FAILED, timeout=8.0)
++    assert factory_calls == 2  # episode 1: strike 1 + its single retry
++
++    # Operator restarts directly from FAILED (the only UI-reachable action).
++    await live.start()
++    # The fresh episode must run its OWN strike-1 reconnect (a stale strike would
++    # jump straight to FAILED with no third/fourth feed).
++    await _wait_for(lambda: live.status().state == LiveState.FAILED, timeout=8.0)
++    assert factory_calls == 4
++    await live.stop()
++
++
++def test_reconnect_is_skipped_while_a_replay_is_active(
++    caplog,
++) -> None:
++    """Verify fix: the internal reconnect path honors the live/replay mutual
++    exclusion (audit #NN-2) — it must not reset the shared runtime and arm the
++    warm gate underneath a running replay."""
++
++    asyncio.run(_run_reconnect_replay_guard(caplog))
++
++
++async def _run_reconnect_replay_guard(caplog) -> None:
++    factory_calls = 0
++
++    class _DroppingFeed:
++        async def start(self) -> None:
++            pass
++
++        async def stop(self) -> None:
++            pass
++
++        async def events(self) -> AsyncIterator[object]:
++            yield _trade(datetime.now(UTC) - timedelta(hours=3))
++
++    def factory(_config: LiveConfig):
++        nonlocal factory_calls
++        factory_calls += 1
++        return _DroppingFeed()
++
++    live = LiveMarketDataService(
++        _runtime(),
++        _live_config(),
++        factory,
++        reconnect_delay_seconds=0.02,
++        watchdog_seconds=60.0,
++        replay_active=lambda: True,
++    )
++    with caplog.at_level("WARNING"):
++        await live.start()
++        # The feed ends (disconnect) -> reconnect scheduled -> must be SKIPPED.
++        await _wait_for(lambda: live.status().state == LiveState.DISCONNECTED)
++        await asyncio.sleep(0.2)
++    assert factory_calls == 1
++    assert live.status().state == LiveState.DISCONNECTED
++    assert any("reconnect skipped" in record.message for record in caplog.records)
++    await live.stop()
++
++
++def test_reconnect_then_silence_fails_for_the_operator() -> None:
++    asyncio.run(_run_second_silence())
++
++
++async def _run_second_silence() -> None:
++    factory_calls = 0
++    feeds = [_WarmThenSilentFeed(), _WarmThenSilentFeed()]
++
++    def factory(_config: LiveConfig):
++        nonlocal factory_calls
++        factory_calls += 1
++        return feeds[factory_calls - 1]
++
++    live = LiveMarketDataService(
++        _runtime(),
++        _live_config(),
++        factory,
++        reconnect_delay_seconds=0.02,
++        watchdog_seconds=0.08,
++    )
++    await live.start()
++    # Strike 1 reconnects (single D-P-06 retry); the retry is silent too ->
++    # strike 2 marks FAILED and never spawns a third feed.
++    await _wait_for(lambda: live.status().state == LiveState.FAILED, timeout=8.0)
++    assert factory_calls == 2
++    status = live.status()
++    assert status.last_error == "live_watchdog_silent_after_reconnect"
++    assert status.warm_start_state != "live"
++    await live.stop()
++    assert live.status().state == LiveState.STOPPED
+diff --git a/backend/tests/test_logging_config.py b/backend/tests/test_logging_config.py
+new file mode 100644
+index 0000000..55840a6
+--- /dev/null
++++ b/backend/tests/test_logging_config.py
+@@ -0,0 +1,99 @@
++"""WARM-FIX P5: the backend logging surface (WEDGE_CAPTURE.md §A.2).
++
++The wedge stayed invisible partly because the deployment had no logging config:
++everything below WARNING from trade_lab.* and the databento SDK went nowhere.
++These tests pin the configure_logging contract and restore global state after.
++"""
++
++import logging
++import sys
++
++import pytest
++
++from trade_lab.api.__main__ import _HANDLER_MARKER, configure_logging
++from trade_lab.config import Settings
++
++
++@pytest.fixture()
++def _restore_logging():
++    root = logging.getLogger()
++    saved_root_level = root.level
++    saved_handlers = list(root.handlers)
++    saved_access = logging.getLogger("uvicorn.access").level
++    saved_databento = logging.getLogger("databento").level
++    yield
++    root.setLevel(saved_root_level)
++    for handler in list(root.handlers):
++        if handler not in saved_handlers:
++            root.removeHandler(handler)
++    logging.getLogger("uvicorn.access").setLevel(saved_access)
++    logging.getLogger("databento").setLevel(saved_databento)
++
++
++def _own_handlers() -> list[logging.Handler]:
++    return [
++        handler
++        for handler in logging.getLogger().handlers
++        if getattr(handler, _HANDLER_MARKER, False)
++    ]
++
++
++def test_configure_logging_sets_the_specified_levels(_restore_logging) -> None:
++    configure_logging("INFO")
++
++    root = logging.getLogger()
++    assert root.level == logging.INFO
++    # Databento stays INFO at the default level; uvicorn access noise is capped.
++    assert logging.getLogger("databento").level == logging.INFO
++    assert logging.getLogger("uvicorn.access").level == logging.WARNING
++    handlers = _own_handlers()
++    assert len(handlers) == 1
++    assert isinstance(handlers[0], logging.StreamHandler)
++    assert handlers[0].stream is sys.stderr
++    # Timestamps are part of the format (the wedge capture depends on them).
++    assert "%(asctime)s" in handlers[0].formatter._fmt
++
++
++def test_debug_level_raises_the_databento_logger_and_calls_are_idempotent(
++    _restore_logging,
++) -> None:
++    configure_logging("INFO")
++    configure_logging("debug")  # case-insensitive env values
++
++    assert logging.getLogger().level == logging.DEBUG
++    assert logging.getLogger("databento").level == logging.DEBUG
++    # Re-configuring re-levels but never stacks a second handler.
++    assert len(_own_handlers()) == 1
++
++    configure_logging("not-a-level")  # tolerant: falls back to INFO
++    assert logging.getLogger().level == logging.INFO
++    assert logging.getLogger("databento").level == logging.INFO
++    assert len(_own_handlers()) == 1
++
++
++def test_settings_expose_the_env_tunable_log_level() -> None:
++    assert Settings(_env_file=None).log_level == "INFO"
++    assert Settings(_env_file=None, log_level="DEBUG").log_level == "DEBUG"
++
++
++def test_main_disables_uvicorn_log_config_so_the_caps_survive(
++    monkeypatch, _restore_logging
++) -> None:
++    """Verify fix: uvicorn's DEFAULT dictConfig names uvicorn.access and would
++    re-level it back to INFO (disable_existing_loggers=False only protects
++    loggers it does NOT name). main() must pass log_config=None."""
++
++    import trade_lab.api.__main__ as entrypoint
++
++    captured: dict = {}
++
++    def fake_run(*args, **kwargs) -> None:
++        captured.update(kwargs)
++
++    monkeypatch.setattr(entrypoint.uvicorn, "run", fake_run)
++    monkeypatch.setattr(
++        entrypoint, "load_settings", lambda: Settings(_env_file=None)
++    )
++    entrypoint.main()
++    assert "log_config" in captured
++    assert captured["log_config"] is None

@@ -1,0 +1,62 @@
+FIX_TRADE_LAB_DIFF — Restore the working warm-up (verification pass)
+Date: 2026-06-16
+Branch: platform-refactor   HEAD: 0286dc7
+
+CONCLUSION
+==========
+The LIVE warm-up is VERIFIED WORKING at the current HEAD (0286dc7). No new code
+change was required this pass. The warm-up was already restored by the earlier
+revert of ddcfdc0 (the viewport "labeling" change), which was removed before this
+pass began. The two labeling commits that REMAIN on the branch (77ec617, 0286dc7)
+are present and the warm-up renders correctly with them in place — so they are NOT
+the cause.
+
+THE CHECK (real warm-up -> chart, not the mocked unit tests)
+============================================================
+The mocked vitest suite (156 green) does NOT exercise the real chart, so it cannot
+catch a warm-up/render break. This check drives the real stack:
+
+  1. Backend:   cd backend && PYTHONPATH=src TRADE_LAB_BACKEND_HOST=127.0.0.1 \
+                TRADE_LAB_BACKEND_PORT=8001 python -m trade_lab.api
+                (loads backend/.env -> Databento key, live enabled, contract NQU6)
+  2. Frontend:  cd frontend && npm run dev   (http://127.0.0.1:5174)
+  3. Browser:   load the app, POST /api/v1/live/start, then assert (poll
+                /api/v1/status .live):
+                  - warm_start_events climbs above 0,
+                  - last_event_ts_utc advances in real wall-clock time,
+                  - chart leaves the empty state (.empty-overlay gone),
+                  - rendered candles sit on the CORRECT price scale and the
+                    session levels (PDH/PDL/asia) anchor to them.
+                RED = 0 events / chart empty / bars off the visible price scale.
+                Stop the paid feed with POST /api/v1/live/stop when done.
+
+EVIDENCE (run on 2026-06-16, HEAD 0286dc7)
+==========================================
+  - MODE LIVE, SESSION ASIA, trading day 2026-06-17, contract NQU6, feed connected.
+  - warm_start_state -> "live"; warm_start_events drained 11,965 -> 123,826.
+  - last_event_ts_utc advanced 23:36:05 -> 23:36:14 (live ticks in real time).
+  - Chart rendered real NQ candles at ~30,305-30,390 on a fitted price axis
+    (30,295-30,400); ASIA HIGH 30,380 / ASIA LOW 30,326 lines anchored; PDH
+    30,975.50 / PDL 30,272.25 eligible; DATA QUALITY: no warnings.
+
+ROOT-CAUSE / HONESTY NOTES
+==========================
+  - FIRST live attempt this session sat at warm_start_events=0 for ~8 min ("warming",
+    no error). That was a TRANSIENT cold-subscribe fluke, NOT a real break: an
+    immediate retry warmed up and streamed normally. An earlier interim conclusion
+    that "the warm-up is dead / the backend feed (8bdedfb) is broken" was based on
+    that single fluke run and is RETRACTED.
+  - The "bars look wrong / price axis stuck at ~17,000 with invisible candles" seen
+    mid-session was self-inflicted: a synthetic-demo replay (price range ~17,000) was
+    run in the same page session before live (price range ~30,000), and the price
+    scale did not re-autoscale across that synthetic->live switch. A clean page reload
+    renders live correctly. This is a test artifact, not the warm-up bug. (Possible
+    minor pre-existing edge case: price scale not re-fitting on a drastic data-range
+    swap without reload — separate from this task; flagged, not changed.)
+
+WHAT WAS / WASN'T CHANGED
+=========================
+  - No new code change this pass (RECOVERY: warm-up already restored, verified).
+  - Serving-path (warm-start/emit/bar-depth) NOT touched.
+  - The labeling commits 77ec617 and 0286dc7 remain and are confirmed fine.
+  - ddcfdc0 (viewport) remains reverted (removed earlier this session).

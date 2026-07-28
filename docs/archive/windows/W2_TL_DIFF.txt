@@ -1,0 +1,3339 @@
+diff --git a/.github/workflows/backend-ci.yml b/.github/workflows/backend-ci.yml
+index f4e7a13..f8b7ab6 100644
+--- a/.github/workflows/backend-ci.yml
++++ b/.github/workflows/backend-ci.yml
+@@ -10,6 +10,8 @@ on:
+     branches: [main, platform-refactor]
+   pull_request:
+     branches: [main]
++  # W2 P4b (A157): manual runs for greenlight witnessing without a push.
++  workflow_dispatch:
+ 
+ concurrency:
+   group: backend-ci-${{ github.ref }}
+diff --git a/backend/src/trade_lab/adapters/databento.py b/backend/src/trade_lab/adapters/databento.py
+index 8fe8107..a444ff9 100644
+--- a/backend/src/trade_lab/adapters/databento.py
++++ b/backend/src/trade_lab/adapters/databento.py
+@@ -8,13 +8,14 @@ to Databento; ``start()`` is called only by the opt-in live controller.
+ """
+ 
+ import asyncio
++import heapq
+ import importlib.util
+ import logging
+ import re
+-from collections.abc import AsyncIterator, Callable
+-from datetime import UTC, datetime
++from collections.abc import AsyncIterator, Callable, Iterable
++from datetime import UTC, datetime, timedelta
+ from decimal import Decimal
+-from typing import Any, NamedTuple
++from typing import TYPE_CHECKING, Any, NamedTuple
+ 
+ from trade_lab.domain.data_quality import (
+     DataQualityCode,
+@@ -33,6 +34,10 @@ from trade_lab.domain.events import (
+ )
+ from trade_lab.domain.feed import FeedConnectionState, FeedStatus
+ from trade_lab.domain.prices import NQ_TICK_SIZE, price_to_ticks
++from trade_lab.domain.trading_day import most_recent_session_open_utc
++
++if TYPE_CHECKING:
++    from trade_lab.adapters.databento_historical import DatabentoHistoricalSource
+ 
+ 
+ class DatabentoUnavailableError(RuntimeError):
+@@ -102,13 +107,31 @@ class _DatabentoSdkFacade:
+         client.add_callback(callback)
+ 
+     def subscribe(
+-        self, client: Any, *, dataset: str, schema: str, symbol: str, stype_in: str
++        self,
++        client: Any,
++        *,
++        dataset: str,
++        schema: str,
++        symbol: str,
++        stype_in: str,
++        start: datetime | None = None,
+     ) -> None:
+         if not hasattr(client, "subscribe"):
+             raise DatabentoUnavailableError(
+                 "Databento Live client does not expose subscribe. Upgrade the databento SDK."
+             )
+-        client.subscribe(dataset=dataset, schema=schema, symbols=[symbol], stype_in=stype_in)
++        # W2 P1b: ``start`` engages the gateway's intraday replay (warm start). It is
++        # only forwarded when set so fakes/older clients keep the narrow signature.
++        if start is None:
++            client.subscribe(dataset=dataset, schema=schema, symbols=[symbol], stype_in=stype_in)
++        else:
++            client.subscribe(
++                dataset=dataset,
++                schema=schema,
++                symbols=[symbol],
++                stype_in=stype_in,
++                start=start,
++            )
+ 
+     def start(self, client: Any) -> None:
+         if hasattr(client, "start"):
+@@ -143,6 +166,9 @@ class DatabentoMarketDataFeed:
+         queue_maxsize: int = 10_000,
+         sdk_module: Any | None = None,
+         sdk_facade: _DatabentoSdkFacade | None = None,
++        intraday_replay: bool = False,
++        historical_source: "DatabentoHistoricalSource | None" = None,
++        now_provider: Callable[[], datetime] | None = None,
+     ) -> None:
+         if not api_key:
+             raise ValueError("Databento API key must be configured in backend environment")
+@@ -171,16 +197,51 @@ class DatabentoMarketDataFeed:
+         self._queue: asyncio.Queue[_QueuedProviderMessage] = asyncio.Queue(maxsize=queue_maxsize)
+         self._overflow_count = 0
+         self._loop: asyncio.AbstractEventLoop | None = None
++        self._intraday_replay = intraday_replay
++        self._historical_source = historical_source
++        self._now = now_provider or (lambda: datetime.now(UTC))
++        # W2 P1b FALLBACK: per-schema historical record streams staged by start()
++        # when the gateway rejects the replay-start subscribe; drained by events()
++        # BEFORE the live subscription so the queue can never overflow on history.
++        self._warm_start_streams: tuple[tuple[str, Iterable[Any]], ...] | None = None
+ 
+     async def start(self) -> None:
+         if self._started:
+             return
++        self._warm_start_streams = None
++        if self._intraday_replay:
++            replay_start = most_recent_session_open_utc(self._now())
++            try:
++                self._connect(replay_start=replay_start)
++                self._started = True
++                return
++            except Exception as exc:
++                # W2 P1b: the gateway/entitlement rejected the replay-start subscribe
++                # at runtime — fall back to the Historical API for the same window.
++                logger.warning(
++                    "Databento live replay-start subscribe was rejected "
++                    "(exception_type=%s); falling back to the Historical API warm start",
++                    type(exc).__name__,
++                )
++                self._teardown_client()
++                self._warm_start_streams = await self._fetch_warm_start_streams(replay_start)
++                if self._warm_start_streams is not None:
++                    # The live subscribe happens in events() AFTER the historical
++                    # records drain, so warm-start can never overflow the live queue.
++                    self._loop = asyncio.get_running_loop()
++                    self._started = True
++                    return
++        self._connect(replay_start=None)
++        self._started = True
++
++    def _connect(self, *, replay_start: datetime | None) -> None:
+         client: Any = None
+         try:
+             client = self._sdk_facade.create_live_client(self._api_key)
+             self._client = client
+             self._loop = asyncio.get_running_loop()
+             self._sdk_facade.add_callback(client, self._provider_callback)
++            replayable = {self.trade_schema.lower(), self.quote_schema.lower()}
+             for schema in _unique_schemas(
+                 (self.trade_schema, self.quote_schema, *self.context_schemas)
+             ):
+@@ -190,9 +251,9 @@ class DatabentoMarketDataFeed:
+                     schema=schema,
+                     symbol=self.requested_symbol,
+                     stype_in=self.stype_in,
++                    start=replay_start if schema in replayable else None,
+                 )
+             self._sdk_facade.start(client)
+-            self._started = True
+         except Exception:
+             if client is not None:
+                 try:
+@@ -207,6 +268,46 @@ class DatabentoMarketDataFeed:
+             self._started = False
+             raise
+ 
++    def _teardown_client(self) -> None:
++        if self._client is not None:
++            try:
++                self._sdk_facade.stop(self._client)
++            except Exception as stop_exc:  # pragma: no cover - defensive logging
++                logger.warning(
++                    "Databento client cleanup after rejected replay-start raised: "
++                    "exception_type=%s",
++                    type(stop_exc).__name__,
++                )
++        self._client = None
++        self._loop = None
++
++    async def _fetch_warm_start_streams(
++        self, replay_start: datetime
++    ) -> tuple[tuple[str, Iterable[Any]], ...] | None:
++        source = self._historical_source
++        if source is None or not source.available:
++            logger.warning(
++                "Databento warm-start fallback unavailable: Historical API access is "
++                "not configured; subscribing live without intraday history"
++            )
++            return None
++        try:
++            return await asyncio.to_thread(
++                source.dbn_record_streams,
++                start=replay_start,
++                end=self._now(),
++                schemas=(self.trade_schema, self.quote_schema),
++            )
++        except asyncio.CancelledError:
++            raise
++        except Exception as exc:
++            logger.warning(
++                "Databento warm-start fallback fetch failed (exception_type=%s); "
++                "subscribing live without intraday history",
++                type(exc).__name__,
++            )
++            return None
++
+     async def stop(self) -> None:
+         self._started = False
+         loop = self._loop
+@@ -229,6 +330,16 @@ class DatabentoMarketDataFeed:
+             last_message="Databento live adapter consuming provider callback queue.",
+             metadata={"schemas": list(_unique_schemas(self._schemas))},
+         )
++        warm_streams = self._warm_start_streams
++        self._warm_start_streams = None
++        if warm_streams is not None:
++            async for item in self._drain_warm_start_streams(warm_streams):
++                yield item
++            if not self._started:
++                return
++            # Spec order: fetch -> feed -> subscribe live from now. A subscribe
++            # failure here propagates and surfaces as a live-feed failure.
++            self._connect(replay_start=None)
+         while self._started or not self._queue.empty():
+             await asyncio.sleep(0)
+             warning = self._take_overflow_warning()
+@@ -268,6 +379,41 @@ class DatabentoMarketDataFeed:
+                     detail=_redact(str(exc), (self._api_key,)),
+                 )
+ 
++    async def _drain_warm_start_streams(
++        self, streams: tuple[tuple[str, Iterable[Any]], ...]
++    ) -> AsyncIterator[MarketEvent | DataQualityWarning]:
++        """Yield normalized historical records (merged by ``ts_event``) for warm start.
++
++        Records flow through the SAME ``normalize_provider_message`` path live
++        records take, so warm-start events cannot diverge from live ones. The loop
++        yields control periodically so a long intraday drain never starves the loop.
++        """
++
++        merged = heapq.merge(
++            *(_tag_records(schema, records) for schema, records in streams),
++            key=lambda item: _record_ts_event(item[1]),
++        )
++        count = 0
++        for schema, record in merged:
++            if not self._started:
++                return
++            normalized_schema = _normalize_provider_schema(schema, self.quote_schema) or schema
++            try:
++                yield normalize_provider_message(
++                    record, requested_symbol=self.requested_symbol, schema=normalized_schema
++                )
++            except Exception as exc:
++                yield _warning(
++                    _code_for_normalization_error(exc),
++                    "Databento warm-start record could not be normalized safely",
++                    schema=_safe_provider_schema(normalized_schema),
++                    detail=_redact(str(exc), (self._api_key,)),
++                )
++            count += 1
++            if count % 500 == 0:
++                await asyncio.sleep(0)
++        logger.info("Databento warm-start fallback replayed %d historical records", count)
++
+     @property
+     def _schemas(self) -> tuple[str, ...]:
+         return (self.trade_schema, self.quote_schema, *self.context_schemas)
+@@ -417,6 +563,26 @@ def _top_of_book_source(message: Any) -> Any:
+         return message
+ 
+ 
++def _tag_records(schema: str, records: Iterable[Any]) -> Iterable[tuple[str, Any]]:
++    # A real function (not a genexp) so each stream binds ITS schema eagerly.
++    for record in records:
++        yield (schema, record)
++
++
++_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=UTC)
++
++
++def _record_ts_event(record: Any) -> int:
++    value = getattr(record, "ts_event", None)
++    if value is None:
++        header = getattr(record, "hdr", None)
++        value = getattr(header, "ts_event", 0)
++    try:
++        return int(value)
++    except (TypeError, ValueError):
++        return 0
++
++
+ def _timestamp(message: Any) -> datetime:
+     value = _get(message, "event_ts_utc", "ts_event", "timestamp")
+     if value is None:
+@@ -424,7 +590,10 @@ def _timestamp(message: Any) -> datetime:
+     if isinstance(value, datetime):
+         return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
+     if isinstance(value, int):
+-        return datetime.fromtimestamp(value / 1_000_000_000, UTC)
++        # W2 P1a: ns since epoch decoded on the floor-µs INTEGER path. The float
++        # fromtimestamp(ns / 1e9) route loses sub-µs precision near the float53
++        # boundary and is deleted (same recipe as Strategy-Core's decoders).
++        return _EPOCH_UTC + timedelta(microseconds=value // 1_000)
+     text = str(value).replace("Z", "+00:00")
+     return datetime.fromisoformat(text).astimezone(UTC)
+ 
+@@ -508,10 +677,14 @@ def _pretty_price_value(message: Any, *names: str) -> Any:
+ 
+ 
+ def _side(message: Any) -> TradeSide:
++    # W2: Databento's single-letter aggressor codes are 'B' (bid aggressor = buy)
++    # and 'A' (ask aggressor = SELL) — the canonical mapping Strategy-Core's W1
++    # parquet shim ratified. 'A' previously fell through to UNKNOWN here, starving
++    # side-aware order-flow features of every sell print on the live path.
+     value = (_optional_str(message, "side", "aggressor_side") or "unknown").lower()
+     if value in {"buy", "b", "ask"}:
+         return TradeSide.BUY
+-    if value in {"sell", "s", "bid"}:
++    if value in {"sell", "s", "a", "bid"}:
+         return TradeSide.SELL
+     return TradeSide.UNKNOWN
+ 
+diff --git a/backend/src/trade_lab/adapters/databento_historical.py b/backend/src/trade_lab/adapters/databento_historical.py
+index bf5f31c..8c4a327 100644
+--- a/backend/src/trade_lab/adapters/databento_historical.py
++++ b/backend/src/trade_lab/adapters/databento_historical.py
+@@ -1,19 +1,22 @@
+-"""Databento Historical API source for live-mode warm-up seeding.
+-
+-Live streaming only has access to L0/L1 (trades + MBP-1), so the warm-up that
+-pre-fills the chart with the last few sessions uses the same L0 trade prints from
+-the Historical API. The continuous front-month symbol resolves to a single outright
+-contract server-side, so — unlike the local MBP-10 dumps — there is no spread or
+-back-month contamination to filter here.
+-
+-Trades are returned as a pandas DataFrame (``DBNStore.to_df``) so the seed service can
+-build tick bars vectorized; per-record Python normalization is ~100x slower and made
+-the warm-up effectively never finish. Importing this module never connects to
+-Databento; the client is built only when ``trades_frame`` is called, and a
+-``frame_fetcher`` can be injected so tests run without the SDK or network.
++"""Databento Historical API source for the live warm-start FALLBACK + PDH/PDL seed.
++
++D-P-03: the Historical API exists solely for the live warm-start slice. Two
++consumers remain after the Chicago display seed retired (W2 P1e):
++
++* ``dbn_record_streams`` — the warm-start FALLBACK when the live gateway rejects
++  the intraday replay-start subscribe: raw DBN records (trades + MBP-1) for
++  ``[trading-day 18:00 ET, now)``, fed through the SAME
++  ``normalize_provider_message`` path live records take.
++* ``ohlcv_frame`` — the tiny prior-trading-day ohlcv-1h request reduced to
++  (max high, min low) for ``runtime.load_prior_day_summary`` (W2 P1c), the same
++  seed path research and cold replay use.
++
++Importing this module never connects to Databento; a client is built only when a
++fetch method runs, and ``record_fetcher``/``ohlcv_fetcher`` can be injected so
++tests run without the SDK or network.
+ """
+ 
+-from collections.abc import Callable
++from collections.abc import Callable, Iterable
+ from datetime import UTC, datetime
+ from typing import TYPE_CHECKING, Any
+ 
+@@ -22,14 +25,16 @@ from trade_lab.adapters.databento import DatabentoUnavailableError, is_databento
+ if TYPE_CHECKING:
+     import pandas as pd
+ 
+-# (start, end) -> trades DataFrame with at least ts_event, price, size columns.
+-FrameFetcher = Callable[[datetime, datetime], "pd.DataFrame"]
++# (schema, start, end) -> iterable of DBN records for that schema.
++RecordFetcher = Callable[[str, datetime, datetime], Iterable[Any]]
++# (start, end) -> ohlcv DataFrame with at least high/low columns.
++OhlcvFetcher = Callable[[datetime, datetime], "pd.DataFrame"]
+ 
+-_SEED_TRADE_SCHEMA = "trades"
++_OHLCV_SCHEMA = "ohlcv-1h"
+ 
+ 
+ class DatabentoHistoricalSource:
+-    """Fetch historical front-month trade prints (as a DataFrame) for warm-up seeding."""
++    """Fetch historical front-month records/summaries for live warm start."""
+ 
+     def __init__(
+         self,
+@@ -38,45 +43,61 @@ class DatabentoHistoricalSource:
+         dataset: str,
+         requested_symbol: str,
+         stype_in: str,
+-        frame_fetcher: FrameFetcher | None = None,
++        record_fetcher: RecordFetcher | None = None,
++        ohlcv_fetcher: OhlcvFetcher | None = None,
+     ) -> None:
+         self._api_key = api_key
+         self._dataset = dataset
+         self._requested_symbol = requested_symbol
+         self._stype_in = stype_in
+-        self._has_custom_fetcher = frame_fetcher is not None
+-        self._frame_fetcher = frame_fetcher or self._default_frame_fetcher
++        self._record_fetcher = record_fetcher
++        self._ohlcv_fetcher = ohlcv_fetcher
+ 
+     @property
+     def available(self) -> bool:
+-        # An injected fetcher (tests/custom deployments) is always usable; the default
+-        # fetcher needs both the optional SDK and a configured API key.
+-        if self._has_custom_fetcher:
++        # Injected fetchers (tests/custom deployments) are always usable; the
++        # default fetchers need both the optional SDK and a configured API key.
++        if self._record_fetcher is not None or self._ohlcv_fetcher is not None:
+             return True
+         return self._api_key is not None and is_databento_sdk_available()
+ 
+-    def trades_frame(self, *, start: datetime, end: datetime) -> "pd.DataFrame":
+-        """Return front-month trade prints over ``[start, end)`` as a DataFrame."""
+-
+-        return self._frame_fetcher(start, end)
++    def dbn_record_streams(
++        self, *, start: datetime, end: datetime, schemas: tuple[str, ...]
++    ) -> tuple[tuple[str, Iterable[Any]], ...]:
++        """Per-schema DBN record streams over ``[start, end)`` for warm start."""
++
++        if self._record_fetcher is not None:
++            return tuple((schema, self._record_fetcher(schema, start, end)) for schema in schemas)
++        client = self._client()
++        # Historical data lags real time by minutes; an unclamped end (≈ now)
++        # triggers a 422 data_end_after_available_end error.
++        end = self._clamp_end_to_available(client, end, schemas[0])
++        if end <= start:
++            return tuple((schema, ()) for schema in schemas)
++        return tuple(
++            (
++                schema,
++                client.timeseries.get_range(
++                    dataset=self._dataset,
++                    schema=schema,
++                    symbols=[self._requested_symbol],
++                    stype_in=self._stype_in,
++                    start=start,
++                    end=end,
++                ),
++            )
++            for schema in schemas
++        )
+ 
+-    def _default_frame_fetcher(self, start: datetime, end: datetime) -> "pd.DataFrame":
+-        if self._api_key is None:
+-            raise DatabentoUnavailableError("Databento API key is not configured for seeding")
+-        if not is_databento_sdk_available():
+-            raise DatabentoUnavailableError("Databento SDK is not installed for seeding")
+-        import databento
+-        import pandas as pd
++    def ohlcv_frame(self, *, start: datetime, end: datetime) -> "pd.DataFrame":
++        """Hourly ohlcv bars over ``[start, end)`` (the prior-day summary input)."""
+ 
+-        client = databento.Historical(self._api_key)
+-        # Historical data lags real time by minutes, so `end` (≈ now) is routinely past the
+-        # available range and otherwise triggers a 422 data_end_after_available_end error.
+-        end = self._clamp_end_to_available(client, end)
+-        if end <= start:
+-            return pd.DataFrame(columns=["ts_event", "price", "size"])
++        if self._ohlcv_fetcher is not None:
++            return self._ohlcv_fetcher(start, end)
++        client = self._client()
+         store = client.timeseries.get_range(
+             dataset=self._dataset,
+-            schema=_SEED_TRADE_SCHEMA,
++            schema=_OHLCV_SCHEMA,
+             symbols=[self._requested_symbol],
+             stype_in=self._stype_in,
+             start=start,
+@@ -85,7 +106,20 @@ class DatabentoHistoricalSource:
+         frame: Any = store.to_df()
+         return frame
+ 
+-    def _clamp_end_to_available(self, client: Any, end: datetime) -> datetime:
++    def _client(self) -> Any:
++        if self._api_key is None:
++            raise DatabentoUnavailableError(
++                "Databento API key is not configured for historical fetches"
++            )
++        if not is_databento_sdk_available():
++            raise DatabentoUnavailableError(
++                "Databento SDK is not installed for historical fetches"
++            )
++        import databento
++
++        return databento.Historical(self._api_key)
++
++    def _clamp_end_to_available(self, client: Any, end: datetime, schema: str) -> datetime:
+         import pandas as pd
+ 
+         try:
+@@ -94,10 +128,8 @@ class DatabentoHistoricalSource:
+             return end
+         raw_end = None
+         schema_ranges = available.get("schema") if isinstance(available, dict) else None
+-        if isinstance(schema_ranges, dict) and isinstance(
+-            schema_ranges.get(_SEED_TRADE_SCHEMA), dict
+-        ):
+-            raw_end = schema_ranges[_SEED_TRADE_SCHEMA].get("end")
++        if isinstance(schema_ranges, dict) and isinstance(schema_ranges.get(schema), dict):
++            raw_end = schema_ranges[schema].get("end")
+         if raw_end is None and isinstance(available, dict):
+             raw_end = available.get("end")
+         if raw_end is None:
+diff --git a/backend/src/trade_lab/api/app.py b/backend/src/trade_lab/api/app.py
+index 4f56f07..57a0980 100644
+--- a/backend/src/trade_lab/api/app.py
++++ b/backend/src/trade_lab/api/app.py
+@@ -3,6 +3,7 @@
+ import hmac
+ import ipaddress
+ import re
++from contextlib import asynccontextmanager
+ from pathlib import Path
+ from urllib.parse import urlsplit
+ 
+@@ -32,9 +33,9 @@ from trade_lab.services.model_registry import (
+     ServingCapabilities,
+     is_safe_model_id,
+ )
++from trade_lab.services.journal import PredictionJournal
+ from trade_lab.services.replay import HistoricalReplayService, ReplayConfig, ReplayState
+-from trade_lab.services.runtime import ApplicationRuntime
+-from trade_lab.services.seed import HistoricalSeedService
++from trade_lab.services.runtime import ApplicationRuntime, RuntimeUpdate
+ 
+ 
+ class ReplayStartRequest(BaseModel):
+@@ -168,6 +169,9 @@ def _live_status_payload(live: LiveMarketDataService) -> dict[str, object]:
+         "stopped_at_utc": None
+         if status.stopped_at_utc is None
+         else status.stopped_at_utc.isoformat(),
++        # W2 P1b: "warming (N events)" vs "live" for the status surface.
++        "warm_start_state": status.warm_start_state,
++        "warm_start_events": status.warm_start_events,
+     }
+ 
+ 
+@@ -210,7 +214,17 @@ def create_app(
+     broadcaster: WebSocketBroadcaster | None = None,
+ ) -> FastAPI:
+     settings = settings or load_settings()
+-    app = FastAPI(title="Trade-Lab Backend", version=__version__)
++
++    # W2 P2a: the lifespan shutdown hook stops an active live feed on process
++    # exit, so the live-stop resolver flush actually runs (F10).
++    @asynccontextmanager
++    async def lifespan(app: FastAPI):
++        yield
++        live_service = getattr(app.state, "live", None)
++        if live_service is not None and _live_is_active(live_service):
++            await live_service.stop()
++
++    app = FastAPI(title="Trade-Lab Backend", version=__version__, lifespan=lifespan)
+     app.add_middleware(
+         CORSMiddleware,
+         allow_origins=list(settings.allowed_origin_values),
+@@ -225,6 +239,8 @@ def create_app(
+         observation_duration_seconds=settings.observation_duration_seconds,
+         seed_bar_limit_per_timeframe=settings.seed_max_bars_per_timeframe,
+         market_context_retention_minutes=settings.market_context_retention_minutes,
++        # W2 P2e (D-P-07): append-only prediction/outcome/drop journaling.
++        journal=PredictionJournal(settings.journal_path),
+     )
+     # ModelRegistry discovers bundles from the configured models path; the runtime
+     # invokes inference on completed observations only once an operator activates a
+@@ -273,6 +289,20 @@ def create_app(
+             secret_values=_configured_secret_values(settings),
+         )
+ 
++        # W2 P1: one Historical source serves the warm-start FALLBACK (inside the
++        # feed) and the prior-day PDH/PDL seed (inside the live service). D-P-03:
++        # the Historical API exists solely for the live warm-start slice.
++        historical_source = DatabentoHistoricalSource(
++            api_key=(
++                None
++                if settings.databento_api_key is None
++                else settings.databento_api_key.get_secret_value()
++            ),
++            dataset=settings.databento_dataset,
++            requested_symbol=settings.databento_requested_symbol,
++            stype_in=settings.databento_stype_in,
++        )
++
+         def live_feed_factory(config: LiveConfig):
+             if settings.databento_api_key is None:
+                 raise RuntimeError("Databento API key is not configured")
+@@ -284,26 +314,17 @@ def create_app(
+                 trade_schema=config.trade_schema,
+                 quote_schema=config.quote_schema,
+                 context_schemas=config.context_schemas,
++                # W2 P1b (D-P-06): replay the current trading day from 18:00 ET
++                # through the same adapter path before flowing into real time.
++                intraday_replay=True,
++                historical_source=historical_source,
+             )
+ 
+-        seed_service = HistoricalSeedService(
+-            DatabentoHistoricalSource(
+-                api_key=(
+-                    None
+-                    if settings.databento_api_key is None
+-                    else settings.databento_api_key.get_secret_value()
+-                ),
+-                dataset=settings.databento_dataset,
+-                requested_symbol=settings.databento_requested_symbol,
+-                stype_in=settings.databento_stype_in,
+-            ),
+-            tick_timeframes=settings.tick_timeframes,
+-            lookback_days=settings.seed_lookback_days,
+-            max_bars_per_timeframe=settings.seed_max_bars_per_timeframe,
+-            enabled=settings.seed_enabled,
+-        )
+         live = LiveMarketDataService(
+-            runtime, live_config, live_feed_factory, seed_service=seed_service
++            runtime,
++            live_config,
++            live_feed_factory,
++            historical_source=historical_source,
+         )
+     if not live.has_update_callback:
+         live.set_update_callback(broadcaster.broadcast_update)
+@@ -339,6 +360,8 @@ def create_app(
+             "trading_day": None if trading_day is None else trading_day.isoformat(),
+             "replay": replay_status,
+             "live": _live_status_payload(app.state.live),
++            # W2 P2d: named-feature inference failure visibility.
++            "inference": app.state.runtime.inference_health(),
+         }
+ 
+     @app.get("/api/v1/live/status")
+@@ -391,31 +414,53 @@ def create_app(
+         if not is_safe_model_id(model_id):
+             raise HTTPException(status_code=400, detail="invalid model id")
+         registry: ModelRegistry = app.state.model_registry
++        runtime: ApplicationRuntime = app.state.runtime
++        # W2 P2b (F12): validation + ActiveModel construction + resolver build all
++        # complete BEFORE the registry swap. Any failure here leaves the previous
++        # model serving, untouched.
+         try:
+-            registry.activate(model_id)
++            candidate = registry.prepare_activation(model_id)
+         except ModelNotFoundError as exc:
+             raise HTTPException(status_code=404, detail="unknown model id") from exc
+         except ModelValidationError as exc:
+             # The message is already path-free/secret-free by ModelRegistry design.
+             raise HTTPException(status_code=409, detail=str(exc)) from exc
+-        # The active contract changed: rebind the engine so prior predictions,
+-        # outcomes, and the contract-specific tracker are cleared atomically.
+-        app.state.runtime.set_inference_engine(app.state.inference_engine)
+-        status = app.state.runtime.model_status()
+-        await app.state.broadcaster.broadcast_model_status(status)
+-        return model_status_to_dto(status).model_dump(mode="json")
++        try:
++            prepared = runtime.prepare_inference_rebind(app.state.inference_engine, candidate)
++        except Exception as exc:
++            raise HTTPException(status_code=409, detail=str(exc)) from exc
++        # W2 P2a: flush the OLD resolver before the swap discards it; the flushed
++        # drops belong to the outgoing bundle and broadcast after the commit.
++        flush_update = runtime.flush_resolver()
++        # The swap + engine rebind happen together with NO awaits between them, so
++        # the event loop can never observe a torn (registry, resolver) pair.
++        registry.commit_activation(candidate)
++        runtime.commit_inference_rebind(prepared)
++        if flush_update.has_deltas():
++            await app.state.broadcaster.broadcast_update(flush_update)
++        # W2 P2c: typed reset frame — clients clear prediction/outcome panes. The
++        # broadcaster appends the changed model.status delta to the same update.
++        await app.state.broadcaster.broadcast_update(
++            RuntimeUpdate(model_reset_reason="activation")
++        )
++        return model_status_to_dto(runtime.model_status()).model_dump(mode="json")
+ 
+     @app.post("/api/v1/models/deactivate")
+     async def deactivate_model(request: Request) -> dict[str, object]:
+         _authorize_live_control(request, settings)
+         registry: ModelRegistry = app.state.model_registry
++        runtime: ApplicationRuntime = app.state.runtime
++        prepared = runtime.prepare_inference_rebind(app.state.inference_engine, None)
++        flush_update = runtime.flush_resolver()
++        # Swap + rebind together, no awaits between (mirrors activate).
+         registry.deactivate()
+-        # Rebind so prediction/outcome/tracker state is dropped; market data keeps
+-        # flowing with no model active.
+-        app.state.runtime.set_inference_engine(app.state.inference_engine)
+-        status = app.state.runtime.model_status()
+-        await app.state.broadcaster.broadcast_model_status(status)
+-        return model_status_to_dto(status).model_dump(mode="json")
++        runtime.commit_inference_rebind(prepared)
++        if flush_update.has_deltas():
++            await app.state.broadcaster.broadcast_update(flush_update)
++        await app.state.broadcaster.broadcast_update(
++            RuntimeUpdate(model_reset_reason="activation")
++        )
++        return model_status_to_dto(runtime.model_status()).model_dump(mode="json")
+ 
+     @app.get("/api/v1/replay/status")
+     async def replay_status() -> dict[str, object]:
+diff --git a/backend/src/trade_lab/api/dto.py b/backend/src/trade_lab/api/dto.py
+index 7597791..8cb63ae 100644
+--- a/backend/src/trade_lab/api/dto.py
++++ b/backend/src/trade_lab/api/dto.py
+@@ -36,6 +36,7 @@ MessageType = Literal[
+     "prediction.resolved",
+     "prediction.dropped",
+     "model.status",
++    "model.reset",
+ ]
+ 
+ 
+diff --git a/backend/src/trade_lab/config.py b/backend/src/trade_lab/config.py
+index d5d9ac8..2c19dc8 100644
+--- a/backend/src/trade_lab/config.py
++++ b/backend/src/trade_lab/config.py
+@@ -63,13 +63,15 @@ class Settings(BaseSettings):
+     # cover approach + interaction + margin (default 30 + 5 + 10 = 45 minutes).
+     market_context_retention_minutes: int = Field(default=45, ge=45, le=240)
+ 
+-    # Live warm-up: on live start, pre-fill the chart with the last N completed sessions
+-    # of front-month tick bars fetched from the Databento Historical API (L0/L1 only, to
+-    # match what live streaming provides). Bounded per timeframe to cap snapshot size.
+-    seed_enabled: bool = True
+-    seed_lookback_days: int = Field(default=3, ge=1, le=30)
++    # Per-timeframe cap on warm-up bars retained by the runtime snapshot buffer.
++    # (W2 P1e: the Chicago display-seed service retired; display warm-up now comes
++    # from real engine bars produced by the live warm-start replay.)
+     seed_max_bars_per_timeframe: int = Field(default=2500, ge=1, le=20_000)
+ 
++    # W2 P2e (D-P-07): append-only prediction journal directory; one JSONL file
++    # per trading day (18:00 ET roll). Write-only this window; W3's soak reads it.
++    journal_path: Path = Field(default=_BACKEND_ENV_FILE.parent / "data" / "journal")
++
+     _ALLOWED_DATASETS: ClassVar[set[str]] = {"GLBX.MDP3"}
+     _ALLOWED_STYPE_IN: ClassVar[set[str]] = {"raw_symbol", "continuous", "instrument_id", "parent"}
+     _ALLOWED_TRADE_SCHEMAS: ClassVar[set[str]] = {"trades"}
+diff --git a/backend/src/trade_lab/domain/candles.py b/backend/src/trade_lab/domain/candles.py
+index af1808c..5f889e8 100644
+--- a/backend/src/trade_lab/domain/candles.py
++++ b/backend/src/trade_lab/domain/candles.py
+@@ -2,9 +2,10 @@
+ 
+ The local candle-engine shadow implementation was deleted in D2: authoritative
+ live/replay bars are produced by Strategy-Core's streaming engine and mapped into
+-these compatibility types at the adapter seam (``strategy_core_service``). The
+-only TL-local bar CONSTRUCTION left in production is the seed warm-up builder
+-(``services/seed.py`` — display-only, documented carve-out in the acceptance guard).
++these compatibility types at the adapter seam (``strategy_core_service``). W2 P1e
++retired the last TL-local bar construction (the ``services/seed.py`` Chicago
++display seed) — live warm-up bars now come from the engine via the trading-day
++replay, so NO local bar building remains in production.
+ """
+ 
+ from dataclasses import dataclass
+diff --git a/backend/src/trade_lab/domain/trading_day.py b/backend/src/trade_lab/domain/trading_day.py
+new file mode 100644
+index 0000000..2b3a58d
+--- /dev/null
++++ b/backend/src/trade_lab/domain/trading_day.py
+@@ -0,0 +1,56 @@
++"""ET trading-day clock helpers (18:00 America/New_York roll).
++
++D-P-06 anchors live warm-start, reconnect recovery, and the prediction journal
++on the canonical 18:00 ET trading-day boundary — the same boundary
++Strategy-Core's v3 session scheme uses. ``prior_trading_day`` skips weekends so
++a Monday looks back to Friday; exchange holidays are deliberately not modeled
++(an empty fetch is surfaced by the caller instead of silently guessed around).
++"""
++
++from datetime import UTC, date, datetime, time, timedelta
++from zoneinfo import ZoneInfo
++
++ET = ZoneInfo("America/New_York")
++TRADING_DAY_BOUNDARY = time(18, 0)
++
++
++def trading_day_for(ts_utc: datetime) -> date:
++    """The trading day a UTC instant belongs to: ``[prev 18:00 ET, 18:00 ET)``."""
++
++    local = ts_utc.astimezone(ET)
++    day = local.date()
++    if local.time() >= TRADING_DAY_BOUNDARY:
++        day += timedelta(days=1)
++    return day
++
++
++def trading_day_start_utc(trading_day: date) -> datetime:
++    """The UTC instant trading day ``D`` opens: ``(D - 1) 18:00 ET``."""
++
++    local = datetime.combine(
++        trading_day - timedelta(days=1), TRADING_DAY_BOUNDARY, tzinfo=ET
++    )
++    return local.astimezone(UTC)
++
++
++def most_recent_session_open_utc(now_utc: datetime) -> datetime:
++    """The most recent 18:00 ET at/before ``now_utc`` (the live warm-start anchor)."""
++
++    return trading_day_start_utc(trading_day_for(now_utc))
++
++
++def prior_trading_day(trading_day: date) -> date:
++    """The previous Mon-Fri calendar date (Friday for a Monday trading day)."""
++
++    day = trading_day - timedelta(days=1)
++    while day.weekday() >= 5:
++        day -= timedelta(days=1)
++    return day
++
++
++def trading_day_bounds_utc(trading_day: date) -> tuple[datetime, datetime]:
++    """``[start, end)`` UTC bounds of one trading day (prev 18:00 ET → 18:00 ET)."""
++
++    return trading_day_start_utc(trading_day), trading_day_start_utc(
++        trading_day + timedelta(days=1)
++    )
+diff --git a/backend/src/trade_lab/services/broadcaster.py b/backend/src/trade_lab/services/broadcaster.py
+index 7ef745e..eebc62a 100644
+--- a/backend/src/trade_lab/services/broadcaster.py
++++ b/backend/src/trade_lab/services/broadcaster.py
+@@ -77,6 +77,12 @@ class WebSocketBroadcaster:
+ 
+     def messages_for_update(self, update: RuntimeUpdate) -> tuple[bytes, ...]:
+         messages: list[bytes] = []
++        # W2 P2c: the typed reset frame goes FIRST so clients clear stale panes
++        # before this update's fresh deltas arrive.
++        if update.model_reset_reason is not None:
++            messages.append(
++                self.envelope_bytes("model.reset", {"reason": update.model_reset_reason})
++            )
+         if update.feed_status is not None:
+             messages.append(
+                 self.envelope_bytes("feed.status", feed_status_to_dto(update.feed_status))
+diff --git a/backend/src/trade_lab/services/inference/features/__init__.py b/backend/src/trade_lab/services/inference/features/__init__.py
+index 13bddad..f9e92dd 100644
+--- a/backend/src/trade_lab/services/inference/features/__init__.py
++++ b/backend/src/trade_lab/services/inference/features/__init__.py
+@@ -9,6 +9,7 @@ empty-case rule preserved exactly (absorption -> 0.0; approach -> NaN).
+ 
+ from trade_lab.services.inference.features.feature_functions import (
+     DEFAULT_FEATURE_REGISTRY,
++    FeatureComputationError,
+     FeatureFn,
+     FeatureFunctionRegistry,
+     FeatureWindow,
+@@ -19,6 +20,7 @@ from trade_lab.services.inference.features.feature_functions import (
+ 
+ __all__ = [
+     "DEFAULT_FEATURE_REGISTRY",
++    "FeatureComputationError",
+     "FeatureFn",
+     "FeatureFunctionRegistry",
+     "FeatureWindow",
+diff --git a/backend/src/trade_lab/services/inference/features/feature_functions.py b/backend/src/trade_lab/services/inference/features/feature_functions.py
+index e64dde6..f69adc2 100644
+--- a/backend/src/trade_lab/services/inference/features/feature_functions.py
++++ b/backend/src/trade_lab/services/inference/features/feature_functions.py
+@@ -35,6 +35,18 @@ if TYPE_CHECKING:
+     from trade_lab.domain.market_context import MarketContextBuffer
+ 
+ 
++class FeatureComputationError(RuntimeError):
++    """W2 P2d: a named feature function raised during vector construction.
++
++    Carries the failing feature's name so the runtime's inference error path can
++    log and surface WHICH feature broke, not just that one did.
++    """
++
++    def __init__(self, feature_name: str, original: Exception) -> None:
++        super().__init__(f"feature {feature_name!r} failed: {original}")
++        self.feature_name = feature_name
++
++
+ class LevelDirection(StrEnum):
+     """Trade direction implied by which side of the level was touched."""
+ 
+@@ -318,7 +330,12 @@ def build_feature_vector(
+     ordered: list[float] = []
+     by_name: dict[str, float] = {}
+     for name in contract.feature_set.names:
+-        value = registry.compute(name, buffer, window, level_ctx)
++        try:
++            value = registry.compute(name, buffer, window, level_ctx)
++        except Exception as exc:
++            # W2 P2d: name the failing feature so the runtime's status surface can
++            # report WHICH feature broke, not just that one did.
++            raise FeatureComputationError(name, exc) from exc
+         ordered.append(value)
+         by_name[name] = value
+     return ordered, by_name
+diff --git a/backend/src/trade_lab/services/journal.py b/backend/src/trade_lab/services/journal.py
+new file mode 100644
+index 0000000..98e0196
+--- /dev/null
++++ b/backend/src/trade_lab/services/journal.py
+@@ -0,0 +1,110 @@
++"""Append-only prediction journal (W2 P2e, D-P-07).
++
++One JSONL file per trading day (18:00 ET roll) under a settings-driven directory
++(``TRADE_LAB_JOURNAL_PATH``). Records predictions (features, probabilities,
++eligibility), outcomes, and drops, each tagged ``replay``/``live`` plus the bundle
++id, so serving evidence survives restarts. Write-only this window — W3's soak
++reads it. Line-buffered append per record (predictions are rare); fsync is
++deliberately not required. Journal failures are logged and never propagate.
++"""
++
++import json
++import logging
++from datetime import datetime
++from pathlib import Path
++from typing import Any
++
++from trade_lab.domain.outcomes import DroppedPrediction, Outcome
++from trade_lab.domain.trading_day import trading_day_for
++from trade_lab.services.inference.inference_engine import Prediction
++
++logger = logging.getLogger(__name__)
++
++
++class PredictionJournal:
++    """Append prediction/outcome/drop records to per-trading-day JSONL files."""
++
++    def __init__(self, root: Path) -> None:
++        self._root = Path(root)
++
++    def record_prediction(self, prediction: Prediction, *, mode: str) -> None:
++        self._append(
++            prediction.event_ts_utc,
++            {
++                "type": "prediction",
++                "mode": mode,
++                "bundle_id": prediction.model_id,
++                "ts_utc": prediction.event_ts_utc,
++                "prediction_id": prediction.prediction_id,
++                "touch_id": prediction.touch_id,
++                "observation_id": prediction.observation_id,
++                "predicted_class": prediction.predicted_class,
++                "probabilities": dict(prediction.probabilities),
++                "feature_values": dict(prediction.feature_values),
++                "is_eligible": prediction.is_eligible,
++                "direction": prediction.direction,
++                "session": prediction.session,
++                "level_kind": prediction.level_kind,
++                "level_price_ticks": prediction.level_price_ticks,
++                "contract_id": prediction.contract_id,
++                "nan_count": prediction.nan_count,
++            },
++        )
++
++    def record_outcome(self, outcome: Outcome, *, mode: str, bundle_id: str | None) -> None:
++        self._append(
++            outcome.resolved_ts_utc,
++            {
++                "type": "outcome",
++                "mode": mode,
++                "bundle_id": bundle_id,
++                "ts_utc": outcome.resolved_ts_utc,
++                "outcome_id": outcome.outcome_id,
++                "prediction_id": outcome.prediction_id,
++                "touch_id": outcome.touch_id,
++                "resolution_type": outcome.resolution_type.value,
++                "actual_class": outcome.actual_class,
++                "predicted_class": outcome.predicted_class,
++                "correct": outcome.correct,
++                "max_mfe_pts": outcome.max_mfe_pts,
++                "max_mae_pts": outcome.max_mae_pts,
++                "bars_to_resolution": outcome.bars_to_resolution,
++                "entry_price": outcome.entry_price,
++            },
++        )
++
++    def record_drop(
++        self, drop: DroppedPrediction, *, mode: str, bundle_id: str | None
++    ) -> None:
++        self._append(
++            drop.decision_ts_utc,
++            {
++                "type": "drop",
++                "mode": mode,
++                "bundle_id": bundle_id,
++                "ts_utc": drop.decision_ts_utc,
++                "prediction_id": drop.prediction_id,
++                "touch_id": drop.touch_id,
++                "reason": drop.reason,
++                "entry_price": drop.entry_price,
++            },
++        )
++
++    def _append(self, ts_utc: datetime | None, payload: dict[str, Any]) -> None:
++        try:
++            day = trading_day_for(ts_utc) if ts_utc is not None else None
++            name = f"{day.isoformat()}.jsonl" if day is not None else "undated.jsonl"
++            self._root.mkdir(parents=True, exist_ok=True)
++            line = json.dumps(payload, default=_json_default, separators=(",", ":"))
++            with (self._root / name).open("a", encoding="utf-8") as handle:
++                handle.write(line + "\n")
++        except Exception:
++            logger.warning("prediction journal append failed", exc_info=True)
++
++
++def _json_default(value: Any) -> Any:
++    if isinstance(value, datetime):
++        return value.isoformat()
++    if hasattr(value, "value"):
++        return value.value
++    return str(value)
+diff --git a/backend/src/trade_lab/services/live.py b/backend/src/trade_lab/services/live.py
+index b2ff75c..90032f4 100644
+--- a/backend/src/trade_lab/services/live.py
++++ b/backend/src/trade_lab/services/live.py
+@@ -4,6 +4,14 @@ Live and replay deliberately share ``ApplicationRuntime.process_market_event`` s
+ bars, levels, touches, observations, and WebSocket deltas cannot diverge. This
+ controller never auto-starts; an operator API call is required because live market
+ data uses paid credentials and should not surprise-connect during app startup.
++
++W2 (D-P-06): on start the runtime resets, the prior trading day's PDH/PDL seed
++loads through the same ``load_prior_day_summary`` path research and cold replay
++use, and the feed replays the CURRENT trading day from 18:00 ET before going real
++time (the adapter's intraday replay-start, or its Historical fallback). A feed
++disconnect re-runs that exact start path, so a reconnect can never resume on a
++wiped, context-free runtime. The Chicago display seed is retired — display warm-up
++now comes from real engine bars produced by the warm-start replay.
+ """
+ 
+ import asyncio
+@@ -18,16 +26,18 @@ from typing import cast
+ from strategy_core.runtime import LiveRuntime as CoreLiveRuntime
+ from strategy_core.runtime import LiveState as CoreLiveState
+ 
+-from trade_lab.domain.data_quality import (
+-    DataQualityCode,
+-    DataQualitySeverity,
+-    DataQualityWarning,
+-)
++from trade_lab.adapters.databento_historical import DatabentoHistoricalSource
++from trade_lab.domain.data_quality import DataQualityWarning
+ from trade_lab.domain.events import MarketEvent
+ from trade_lab.domain.feed import FeedConnectionState, FeedStatus
++from trade_lab.domain.prices import price_to_ticks
++from trade_lab.domain.trading_day import (
++    prior_trading_day,
++    trading_day_bounds_utc,
++    trading_day_for,
++)
+ from trade_lab.ports.market_data import MarketDataFeed
+ from trade_lab.services.runtime import ApplicationRuntime, RuntimeUpdate, _safe_text
+-from trade_lab.services.seed import HistoricalSeedService
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -74,6 +84,10 @@ class LiveStatus:
+     last_error: str | None = None
+     started_at_utc: datetime | None = None
+     stopped_at_utc: datetime | None = None
++    #: W2 P1b: "warming" while the engine is digesting the trading day's replayed
++    #: events (event ts < the start wall clock); "live" once real-time events flow.
++    warm_start_state: str | None = None
++    warm_start_events: int = 0
+ 
+ 
+ FeedFactory = Callable[[LiveConfig], MarketDataFeed]
+@@ -89,13 +103,17 @@ class LiveMarketDataService:
+         feed_factory: FeedFactory,
+         *,
+         on_update: Callable[[RuntimeUpdate], Awaitable[None]] | None = None,
+-        seed_service: HistoricalSeedService | None = None,
++        historical_source: DatabentoHistoricalSource | None = None,
++        reconnect_delay_seconds: float = 1.0,
++        now_provider: Callable[[], datetime] | None = None,
+     ) -> None:
+         self.runtime = runtime
+         self.config = config
+         self._feed_factory = feed_factory
+         self._on_update = on_update
+-        self._seed_service = seed_service
++        self._historical_source = historical_source
++        self._reconnect_delay_seconds = max(reconnect_delay_seconds, 0.01)
++        self._now = now_provider or (lambda: datetime.now(UTC))
+         self._state = LiveState.IDLE
+         self._events_processed = 0
+         self._last_error: str | None = None
+@@ -104,13 +122,17 @@ class LiveMarketDataService:
+         self._stopped_at_utc: datetime | None = None
+         self._task: asyncio.Task[None] | None = None
+         self.strategy_core_live: CoreLiveRuntime | None = None
+-        self._seed_task: asyncio.Task[None] | None = None
+-        # audit #NN-5: monotonic token identifying the current live/runtime generation.
+-        # Each start() bumps it; an in-flight warm-up seed task carries the generation it
+-        # was started for and no-ops if a disconnect+restart has since reset the runtime.
+-        self._generation = 0
+         self._feed: MarketDataFeed | None = None
+         self._lock = asyncio.Lock()
++        # W2 P1b warm-start marking: events older than the start wall clock are the
++        # replayed trading day ("warming"); the first at/after it flips to "live".
++        self._warm_anchor_utc: datetime | None = None
++        self._warm_start_state: str | None = None
++        self._warm_start_events = 0
++        # W2 P1d: a feed disconnect schedules this task to re-run the full start
++        # path (reset + prior-day seed + trading-day replay), killing the old
++        # wipe-without-recovery behavior.
++        self._reconnect_task: asyncio.Task[None] | None = None
+ 
+     @property
+     def has_update_callback(self) -> bool:
+@@ -154,6 +176,8 @@ class LiveMarketDataService:
+             last_error=last_error,
+             started_at_utc=started_at_utc,
+             stopped_at_utc=stopped_at_utc,
++            warm_start_state=self._warm_start_state,
++            warm_start_events=self._warm_start_events,
+         )
+ 
+     async def start(self) -> None:
+@@ -173,21 +197,20 @@ class LiveMarketDataService:
+             self._started_at_utc = datetime.now(UTC)
+             self._stopped_at_utc = None
+             self.strategy_core_live = None
+-            # audit #NN-5: a restart resets the runtime below, so any warm-up seed task
+-            # left running from a prior (auto-disconnected) connection is now stale. Bump
+-            # the generation token and cancel the orphan so it cannot inject stale bars
+-            # into the freshly reset runtime; the generation guard in _seed_and_broadcast
+-            # is the backstop if the cancel loses the race with an in-flight fetch.
+-            self._generation += 1
+-            if self._seed_task is not None and not self._seed_task.done():
+-                self._seed_task.cancel()
+             if self.config.reset_runtime_on_start:
+                 await self._emit(
+                     self.runtime.reset(
+                         requested_symbol=self.config.requested_symbol,
+                         feed_message="runtime reset for live market data",
++                        reset_reason="live_reset",
+                     )
+                 )
++            # W2 P1c: the prior trading day's PDH/PDL through the SAME seed path
++            # research and cold replay use — before any event reaches the engine.
++            await self._load_prior_day_summary()
++            self._warm_anchor_utc = self._now()
++            self._warm_start_state = "warming"
++            self._warm_start_events = 0
+             await self._emit_status(FeedConnectionState.CONNECTING, "live feed connecting")
+             feed: MarketDataFeed | None = None
+             try:
+@@ -229,23 +252,15 @@ class LiveMarketDataService:
+                 ) from exc
+             self._state = LiveState.RUNNING
+             await self._emit_status(FeedConnectionState.CONNECTED, "live feed running")
+-            # Warm-up runs off the event loop and broadcasts when ready, so the live
+-            # connection is never blocked by the historical fetch. It is scheduled after
+-            # the runtime reset above so its bars are not cleared by the reset.
+-            if self._seed_service is not None and self._seed_service.enabled:
+-                # audit #NN-5: bind this seed task to the current generation so it can
+-                # detect (and skip) seeding if a later restart resets the runtime.
+-                self._seed_task = asyncio.create_task(
+-                    self._seed_and_broadcast(self._generation)
+-                )
+             self._task = asyncio.create_task(self._wait_strategy_core_live())
+ 
+     async def stop(self) -> None:
+         async with self._lock:
+-            if self._seed_task is not None and not self._seed_task.done():
+-                self._seed_task.cancel()
++            if self._reconnect_task is not None and not self._reconnect_task.done():
++                self._reconnect_task.cancel()
+                 with suppress(asyncio.CancelledError):
+-                    await self._seed_task
++                    await self._reconnect_task
++            self._reconnect_task = None
+             core = self.strategy_core_live
+             if core is not None:
+                 await core.stop()
+@@ -257,15 +272,59 @@ class LiveMarketDataService:
+             self._feed = None
+             self._state = LiveState.STOPPED
+             self._stopped_at_utc = datetime.now(UTC)
++            # W2 P2a (F10): finalize open setups whose cutoff has already passed;
++            # the flushed drops ride the normal drop -> DroppedPrediction surface.
++            await self._emit(self.runtime.flush_resolver(datetime.now(UTC)))
+             await self._emit_status(FeedConnectionState.DISCONNECTED, "live feed stopped")
+ 
++    async def _load_prior_day_summary(self) -> None:
++        """W2 P1c: seed PDH/PDL from the prior trading day's ohlcv-1h summary."""
++
++        source = self._historical_source
++        if source is None or not source.available:
++            logger.warning(
++                "prior-day summary skipped: Databento Historical access is not "
++                "configured (PDH/PDL emit only after the first in-stream day roll)"
++            )
++            return
++        try:
++            day = prior_trading_day(trading_day_for(self._now()))
++            start, end = trading_day_bounds_utc(day)
++            frame = await asyncio.to_thread(lambda: source.ohlcv_frame(start=start, end=end))
++            if frame is None or len(frame) == 0:
++                logger.warning("prior-day summary fetch returned no bars for %s", day)
++                return
++            high_ticks = price_to_ticks(str(float(frame["high"].max())))
++            low_ticks = price_to_ticks(str(float(frame["low"].min())))
++            self.runtime.levels.load_prior_day_summary(day, high_ticks, low_ticks)
++            logger.info("prior-day summary loaded for %s", day)
++        except asyncio.CancelledError:
++            raise
++        except Exception as exc:
++            logger.warning(
++                "prior-day summary fetch failed (exception_type=%s); PDH/PDL emit "
++                "only after the first in-stream day roll",
++                type(exc).__name__,
++            )
++
+     def _process_live_item(self, item: object) -> RuntimeUpdate:
+         if isinstance(item, FeedStatus):
+             return self.runtime.set_feed_status(item)
+         if isinstance(item, DataQualityWarning):
+             return self.runtime.record_warning(item)
++        self._mark_warm_start(item)
+         return self.runtime.process_market_event(cast(MarketEvent, item))
+ 
++    def _mark_warm_start(self, item: object) -> None:
++        anchor = self._warm_anchor_utc
++        ts = getattr(item, "event_ts_utc", None)
++        if anchor is None or ts is None:
++            return
++        if ts < anchor:
++            self._warm_start_events += 1
++        elif self._warm_start_state != "live":
++            self._warm_start_state = "live"
++
+     async def _wait_strategy_core_live(self) -> None:
+         core = self.strategy_core_live
+         if core is None:
+@@ -279,12 +338,11 @@ class LiveMarketDataService:
+         self._stopped_at_utc = status.stopped_at_utc
+         if status.state == CoreLiveState.DISCONNECTED and self._state == LiveState.RUNNING:
+             self._state = LiveState.DISCONNECTED
+-            # audit #NN-5: deliberately do NOT cancel self._seed_task here. A bare
+-            # disconnect does not reset the runtime, so an in-flight warm-up is still
+-            # valid for the current generation (the empty-feed-then-seed path relies on
+-            # this). The orphaning race is closed instead at restart (start() cancels +
+-            # bumps the generation) and by the generation guard in _seed_and_broadcast.
+             await self._emit_status(FeedConnectionState.DISCONNECTED, "live feed disconnected")
++            # W2 P1d (D-P-06): reconnect = the same warm-start path. start() resets
++            # the runtime, reloads the prior-day seed, and replays the trading day
++            # from 18:00 ET before resuming real time.
++            self._schedule_reconnect()
+         elif status.state == CoreLiveState.FAILED:
+             self._state = LiveState.FAILED
+             # audit #N6: the migration dropped the old failure logger.error call, so a
+@@ -299,46 +357,24 @@ class LiveMarketDataService:
+             )
+             await self._emit_status(FeedConnectionState.DISCONNECTED, "live feed failed")
+ 
+-    async def _seed_and_broadcast(self, generation: int) -> None:
+-        service = self._seed_service
+-        if service is None:
++    def _schedule_reconnect(self) -> None:
++        if self._reconnect_task is not None and not self._reconnect_task.done():
++            return
++        self._reconnect_task = asyncio.create_task(self._reconnect_after_disconnect())
++
++    async def _reconnect_after_disconnect(self) -> None:
++        await asyncio.sleep(self._reconnect_delay_seconds)
++        if self._state != LiveState.DISCONNECTED:
+             return
++        logger.info("live feed reconnecting from the trading-day start (D-P-06)")
+         try:
+-            bars = await asyncio.to_thread(service.build_seed_bars)
+-        except asyncio.CancelledError:
+-            raise
++            await self.start()
+         except Exception as exc:
+-            logger.warning(
+-                "historical warm-up seeding task failed: exception_type=%s", type(exc).__name__
+-            )
+-            bars = ()
+-        # audit #NN-5: history fetch above runs off-thread and can outlive its
+-        # connection. If a disconnect+restart advanced the generation while we were
+-        # fetching, this task belongs to a torn-down runtime; drop the result rather
+-        # than seed (possibly stale) bars or warnings into the freshly reset runtime.
+-        if generation != self._generation:
+-            return
+-        if bars:
+-            logger.info("historical warm-up seeded %d bars", len(bars))
+-            await self._emit(self.runtime.seed_closed_bars(bars))
+-            return
+-        # Surface (rather than silently swallow) so an empty chart is explained in the UI.
+-        logger.warning("historical warm-up produced no seed bars")
+-        await self._emit(
+-            RuntimeUpdate(
+-                warnings=(
+-                    DataQualityWarning(
+-                        code=DataQualityCode.PROVIDER_ERROR,
+-                        message=(
+-                            "live warm-up history unavailable; chart starts without prior "
+-                            "sessions and will fill as live trades arrive"
+-                        ),
+-                        severity=DataQualitySeverity.WARNING,
+-                        source="seed",
+-                    ),
+-                )
++            logger.error(
++                "live auto-reconnect failed: exception_type=%s message=%s",
++                type(exc).__name__,
++                _redact_configured_secrets(str(exc), self.config.secret_values),
+             )
+-        )
+ 
+     async def _emit_status(self, state: FeedConnectionState, message: str) -> None:
+         await self._emit(
+diff --git a/backend/src/trade_lab/services/model_registry.py b/backend/src/trade_lab/services/model_registry.py
+index b216e5a..028eb1b 100644
+--- a/backend/src/trade_lab/services/model_registry.py
++++ b/backend/src/trade_lab/services/model_registry.py
+@@ -411,6 +411,22 @@ class ModelRegistry:
+         :class:`ModelValidationError` (fail closed) if the loaded model disagrees
+         with its contract. The prior active model is only replaced after the new
+         one fully validates, so a failed activation leaves the registry unchanged.
++
++        W2 P2b: composed from :meth:`prepare_activation` (everything that can
++        fail) + :meth:`commit_activation` (the lock-swap) so the app can commit
++        the registry swap and the runtime's engine rebind together, with no
++        awaits between them.
++        """
++
++        active = self.prepare_activation(model_id)
++        self.commit_activation(active)
++        return active
++
++    def prepare_activation(self, model_id: str) -> ActiveModel:
++        """Validate + load ``model_id`` fully WITHOUT touching the active slot.
++
++        Any failure here leaves the previously active model serving, untouched
++        (F12): the registry swap happens only in :meth:`commit_activation`.
+         """
+ 
+         if not is_safe_model_id(model_id):
+@@ -456,7 +472,7 @@ class ModelRegistry:
+         if not validation_ok:
+             raise ModelValidationError(validation_detail)
+         model = self._load_and_validate_model(directory, contract)
+-        active = ActiveModel(
++        return ActiveModel(
+             model_id=model_id,
+             model=model,
+             contract=contract,
+@@ -464,9 +480,12 @@ class ModelRegistry:
+             validation_ok=validation_ok,
+             validation_detail=validation_detail,
+         )
++
++    def commit_activation(self, active: ActiveModel) -> None:
++        """Swap a fully-validated :class:`ActiveModel` in under the lock."""
++
+         with self._lock:
+             self._active = active
+-        return active
+ 
+     def deactivate(self) -> None:
+         """Unload the active model. Market data continues to be served."""
+diff --git a/backend/src/trade_lab/services/replay.py b/backend/src/trade_lab/services/replay.py
+index e216650..f3f56cf 100644
+--- a/backend/src/trade_lab/services/replay.py
++++ b/backend/src/trade_lab/services/replay.py
+@@ -200,6 +200,7 @@ class HistoricalReplayService:
+             self.runtime.reset(
+                 requested_symbol=config.requested_symbol,
+                 feed_message="runtime reset for historical replay",
++                reset_reason="replay_reset",
+             )
+         )
+         await self._emit(
+@@ -290,6 +291,12 @@ class HistoricalReplayService:
+         await core.start(CoreReplayConfig(speed=config.speed, max_events=config.max_events))
+         await self._flush_pending()
+         status = core.status()
++        # W2 P2a (F10): the bar stream has ended — finalize open setups whose
++        # cutoff is at/before the last replayed instant; the flushed drops ride
++        # the same drop -> DroppedPrediction surface as in-stream drops.
++        resolver_update = self.runtime.flush_resolver(status.last_event_ts_utc)
++        self._accumulate(resolver_update)
++        await self._flush_pending()
+         self._events_processed = status.events_processed
+         self._warnings_recorded = status.warnings_recorded
+         self._last_event_ts_utc = status.last_event_ts_utc
+@@ -438,9 +445,12 @@ def _coalesce_replay_updates(updates: list[RuntimeUpdate]) -> RuntimeUpdate:
+     # 'dropped' (prediction.dropped) is event-style for the same reason.
+     outcomes = list(merged.outcomes)
+     dropped = list(merged.dropped)
++    model_reset_reason = merged.model_reset_reason
+     for update in updates:
+         if update.feed_status is not None:
+             feed_status = update.feed_status
++        if update.model_reset_reason is not None:
++            model_reset_reason = update.model_reset_reason
+         if update.warnings:
+             warnings.extend(update.warnings)
+         if update.current_bars:
+@@ -470,6 +480,7 @@ def _coalesce_replay_updates(updates: list[RuntimeUpdate]) -> RuntimeUpdate:
+         predictions=tuple(predictions),
+         outcomes=tuple(outcomes),
+         dropped=tuple(dropped),
++        model_reset_reason=model_reset_reason,
+     )
+ 
+ 
+diff --git a/backend/src/trade_lab/services/runtime.py b/backend/src/trade_lab/services/runtime.py
+index 5dc7faf..17d1a2a 100644
+--- a/backend/src/trade_lab/services/runtime.py
++++ b/backend/src/trade_lab/services/runtime.py
+@@ -30,12 +30,14 @@ from trade_lab.domain.levels import DisplayLevel, TouchEvent
+ from trade_lab.domain.market_context import DEFAULT_RETENTION_MINUTES, MarketContextBuffer
+ from trade_lab.domain.observations import Observation, ObservationEngine, ObservationStatus
+ from trade_lab.domain.outcomes import DroppedPrediction, Outcome
++from trade_lab.services.inference.features import FeatureComputationError
+ from trade_lab.services.inference.inference_engine import InferenceEngine, Prediction
+ from trade_lab.services.inference.resolution_adapter import (
+     drop_to_dropped,
+     parse_bar_type,
+     resolution_to_outcome,
+ )
++from trade_lab.services.journal import PredictionJournal
+ from trade_lab.services.strategy_core_service import StrategyCoreService
+ 
+ logger = logging.getLogger(__name__)
+@@ -57,6 +59,10 @@ class RuntimeUpdate:
+     predictions: tuple[Prediction, ...] = ()
+     outcomes: tuple[Outcome, ...] = ()
+     dropped: tuple[DroppedPrediction, ...] = ()
++    #: W2 P2c: when set, the broadcaster emits a typed ``model.reset`` frame with
++    #: this reason ("activation" | "replay_reset" | "live_reset") — replacing the
++    #: frontend's 'runtime reset' feed-message substring trigger.
++    model_reset_reason: str | None = None
+ 
+     def has_deltas(self) -> bool:
+         return any(
+@@ -71,10 +77,20 @@ class RuntimeUpdate:
+                 self.predictions,
+                 self.outcomes,
+                 self.dropped,
++                self.model_reset_reason is not None,
+             )
+         )
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class _PreparedRebind:
++    """W2 P2b: a fully-constructed engine rebind awaiting its atomic commit."""
++
++    engine: InferenceEngine | None
++    resolver: StreamingHonestResolver | None
++    market_context_retention: timedelta
++
++
+ @dataclass(frozen=True, slots=True)
+ class ModelStatus:
+     """Path-free, secret-free view of the active inference model for the API edge.
+@@ -130,6 +146,7 @@ class ApplicationRuntime:
+         prediction_limit: int = 500,
+         outcome_limit: int = 500,
+         inference_engine: InferenceEngine | None = None,
++        journal: PredictionJournal | None = None,
+     ) -> None:
+         if warning_limit <= 0:
+             raise ValueError("warning_limit must be positive")
+@@ -179,12 +196,21 @@ class ApplicationRuntime:
+         self._observation_duration_seconds = observation_duration_seconds
+         # D1b: the SC streaming honest resolver IS the serving outcome path (the D1a
+         # dark seat promoted; the legacy level-anchored OutcomeTracker is retired).
+-        self._honest_resolver: StreamingHonestResolver | None = self._build_honest_resolver(
+-            inference_engine
+-        )
+         # W1 P3b: a constructor-supplied engine gets the same contract-driven
+         # retention a hot-swap would apply.
+-        self._apply_market_context_retention(inference_engine)
++        ctor_active = inference_engine.active() if inference_engine is not None else None
++        self._honest_resolver: StreamingHonestResolver | None = self._build_honest_resolver(
++            None if ctor_active is None else ctor_active.contract
++        )
++        self.market_context.set_retention(self._market_context_retention_for(ctor_active))
++        # W2 P2e (D-P-07): append-only prediction/outcome/drop journaling so
++        # serving evidence survives restarts. Write-only this window.
++        self._journal = journal
++        # W2 P2d: named-feature inference failure diagnostics, surfaced on the
++        # status endpoint. Deliberately NOT cleared by reset() — they are
++        # process-lifetime serving health, not per-session market state.
++        self._inference_error_count = 0
++        self._last_inference_error: dict[str, str | None] | None = None
+         self._warnings: list[DataQualityWarning] = []
+         self._recent_closed_bars: list[Candle] = []
+         # Historical warm-up bars kept separate from the rolling live buffer so live
+@@ -205,6 +231,7 @@ class ApplicationRuntime:
+         requested_symbol: str | None = None,
+         preserve_warnings: bool = False,
+         feed_message: str = "Runtime reset for replay.",
++        reset_reason: str | None = None,
+     ) -> RuntimeUpdate:
+         """Reset all derived runtime state before a new replay session.
+ 
+@@ -243,7 +270,7 @@ class ApplicationRuntime:
+             requested_symbol=self.requested_symbol,
+             last_message=feed_message,
+         )
+-        return RuntimeUpdate(feed_status=self._feed_status)
++        return RuntimeUpdate(feed_status=self._feed_status, model_reset_reason=reset_reason)
+ 
+     @property
+     def feed_status(self) -> FeedStatus:
+@@ -259,17 +286,86 @@ class ApplicationRuntime:
+         Called on model hot-swap: an activation switches the engine's active model,
+         so prior predictions belong to a different contract and must be dropped to
+         avoid mixing bundles in one session. Market-data state is untouched.
++
++        W2 P2b: composed from :meth:`prepare_inference_rebind` (everything that can
++        raise) + :meth:`commit_inference_rebind` (the assignment, cannot raise) so
++        the activation endpoint can validate fully BEFORE the registry swap and
++        commit both together with no awaits between them.
++        """
++
++        active = engine.active() if engine is not None else None
++        self.commit_inference_rebind(self.prepare_inference_rebind(engine, active))
++
++    def prepare_inference_rebind(
++        self, engine: InferenceEngine | None, active: "Any"
++    ) -> "_PreparedRebind":
++        """Build everything an engine rebind needs, WITHOUT mutating the runtime.
++
++        ``active`` is the CANDIDATE ActiveModel (may differ from the registry's
++        current one during an atomic activation). Resolver construction fails loud
++        here — before any swap — so a bad activation leaves the serving state
++        untouched (F12).
++        """
++
++        resolver = (
++            None if active is None else self._build_honest_resolver(active.contract)
++        )
++        return _PreparedRebind(
++            engine=engine,
++            resolver=resolver,
++            market_context_retention=self._market_context_retention_for(active),
++        )
++
++    def commit_inference_rebind(self, prepared: "_PreparedRebind") -> None:
++        """Apply a prepared rebind: pure assignment, no I/O, nothing can raise.
++
++        Called together with the registry swap (no awaits between) so concurrent
++        readers on the event loop always see a consistent (registry, resolver,
++        retention) triple.
+         """
+ 
+-        self._inference_engine = engine
++        self._inference_engine = prepared.engine
+         self._predictions.clear()
+         self._outcomes.clear()
+         self._dropped.clear()
+         self._open_predictions.clear()
+-        self._honest_resolver = self._build_honest_resolver(engine)
+-        self._apply_market_context_retention(engine)
++        self._honest_resolver = prepared.resolver
++        self.market_context.set_retention(prepared.market_context_retention)
+ 
+-    def _apply_market_context_retention(self, engine: InferenceEngine | None) -> None:
++    def flush_resolver(self, now_ts_utc=None) -> RuntimeUpdate:
++        """W2 P2a (F10): finalize open setups whose cutoff is at/before ``now``.
++
++        Wired at replay stream end (last event instant), live stop (wall clock),
++        and hot-swap (the OLD resolver, before the new one is built). Flushed
++        drops flow through the existing drop -> DroppedPrediction adapter onto
++        the same WS/status surfaces as in-stream drops, and are journaled.
++        """
++
++        resolver = self._honest_resolver
++        if resolver is None:
++            return RuntimeUpdate()
++        if now_ts_utc is None:
++            now_ts_utc = self._feed_status.last_event_ts_utc
++        if now_ts_utc is None:
++            return RuntimeUpdate()
++        try:
++            emitted = resolver.flush(now_ts_utc)
++        except Exception:
++            logger.warning("honest-resolver flush failed", exc_info=True)
++            return RuntimeUpdate()
++        dropped: list[DroppedPrediction] = []
++        for drop in emitted:
++            prediction = self._open_predictions.pop(drop.key, None)
++            if prediction is None:
++                logger.warning("honest-resolver flush emission has no open prediction")
++                continue
++            served = drop_to_dropped(drop, prediction)
++            self._append_dropped(served)
++            dropped.append(served)
++        self._journal_records((), (), tuple(dropped))
++        return RuntimeUpdate(dropped=tuple(dropped))
++
++    def _market_context_retention_for(self, active: "Any") -> timedelta:
+         """W1 P3b: buffer retention follows the ACTIVE contract's feature windows.
+ 
+         Effective retention = approach + interaction + slack minutes (inference
+@@ -283,34 +379,29 @@ class ApplicationRuntime:
+         """
+ 
+         minutes = self._market_context_retention_minutes
+-        active = engine.active() if engine is not None else None
+-        if active is not None:
+-            windows = active.section.feature_windows
++        section = getattr(active, "section", None) if active is not None else None
++        if section is not None:
++            windows = section.feature_windows
+             minutes = (
+                 windows.approach_window_minutes
+                 + windows.interaction_window_minutes
+                 + MARKET_CONTEXT_RETENTION_SLACK_MINUTES
+             )
+-        self.market_context.set_retention(timedelta(minutes=minutes))
++        return timedelta(minutes=minutes)
+ 
+-    def _build_honest_resolver(
+-        self, engine: InferenceEngine | None
+-    ) -> StreamingHonestResolver | None:
++    def _build_honest_resolver(self, contract) -> StreamingHonestResolver | None:
+         """Construct the contract-specific SC streaming honest resolver.
+ 
+-        The serving outcome path (D1b): built from the active model's contract so a
++        The serving outcome path (D1b): built from the activating contract so a
+         hot-swap re-derives forward bar type + thresholds. Entry prints come from
+         the Strategy-Core runtime's trade ring via a late-binding closure so the
+         seam survives ``reset()`` swapping the service. Construction FAILS LOUD
+         when the contract's forward bar type is not among the runtime's configured
+         tick timeframes — the recon's silent-never-resolve hole — so a bad
+         activation is rejected instead of silently tracking nothing. Returns
+-        ``None`` when no engine/model is active.
++        ``None`` when no contract is supplied.
+         """
+ 
+-        if engine is None:
+-            return None
+-        contract = engine.active_contract
+         if contract is None:
+             return None
+         policy = contract.label_policy
+@@ -466,9 +557,21 @@ class ApplicationRuntime:
+                 continue
+             try:
+                 prediction = engine.predict_for_observation(observation, self.market_context)
++            except FeatureComputationError as exc:
++                # Inference must never break the market-data hot path; W2 P2d: the
++                # failing FEATURE is named, counted, and surfaced on status.
++                self._record_inference_error(exc.feature_name, observation)
++                logger.warning(
++                    "inference failed computing feature %r for a completed observation",
++                    exc.feature_name,
++                    exc_info=True,
++                )
++                continue
+             except Exception:
+-                # Inference must never break the market-data hot path.
+-                logger.warning("inference failed for a completed observation", exc_info=False)
++                self._record_inference_error(None, observation)
++                logger.warning(
++                    "inference failed for a completed observation", exc_info=True
++                )
+                 continue
+             if prediction is not None:
+                 produced.append(prediction)
+@@ -537,6 +640,48 @@ class ApplicationRuntime:
+                 del self._outcomes[: len(self._outcomes) - self._outcome_limit]
+         return tuple(resolved), tuple(dropped)
+ 
++    def _record_inference_error(self, feature_name: str | None, observation) -> None:
++        self._inference_error_count += 1
++        ts = getattr(observation, "scheduled_end_ts_utc", None)
++        self._last_inference_error = {
++            "feature_name": feature_name,
++            "ts_utc": None if ts is None else ts.isoformat(),
++        }
++
++    def inference_health(self) -> dict[str, Any]:
++        """W2 P2d: inference failure diagnostics for the status endpoint."""
++
++        return {
++            "error_count": self._inference_error_count,
++            "last_error": self._last_inference_error,
++        }
++
++    def _journal_records(
++        self,
++        predictions: tuple[Prediction, ...],
++        outcomes: tuple[Outcome, ...],
++        dropped: tuple[DroppedPrediction, ...],
++    ) -> None:
++        """W2 P2e (D-P-07): append the served records to the prediction journal.
++
++        Tagged with the runtime mode (replay|live via feed status) and the active
++        bundle id. Journal failures are logged and never break the hot path.
++        """
++
++        journal = self._journal
++        if journal is None or not (predictions or outcomes or dropped):
++            return
++        mode = self._feed_status.mode
++        engine = self._inference_engine
++        active = engine.active() if engine is not None else None
++        bundle_id = None if active is None else active.model_id
++        for prediction in predictions:
++            journal.record_prediction(prediction, mode=mode)
++        for outcome in outcomes:
++            journal.record_outcome(outcome, mode=mode, bundle_id=bundle_id)
++        for drop in dropped:
++            journal.record_drop(drop, mode=mode, bundle_id=bundle_id)
++
+     def record_warning(self, warning: DataQualityWarning) -> RuntimeUpdate:
+         warning = _safe_warning(warning)
+         self._warnings.append(warning)
+@@ -709,6 +854,9 @@ class ApplicationRuntime:
+         for touch in core_update.touches:
+             changed_observations.append(self.observations.start_from_touch(touch))
+         self._feed_status = self._feed_status_for_mode(core_update.feed_status, trade=trade)
++        self._journal_records(
++            predictions, outcomes, (*registration_drops, *terminal_drops)
++        )
+         return RuntimeUpdate(
+             feed_status=self._feed_status,
+             current_bars=core_update.current_bars,
+diff --git a/backend/src/trade_lab/services/seed.py b/backend/src/trade_lab/services/seed.py
+deleted file mode 100644
+index e241d20..0000000
+--- a/backend/src/trade_lab/services/seed.py
++++ /dev/null
+@@ -1,208 +0,0 @@
+-"""Build historical warm-up tick bars for the last N completed sessions.
+-
+-On live start the chart should already show recent context instead of waiting for
+-147/987/2000 new trades to form the first bars. This service pulls the last few
+-completed sessions of historical front-month trades as a DataFrame and builds tick
+-bars **vectorized** (PyArrow/pandas), which is ~100x faster than per-trade Python and
+-keeps a multi-day warm-up to tens of seconds. It is intentionally synchronous/blocking
+-— callers run it off the event loop (e.g. ``asyncio.to_thread``).
+-
+-``build_tick_bars_from_frame`` is a legacy warm-up helper for display context only;
+-authoritative live/replay runtime bars, sessions, levels, and touches are produced
+-by Strategy-Core.
+-"""
+-
+-import logging
+-from collections import defaultdict
+-from collections.abc import Callable
+-from datetime import UTC, date, datetime, timedelta
+-from typing import TYPE_CHECKING
+-
+-from trade_lab.adapters.databento_historical import DatabentoHistoricalSource
+-from trade_lab.domain.candles import Candle, CandleCloseReason, make_bar_id
+-from trade_lab.domain.prices import NQ_TICK_SIZE
+-from trade_lab.domain.sessions import CT, classify_session, to_ct
+-
+-if TYPE_CHECKING:
+-    import pandas as pd
+-
+-logger = logging.getLogger(__name__)
+-
+-# Extra calendar days fetched beyond the requested lookback so weekends/holidays do
+-# not starve the window of N actual trading sessions.
+-_CALENDAR_PADDING_DAYS = 4
+-
+-# Chicago seconds-of-day session boundaries (must match domain.sessions.classify_session):
+-# trades at/after 16:00 and before 18:00 CT are the closed maintenance window.
+-_SESSION_CLOSE_SOD = 16 * 3600  # 16:00 CT
+-_SESSION_OPEN_SOD = 18 * 3600  # 18:00 CT (next trading day begins)
+-_TICK_SIZE = float(NQ_TICK_SIZE)
+-
+-
+-def build_tick_bars_from_frame(
+-    frame: "pd.DataFrame", timeframes: tuple[int, ...]
+-) -> list[Candle]:
+-    """Build display seed bars from historical trades without starting live replay.
+-
+-    ``frame`` must have ``ts_event`` (UTC), ``price`` (tick-aligned dollars) and
+-    ``size``. Trades in the 16:00-18:00 CT closed window are dropped for backward
+-    compatibility with existing chart warm-up behavior. The most recent session's
+-    trailing partial is emitted as an END_OF_DAY display bar.
+-    """
+-
+-    import numpy as np
+-    import pandas as pd
+-
+-    if frame is None or len(frame) == 0:
+-        return []
+-
+-    ts = frame["ts_event"]
+-    if not pd.api.types.is_datetime64_any_dtype(ts):
+-        ts = pd.to_datetime(ts, utc=True, unit="ns")
+-    elif ts.dt.tz is None:
+-        ts = ts.dt.tz_localize("UTC")
+-    else:
+-        ts = ts.dt.tz_convert("UTC")
+-
+-    price_ticks = np.rint(frame["price"].to_numpy(dtype="float64") / _TICK_SIZE).astype("int64")
+-    work = pd.DataFrame(
+-        {
+-            "ts_event": ts.to_numpy(),
+-            "price_ticks": price_ticks,
+-            "size": frame["size"].to_numpy(dtype="int64"),
+-        }
+-    )
+-    work["ts_event"] = pd.to_datetime(work["ts_event"], utc=True)
+-
+-    ct = work["ts_event"].dt.tz_convert(CT)
+-    sod = ct.dt.hour * 3600 + ct.dt.minute * 60 + ct.dt.second
+-    cal_date = ct.dt.tz_localize(None).dt.floor("D")
+-    roll = (sod >= _SESSION_OPEN_SOD).astype("int64")
+-    work["trading_day"] = cal_date + pd.to_timedelta(roll, unit="D")
+-    closed = (sod >= _SESSION_CLOSE_SOD) & (sod < _SESSION_OPEN_SOD)
+-
+-    work = work[~closed].sort_values("ts_event", kind="stable").reset_index(drop=True)
+-    if work.empty:
+-        return []
+-
+-    day_groups = work.groupby("trading_day", sort=True)
+-    bars: list[Candle] = []
+-    for timeframe in sorted(set(timeframes)):
+-        work["bar_index"] = (day_groups.cumcount() // timeframe).to_numpy()
+-        agg = (
+-            work.groupby(["trading_day", "bar_index"], sort=True)
+-            .agg(
+-                open_ts=("ts_event", "first"),
+-                close_ts=("ts_event", "last"),
+-                open_ticks=("price_ticks", "first"),
+-                close_ticks=("price_ticks", "last"),
+-                high_ticks=("price_ticks", "max"),
+-                low_ticks=("price_ticks", "min"),
+-                volume=("size", "sum"),
+-                trade_count=("price_ticks", "size"),
+-            )
+-            .reset_index()
+-        )
+-        for row in agg.itertuples(index=False):
+-            trading_day = row.trading_day.date()
+-            bar_index = int(row.bar_index)
+-            complete = int(row.trade_count) == timeframe
+-            bars.append(
+-                Candle(
+-                    timeframe_ticks=timeframe,
+-                    trading_day=trading_day,
+-                    bar_index=bar_index,
+-                    bar_id=make_bar_id(timeframe, trading_day, bar_index),
+-                    open_ts_utc=row.open_ts.to_pydatetime(warn=False),
+-                    close_ts_utc=row.close_ts.to_pydatetime(warn=False),
+-                    open_ticks=int(row.open_ticks),
+-                    high_ticks=int(row.high_ticks),
+-                    low_ticks=int(row.low_ticks),
+-                    close_ticks=int(row.close_ticks),
+-                    volume=int(row.volume),
+-                    trade_count=int(row.trade_count),
+-                    is_complete=complete,
+-                    is_partial=not complete,
+-                    close_reason=(
+-                        CandleCloseReason.COMPLETE if complete else CandleCloseReason.END_OF_DAY
+-                    ),
+-                )
+-            )
+-    return bars
+-
+-
+-class HistoricalSeedService:
+-    """Produce the last N completed trading sessions of tick bars for live warm-up."""
+-
+-    def __init__(
+-        self,
+-        source: DatabentoHistoricalSource,
+-        *,
+-        tick_timeframes: tuple[int, ...],
+-        lookback_days: int = 3,
+-        max_bars_per_timeframe: int = 2500,
+-        enabled: bool = True,
+-        now_provider: Callable[[], datetime] | None = None,
+-    ) -> None:
+-        if lookback_days <= 0:
+-            raise ValueError("lookback_days must be positive")
+-        if max_bars_per_timeframe <= 0:
+-            raise ValueError("max_bars_per_timeframe must be positive")
+-        self._source = source
+-        self._tick_timeframes = tick_timeframes
+-        self._lookback_days = lookback_days
+-        self._max_bars_per_timeframe = max_bars_per_timeframe
+-        self._enabled = enabled
+-        self._now = now_provider or (lambda: datetime.now(UTC))
+-
+-    @property
+-    def enabled(self) -> bool:
+-        return self._enabled and self._source.available
+-
+-    @property
+-    def lookback_days(self) -> int:
+-        return self._lookback_days
+-
+-    def build_seed_bars(self) -> tuple[Candle, ...]:
+-        """Return closed bars for the last N completed sessions (newest sessions kept).
+-
+-        Bars dated on/after the current trading day are excluded so seed bar ids never
+-        collide with the live engine's bars for the session live is about to stream.
+-        Returns an empty tuple (never raises) when seeding is disabled/unavailable or the
+-        fetch fails, so live start is never blocked by warm-up problems.
+-        """
+-
+-        if not self.enabled:
+-            return ()
+-        now = self._now()
+-        cutoff_trading_day = self._current_trading_day(now)
+-        start = now - timedelta(days=self._lookback_days + _CALENDAR_PADDING_DAYS)
+-        try:
+-            frame = self._source.trades_frame(start=start, end=now)
+-            bars = build_tick_bars_from_frame(frame, self._tick_timeframes)
+-        except Exception:
+-            logger.warning("historical warm-up seeding failed; live will start without seed bars")
+-            return ()
+-        return self._select_recent_sessions(bars, cutoff_trading_day)
+-
+-    def _current_trading_day(self, now: datetime) -> date:
+-        info = classify_session(now)
+-        return info.trading_day if info.trading_day is not None else to_ct(now).date()
+-
+-    def _select_recent_sessions(
+-        self, bars: list[Candle], cutoff_trading_day: date
+-    ) -> tuple[Candle, ...]:
+-        eligible = [bar for bar in bars if bar.trading_day < cutoff_trading_day]
+-        if not eligible:
+-            return ()
+-        keep_days = set(sorted({bar.trading_day for bar in eligible})[-self._lookback_days :])
+-        per_timeframe: dict[int, list[Candle]] = defaultdict(list)
+-        for bar in eligible:
+-            if bar.trading_day in keep_days:
+-                per_timeframe[bar.timeframe_ticks].append(bar)
+-        selected: list[Candle] = []
+-        for tf_bars in per_timeframe.values():
+-            tf_bars.sort(key=lambda bar: (bar.trading_day, bar.bar_index))
+-            selected.extend(tf_bars[-self._max_bars_per_timeframe :])
+-        selected.sort(key=lambda bar: (bar.trading_day, bar.bar_index, bar.timeframe_ticks))
+-        return tuple(selected)
+diff --git a/backend/tests/test_api_contract.py b/backend/tests/test_api_contract.py
+index c1a9803..8b4a360 100644
+--- a/backend/tests/test_api_contract.py
++++ b/backend/tests/test_api_contract.py
+@@ -192,7 +192,10 @@ def test_status_includes_runtime_fields_and_supported_timeframes_without_secrets
+             "last_error": None,
+             "started_at_utc": None,
+             "stopped_at_utc": None,
++            "warm_start_state": None,
++            "warm_start_events": 0,
+         },
++        "inference": {"error_count": 0, "last_error": None},
+     }
+     _assert_no_secret_text(payload)
+ 
+diff --git a/backend/tests/test_honest_resolver_serving.py b/backend/tests/test_honest_resolver_serving.py
+index e3423d8..9b22f1b 100644
+--- a/backend/tests/test_honest_resolver_serving.py
++++ b/backend/tests/test_honest_resolver_serving.py
+@@ -15,7 +15,7 @@ import json
+ import logging
+ from datetime import UTC, datetime, timedelta
+ from pathlib import Path
+-from types import MappingProxyType
++from types import MappingProxyType, SimpleNamespace
+ 
+ import pytest
+ from strategy_core import load_strategy_contract
+@@ -42,8 +42,17 @@ class _FakeEngine:
+         self.has_active_model = True
+         self._counter = 0
+ 
+-    def active(self):  # model_status() probe; not under test here.
+-        return None
++    def active(self):
++        # W2 P2b: the runtime's rebind reads the ActiveModel-shaped probe
++        # (contract for the resolver; section for retention — None keeps the
++        # configured baseline, which is not under test here).
++        return SimpleNamespace(
++            contract=self.active_contract,
++            section=None,
++            model_id="m-1",
++            validation_ok=True,
++            validation_detail="fake",
++        )
+ 
+     def predict_for_observation(self, observation, market_context) -> Prediction:
+         self._counter += 1
+diff --git a/backend/tests/test_inference_api.py b/backend/tests/test_inference_api.py
+index 3d18dc4..531e5eb 100644
+--- a/backend/tests/test_inference_api.py
++++ b/backend/tests/test_inference_api.py
+@@ -103,6 +103,8 @@ def _settings(tmp_path: Path, *, with_token: bool = False) -> Settings:
+         "front_month_symbol": "NQ.c.0",
+         "models_path": tmp_path,
+         "databento_api_key": "super-secret-key",
++        # W2 P2e: keep test journals inside the test tmp dir, never the repo.
++        "journal_path": tmp_path / "journal",
+     }
+     if with_token:
+         kwargs["operator_token"] = _OPERATOR_TOKEN
+@@ -193,8 +195,12 @@ def test_activate_broadcasts_model_status_over_websocket(tmp_path: Path) -> None
+         activate = client.post("/api/v1/models/activate", json={"model_id": "good-model"})
+         assert activate.status_code == 200
+ 
++        # W2 P2c: a typed model.reset frame precedes the model.status delta.
++        model_reset = json.loads(websocket.receive_bytes())
+         model_status = json.loads(websocket.receive_bytes())
+ 
++    assert model_reset["type"] == "model.reset"
++    assert model_reset["payload"] == {"reason": "activation"}
+     assert model_status["version"] == MESSAGE_VERSION
+     assert model_status["type"] == "model.status"
+     assert model_status["sequence"] > snapshot["sequence"]
+diff --git a/backend/tests/test_journal.py b/backend/tests/test_journal.py
+new file mode 100644
+index 0000000..374e48a
+--- /dev/null
++++ b/backend/tests/test_journal.py
+@@ -0,0 +1,100 @@
++"""W2 P2e (D-P-07): append-only prediction journal — record shape + 18:00 ET roll."""
++
++import json
++from datetime import UTC, datetime
++from pathlib import Path
++from types import MappingProxyType
++
++from trade_lab.domain.outcomes import DroppedPrediction, Outcome, ResolutionType
++from trade_lab.services.inference.inference_engine import Prediction
++from trade_lab.services.journal import PredictionJournal
++
++
++def _prediction(ts: datetime) -> Prediction:
++    return Prediction(
++        prediction_id="pred-1",
++        touch_id="touch-1",
++        observation_id="obs-1",
++        event_ts_utc=ts,
++        predicted_class="tradeable_reversal",
++        probabilities=MappingProxyType({"tradeable_reversal": 0.8, "trap_reversal": 0.2}),
++        feature_values=MappingProxyType({"interaction_dwell_time": 1.5}),
++        level_kind="pdh",
++        level_price_ticks=80_000,
++        direction="short",
++        session="ny",
++        is_eligible=True,
++        model_id="bundle-a",
++        contract_id="bundle-a",
++        nan_count=0,
++    )
++
++
++def _outcome(ts: datetime) -> Outcome:
++    return Outcome(
++        outcome_id="out-1",
++        prediction_id="pred-1",
++        touch_id="touch-1",
++        resolution_type=ResolutionType.TP_HIT,
++        actual_class="tradeable_reversal",
++        predicted_class="tradeable_reversal",
++        correct=True,
++        max_mfe_pts=16.0,
++        max_mae_pts=3.5,
++        bars_to_resolution=4,
++        resolved_ts_utc=ts,
++        entry_price=20_001.25,
++    )
++
++
++def _read_lines(path: Path) -> list[dict]:
++    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
++
++
++def test_journal_records_prediction_outcome_and_drop_shapes(tmp_path: Path) -> None:
++    journal = PredictionJournal(tmp_path / "journal")
++    ts = datetime(2026, 6, 11, 14, 30, tzinfo=UTC)  # 10:30 ET -> trading day 2026-06-11
++
++    journal.record_prediction(_prediction(ts), mode="live")
++    journal.record_outcome(_outcome(ts), mode="live", bundle_id="bundle-a")
++    journal.record_drop(
++        DroppedPrediction("pred-2", "touch-2", "flatten", ts),
++        mode="replay",
++        bundle_id="bundle-a",
++    )
++
++    lines = _read_lines(tmp_path / "journal" / "2026-06-11.jsonl")
++    assert [line["type"] for line in lines] == ["prediction", "outcome", "drop"]
++    prediction = lines[0]
++    assert prediction["mode"] == "live"
++    assert prediction["bundle_id"] == "bundle-a"
++    assert prediction["probabilities"] == {"tradeable_reversal": 0.8, "trap_reversal": 0.2}
++    assert prediction["feature_values"] == {"interaction_dwell_time": 1.5}
++    assert prediction["is_eligible"] is True
++    outcome = lines[1]
++    assert outcome["resolution_type"] == "tp_hit"
++    assert outcome["correct"] is True
++    assert outcome["entry_price"] == 20_001.25
++    drop = lines[2]
++    assert drop["mode"] == "replay"
++    assert drop["reason"] == "flatten"
++
++
++def test_journal_rotates_at_the_1800_et_roll(tmp_path: Path) -> None:
++    journal = PredictionJournal(tmp_path)
++    before_roll = datetime(2026, 6, 11, 21, 59, tzinfo=UTC)  # 17:59 ET Thu
++    after_roll = datetime(2026, 6, 11, 22, 0, tzinfo=UTC)  # 18:00 ET Thu -> Friday file
++
++    journal.record_prediction(_prediction(before_roll), mode="live")
++    journal.record_prediction(_prediction(after_roll), mode="live")
++
++    assert len(_read_lines(tmp_path / "2026-06-11.jsonl")) == 1
++    assert len(_read_lines(tmp_path / "2026-06-12.jsonl")) == 1
++
++
++def test_journal_append_failure_never_raises(tmp_path: Path) -> None:
++    blocker = tmp_path / "blocked"
++    blocker.write_text("not a directory", encoding="utf-8")
++    journal = PredictionJournal(blocker / "journal")
++    ts = datetime(2026, 6, 11, 14, 30, tzinfo=UTC)
++    journal.record_prediction(_prediction(ts), mode="live")  # must not raise
+diff --git a/backend/tests/test_lifecycle_w2.py b/backend/tests/test_lifecycle_w2.py
+new file mode 100644
+index 0000000..f70c062
+--- /dev/null
++++ b/backend/tests/test_lifecycle_w2.py
+@@ -0,0 +1,346 @@
++"""W2 P2: lifecycle + visibility — atomic activation (F12), flush wiring (F10),
++typed model.reset frame, named-feature failure visibility, journal tagging."""
++
++import asyncio
++import json
++from datetime import UTC, datetime
++from pathlib import Path
++from types import MappingProxyType, SimpleNamespace
++
++import numpy as np
++import pytest
++from catboost import CatBoostClassifier, Pool
++from fastapi.testclient import TestClient
++from strategy_core import StreamDrop
++
++from trade_lab.api.app import create_app
++from trade_lab.config import Settings
++from trade_lab.domain.events import TradeEvent
++from trade_lab.domain.feed import FeedConnectionState, FeedStatus
++from trade_lab.domain.observations import ObservationStatus
++from trade_lab.services.broadcaster import WebSocketBroadcaster
++from trade_lab.services.inference.features import FeatureComputationError
++from trade_lab.services.inference.inference_engine import Prediction
++from trade_lab.services.journal import PredictionJournal
++from trade_lab.services.live import LiveConfig, LiveMarketDataService
++from trade_lab.services.replay import HistoricalReplayService, ReplayConfig
++from trade_lab.services.runtime import ApplicationRuntime, RuntimeUpdate
++
++_FIXTURE_STRATEGY = Path(__file__).parent / "fixtures" / "strategy.json"
++
++
++def _contract_features() -> list[str]:
++    payload = json.loads(_FIXTURE_STRATEGY.read_text(encoding="utf-8"))
++    return list(payload["feature_set"]["names"])
++
++
++def _train_model(feature_names: list[str]) -> CatBoostClassifier:
++    rows: list[list[float]] = []
++    labels: list[int] = []
++    for cls in range(3):
++        for rep in range(4):
++            base = float(cls) + 0.1 * rep
++            rows.append([base + i * 0.01 for i in range(len(feature_names))])
++            labels.append(cls)
++    pool = Pool(np.array(rows), np.array(labels), feature_names=list(feature_names))
++    model = CatBoostClassifier(iterations=30, depth=2, loss_function="MultiClass", verbose=False)
++    model.fit(pool)
++    return model
++
++
++def _write_bundle(root: Path, model_id: str, model: CatBoostClassifier) -> Path:
++    payload = json.loads(_FIXTURE_STRATEGY.read_text(encoding="utf-8"))
++    directory = root / model_id
++    directory.mkdir(parents=True)
++    model.save_model(str(directory / "model.cbm"))
++    (directory / "metadata.json").write_text(
++        json.dumps({"selected_features": payload["feature_set"]["names"]}), encoding="utf-8"
++    )
++    (directory / "strategy.json").write_text(json.dumps(payload), encoding="utf-8")
++    return directory
++
++
++def _settings(tmp_path: Path) -> Settings:
++    return Settings(
++        _env_file=None,
++        front_month_symbol="NQ.c.0",
++        models_path=tmp_path,
++        journal_path=tmp_path / "journal",
++    )
++
++
++def _runtime() -> ApplicationRuntime:
++    return ApplicationRuntime(
++        requested_symbol="NQ.c.0", tick_timeframes=(2, 147), observation_duration_seconds=300
++    )
++
++
++def _prediction(prediction_id: str = "pred-1") -> Prediction:
++    return Prediction(
++        prediction_id=prediction_id,
++        touch_id="touch-1",
++        observation_id="obs-1",
++        event_ts_utc=datetime(2026, 6, 11, 14, 35, tzinfo=UTC),
++        predicted_class="tradeable_reversal",
++        probabilities=MappingProxyType({"tradeable_reversal": 0.8}),
++        feature_values=MappingProxyType({"interaction_dwell_time": 1.5}),
++        level_kind="pdh",
++        level_price_ticks=80_000,
++        direction="short",
++        session="ny",
++        is_eligible=True,
++        model_id="bundle-a",
++        contract_id="bundle-a",
++        nan_count=0,
++    )
++
++
++# --------------------------------------------------------------------------- #
++# P2b: atomic activation
++# --------------------------------------------------------------------------- #
++
++
++def test_late_construction_failure_leaves_previous_model_active(tmp_path: Path) -> None:
++    """F12 negative: a bundle that passes discovery but fails late construction
++    (corrupt model binary) returns 409 and the old model keeps serving."""
++
++    _write_bundle(tmp_path, "good-model", _train_model(_contract_features()))
++    corrupt_dir = _write_bundle(tmp_path, "corrupt-model", _train_model(_contract_features()))
++    (corrupt_dir / "model.cbm").write_bytes(b"this is not a catboost model")
++    client = TestClient(create_app(_settings(tmp_path)))
++
++    # Both bundles pass discovery (contract + metadata are valid).
++    discovered = {m["model_id"] for m in client.get("/api/v1/models").json()["models"]}
++    assert {"good-model", "corrupt-model"} <= discovered
++
++    assert client.post(
++        "/api/v1/models/activate", json={"model_id": "good-model"}
++    ).status_code == 200
++
++    failed = client.post("/api/v1/models/activate", json={"model_id": "corrupt-model"})
++    assert failed.status_code == 409
++    assert "loadable CatBoost model" in failed.json()["detail"]
++
++    active = client.get("/api/v1/models/active").json()
++    assert active["loaded"] is True
++    assert active["model_id"] == "good-model"
++
++
++def test_registry_prepare_does_not_swap_until_commit(tmp_path: Path) -> None:
++    from trade_lab.services.model_registry import ModelRegistry
++
++    _write_bundle(tmp_path, "good-model", _train_model(_contract_features()))
++    registry = ModelRegistry(tmp_path)
++    candidate = registry.prepare_activation("good-model")
++    assert registry.active() is None
++    registry.commit_activation(candidate)
++    assert registry.active() is candidate
++
++
++# --------------------------------------------------------------------------- #
++# P2a: flush wiring
++# --------------------------------------------------------------------------- #
++
++
++def test_flush_resolver_serves_and_journals_flushed_drops(tmp_path: Path) -> None:
++    runtime = ApplicationRuntime(
++        requested_symbol="NQ.c.0",
++        tick_timeframes=(2, 147),
++        observation_duration_seconds=300,
++        journal=PredictionJournal(tmp_path / "journal"),
++    )
++    decision_ts = datetime(2026, 6, 11, 14, 30, tzinfo=UTC)
++    drop = StreamDrop(
++        reason="no_forward", key="pred-1", decision_ts_utc=decision_ts, entry_price=20_001.25
++    )
++
++    class _Resolver:
++        def __init__(self) -> None:
++            self.flushed_at: list[datetime] = []
++
++        def flush(self, now_ts_utc: datetime):
++            self.flushed_at.append(now_ts_utc)
++            return (drop,)
++
++    resolver = _Resolver()
++    runtime._honest_resolver = resolver
++    runtime._open_predictions["pred-1"] = _prediction()
++
++    update = runtime.flush_resolver(datetime(2026, 6, 11, 22, 0, tzinfo=UTC))
++
++    assert resolver.flushed_at == [datetime(2026, 6, 11, 22, 0, tzinfo=UTC)]
++    assert len(update.dropped) == 1
++    assert update.dropped[0].reason == "no_forward"
++    assert update.dropped[0].prediction_id == "pred-1"
++    assert runtime.dropped == update.dropped
++    assert runtime._open_predictions == {}
++    lines = (tmp_path / "journal" / "2026-06-11.jsonl").read_text(encoding="utf-8").splitlines()
++    assert json.loads(lines[0])["type"] == "drop"
++
++
++def test_flush_resolver_without_timestamp_or_resolver_is_a_noop() -> None:
++    runtime = _runtime()
++    assert runtime.flush_resolver().has_deltas() is False  # no resolver
++    runtime._honest_resolver = SimpleNamespace(flush=lambda ts: (_ for _ in ()).throw(AssertionError))
++    assert runtime.flush_resolver().has_deltas() is False  # no timestamp known
++
++
++def test_replay_end_flushes_the_resolver_with_the_last_event_instant() -> None:
++    asyncio.run(_run_replay_end_flush())
++
++
++async def _run_replay_end_flush() -> None:
++    runtime = _runtime()
++    flushed: list[object] = []
++    runtime.flush_resolver = lambda ts=None: flushed.append(ts) or RuntimeUpdate()  # type: ignore[method-assign]
++    replay = HistoricalReplayService(runtime)
++
++    trade_ts = datetime(2026, 6, 11, 14, 30, tzinfo=UTC)
++
++    class _Source:
++        def scan(self, paths, **kwargs):
++            yield TradeEvent(trade_ts, None, 1, "NQ.c.0", "NQM6", 80_000, 1, source_schema="trades")
++
++    await replay.start(
++        _Source(),
++        ReplayConfig(paths=(Path("synthetic"),), requested_symbol="NQ.c.0", schema="trades"),
++    )
++    await replay._task
++    assert flushed == [trade_ts]
++
++
++def test_live_stop_flushes_the_resolver() -> None:
++    asyncio.run(_run_live_stop_flush())
++
++
++async def _run_live_stop_flush() -> None:
++    runtime = _runtime()
++    flushed: list[object] = []
++    runtime.flush_resolver = lambda ts=None: flushed.append(ts) or RuntimeUpdate()  # type: ignore[method-assign]
++
++    class _Feed:
++        async def start(self) -> None:
++            pass
++
++        async def stop(self) -> None:
++            pass
++
++        async def events(self):
++            if False:  # pragma: no cover
++                yield object()
++
++    live = LiveMarketDataService(
++        runtime,
++        LiveConfig(
++            requested_symbol="NQ.c.0",
++            dataset="GLBX.MDP3",
++            trade_schema="trades",
++            quote_schema="mbp-1",
++            context_schemas=(),
++            api_key_configured=True,
++            enabled=True,
++        ),
++        lambda _config: _Feed(),
++    )
++    await live.start()
++    await live.stop()
++    assert len(flushed) == 1
++    assert isinstance(flushed[0], datetime)
++
++
++def test_hot_swap_flushes_the_old_resolver(tmp_path: Path) -> None:
++    _write_bundle(tmp_path, "good-model", _train_model(_contract_features()))
++    runtime = _runtime()
++    flushed: list[object] = []
++    original = runtime.flush_resolver
++    runtime.flush_resolver = lambda ts=None: flushed.append(ts) or original(ts)  # type: ignore[method-assign]
++    app = create_app(_settings(tmp_path), runtime=runtime)
++    client = TestClient(app)
++    assert client.post(
++        "/api/v1/models/activate", json={"model_id": "good-model"}
++    ).status_code == 200
++    assert len(flushed) == 1
++
++
++# --------------------------------------------------------------------------- #
++# P2c: typed model.reset frame
++# --------------------------------------------------------------------------- #
++
++
++def test_model_reset_frame_leads_the_update_messages() -> None:
++    runtime = _runtime()
++    broadcaster = WebSocketBroadcaster(runtime)
++    messages = broadcaster.messages_for_update(
++        RuntimeUpdate(model_reset_reason="replay_reset", feed_status=runtime.feed_status)
++    )
++    first = json.loads(messages[0])
++    assert first["type"] == "model.reset"
++    assert first["payload"] == {"reason": "replay_reset"}
++    assert json.loads(messages[1])["type"] == "feed.status"
++
++
++def test_runtime_reset_carries_the_reset_reason() -> None:
++    runtime = _runtime()
++    update = runtime.reset(feed_message="runtime reset for live market data", reset_reason="live_reset")
++    assert update.model_reset_reason == "live_reset"
++    assert runtime.reset().model_reset_reason is None
++
++
++# --------------------------------------------------------------------------- #
++# P2d: named-feature failure visibility
++# --------------------------------------------------------------------------- #
++
++
++class _ExplodingEngine:
++    has_active_model = True
++
++    def predict_for_observation(self, observation, buffer):
++        raise FeatureComputationError("interaction_dwell_time", ValueError("boom"))
++
++
++def test_named_feature_failure_is_counted_and_surfaced_in_status(
++    tmp_path: Path, caplog: pytest.LogCaptureFixture
++) -> None:
++    runtime = _runtime()
++    runtime._inference_engine = _ExplodingEngine()
++    observation = SimpleNamespace(
++        status=ObservationStatus.EXPIRED,
++        scheduled_end_ts_utc=datetime(2026, 6, 11, 14, 35, tzinfo=UTC),
++    )
++    with caplog.at_level("WARNING"):
++        produced, dropped = runtime._run_inference((observation,))
++    assert produced == () and dropped == ()
++    record = next(r for r in caplog.records if "interaction_dwell_time" in r.message)
++    assert record.exc_info is not None  # exc_info=True logging
++
++    health = runtime.inference_health()
++    assert health["error_count"] == 1
++    assert health["last_error"]["feature_name"] == "interaction_dwell_time"
++    assert health["last_error"]["ts_utc"] == "2026-06-11T14:35:00+00:00"
++
++    app = create_app(_settings(tmp_path), runtime=runtime)
++    client = TestClient(app)
++    payload = client.get("/api/v1/status").json()
++    assert payload["inference"]["error_count"] == 1
++    assert payload["inference"]["last_error"]["feature_name"] == "interaction_dwell_time"
++
++
++# --------------------------------------------------------------------------- #
++# P2e: journal tagging through the runtime seam
++# --------------------------------------------------------------------------- #
++
++
++def test_runtime_journals_with_the_feed_mode_tag(tmp_path: Path) -> None:
++    runtime = ApplicationRuntime(
++        requested_symbol="NQ.c.0",
++        tick_timeframes=(2, 147),
++        observation_duration_seconds=300,
++        journal=PredictionJournal(tmp_path),
++    )
++    runtime.set_feed_status(
++        FeedStatus(FeedConnectionState.REPLAYING, "replay", "NQ.c.0", last_message="replaying")
++    )
++    runtime._journal_records((_prediction(),), (), ())
++    line = json.loads((tmp_path / "2026-06-11.jsonl").read_text(encoding="utf-8").splitlines()[0])
++    assert line["mode"] == "replay"
++    assert line["bundle_id"] == "bundle-a"
+diff --git a/backend/tests/test_live_databento.py b/backend/tests/test_live_databento.py
+index 75d6a80..410c7cf 100644
+--- a/backend/tests/test_live_databento.py
++++ b/backend/tests/test_live_databento.py
+@@ -1318,3 +1318,30 @@ def test_sdk_missing_path_is_actionable(monkeypatch: pytest.MonkeyPatch) -> None
+             requested_symbol="NQ.c.0",
+             dataset="GLBX.MDP3",
+         )
++
++
++def test_integer_ns_timestamp_decode_has_no_float_precision_loss() -> None:
++    # W2 P1a: 1_770_000_000_123_456_789 ns flips its microsecond on the float
++    # fromtimestamp route (123457) vs the floor-µs integer path (123456).
++    event = normalize_provider_message(
++        {"ts_event": 1_770_000_000_123_456_789, "price": 20_000.25, "size": 1},
++        requested_symbol="NQ.c.0",
++        schema="trades",
++    )
++    assert event.event_ts_utc == datetime(2026, 2, 2, 2, 40, 0, 123456, tzinfo=UTC)
++
++
++def test_databento_side_a_maps_to_sell_aggressor() -> None:
++    # W2: 'A' (ask aggressor) = SELL per the W1-ratified canonical mapping;
++    # it previously fell through to UNKNOWN on the live path.
++    base = {"ts_event": 1_770_000_000_000_000_000, "price": 20_000.25, "size": 1}
++    sides = {
++        "A": "sell",
++        "B": "buy",
++        "N": "unknown",
++    }
++    for code, expected in sides.items():
++        event = normalize_provider_message(
++            {**base, "side": code}, requested_symbol="NQ.c.0", schema="trades"
++        )
++        assert event.side.value == expected, code
+diff --git a/backend/tests/test_live_warm_start.py b/backend/tests/test_live_warm_start.py
+new file mode 100644
+index 0000000..7ebcf1d
+--- /dev/null
++++ b/backend/tests/test_live_warm_start.py
+@@ -0,0 +1,400 @@
++"""W2 P1b/c/d: live warm-start (replay-start + Historical fallback), prior-day
++PDH/PDL seeding, warm/live status marking, and disconnect auto-reconnect."""
++
++import asyncio
++from collections.abc import AsyncIterator
++from datetime import UTC, datetime
++from types import SimpleNamespace
++
++import pytest
++
++from trade_lab.adapters.databento import DatabentoMarketDataFeed, _DatabentoSdkFacade
++from trade_lab.adapters.databento_historical import DatabentoHistoricalSource
++from trade_lab.domain.events import TopOfBookEvent, TradeEvent
++from trade_lab.services.live import LiveConfig, LiveMarketDataService, LiveState
++from trade_lab.services.runtime import ApplicationRuntime
++from trade_lab.services.strategy_core_service import StrategyCoreService
++
++_NOW = datetime(2026, 6, 11, 15, 0, tzinfo=UTC)  # Thursday 11:00 ET
++_SESSION_OPEN = datetime(2026, 6, 10, 22, 0, tzinfo=UTC)  # Wednesday 18:00 ET
++
++
++def _runtime() -> ApplicationRuntime:
++    return ApplicationRuntime(
++        requested_symbol="NQ.c.0",
++        tick_timeframes=(2,),
++        observation_duration_seconds=300,
++    )
++
++
++def _live_config(*, key: bool = True, enabled: bool = True) -> LiveConfig:
++    return LiveConfig(
++        requested_symbol="NQ.c.0",
++        dataset="GLBX.MDP3",
++        trade_schema="trades",
++        quote_schema="mbp-1",
++        context_schemas=("definition",),
++        api_key_configured=key,
++        enabled=enabled,
++    )
++
++
++class _RecordingClient:
++    def __init__(self, *, reject_replay_start: bool = False) -> None:
++        self.reject_replay_start = reject_replay_start
++        self.subscriptions: list[dict[str, object]] = []
++        self.started = False
++        self.stopped = False
++
++    def add_callback(self, callback: object) -> None:
++        self.callback = callback
++
++    def subscribe(self, **kwargs: object) -> None:
++        if self.reject_replay_start and kwargs.get("start") is not None:
++            raise ValueError("gateway rejected the replay start parameter")
++        self.subscriptions.append(kwargs)
++
++    def start(self) -> None:
++        self.started = True
++
++    def stop(self) -> None:
++        self.stopped = True
++
++
++class _FakeSdk:
++    def __init__(self, *, reject_replay_start: bool = False) -> None:
++        self.reject_replay_start = reject_replay_start
++        self.clients: list[_RecordingClient] = []
++        sdk = self
++
++        class Live(_RecordingClient):
++            def __init__(self, key: str) -> None:
++                super().__init__(reject_replay_start=sdk.reject_replay_start)
++                self.key = key
++                sdk.clients.append(self)
++
++        self.Live = Live
++
++
++def _feed(sdk: _FakeSdk, **kwargs: object) -> DatabentoMarketDataFeed:
++    return DatabentoMarketDataFeed(
++        api_key="k" * 32,
++        requested_symbol="NQ.c.0",
++        dataset="GLBX.MDP3",
++        trade_schema="trades",
++        quote_schema="mbp-1",
++        context_schemas=("definition",),
++        sdk_facade=_DatabentoSdkFacade(sdk),
++        now_provider=lambda: _NOW,
++        **kwargs,
++    )
++
++
++def test_intraday_replay_subscribes_trade_and_quote_with_trading_day_start() -> None:
++    asyncio.run(_run_replay_start_subscribe())
++
++
++async def _run_replay_start_subscribe() -> None:
++    sdk = _FakeSdk()
++    feed = _feed(sdk, intraday_replay=True)
++    await feed.start()
++    client = sdk.clients[0]
++    by_schema = {sub["schema"]: sub for sub in client.subscriptions}
++    assert by_schema["trades"]["start"] == _SESSION_OPEN
++    assert by_schema["mbp-1"]["start"] == _SESSION_OPEN
++    assert by_schema["definition"].get("start") is None
++    assert client.started is True
++    await feed.stop()
++
++
++def test_without_intraday_replay_no_start_parameter_is_sent() -> None:
++    asyncio.run(_run_no_replay_start())
++
++
++async def _run_no_replay_start() -> None:
++    sdk = _FakeSdk()
++    feed = _feed(sdk)
++    await feed.start()
++    assert all("start" not in sub for sub in sdk.clients[0].subscriptions)
++    await feed.stop()
++
++
++def _historical_records(
++    fetch_calls: list[tuple[str, datetime, datetime]],
++) -> DatabentoHistoricalSource:
++    def record_fetcher(schema: str, start: datetime, end: datetime):
++        fetch_calls.append((schema, start, end))
++        if schema == "trades":
++            return [
++                SimpleNamespace(
++                    ts_event=1_781_200_000_000_000_000, price=20_000_250_000_000, size=2, side="A"
++                ),
++                SimpleNamespace(
++                    ts_event=1_781_200_002_000_000_000, price=20_000_500_000_000, size=1, side="B"
++                ),
++            ]
++        return [
++            SimpleNamespace(
++                ts_event=1_781_200_001_000_000_000,
++                levels=[
++                    SimpleNamespace(
++                        bid_px=20_000_000_000_000, bid_sz=3, ask_px=20_000_500_000_000, ask_sz=4
++                    )
++                ],
++            )
++        ]
++
++    return DatabentoHistoricalSource(
++        api_key=None,
++        dataset="GLBX.MDP3",
++        requested_symbol="NQ.c.0",
++        stype_in="continuous",
++        record_fetcher=record_fetcher,
++    )
++
++
++def test_rejected_replay_start_falls_back_to_historical_records_then_live() -> None:
++    asyncio.run(_run_fallback_warm_start())
++
++
++async def _run_fallback_warm_start() -> None:
++    sdk = _FakeSdk(reject_replay_start=True)
++    fetch_calls: list[tuple[str, datetime, datetime]] = []
++    feed = _feed(sdk, intraday_replay=True, historical_source=_historical_records(fetch_calls))
++    await feed.start()
++    # The rejecting client was torn down; no live client exists until the
++    # historical records drain inside events().
++    assert len(sdk.clients) == 1
++    assert sdk.clients[0].stopped is True
++    assert [(schema, start) for schema, start, _end in fetch_calls] == [
++        ("trades", _SESSION_OPEN),
++        ("mbp-1", _SESSION_OPEN),
++    ]
++
++    events: list[object] = []
++
++    async def consume() -> None:
++        async for item in feed.events():
++            events.append(item)
++
++    task = asyncio.create_task(consume())
++    for _ in range(300):
++        if len(sdk.clients) == 2:
++            break
++        await asyncio.sleep(0.01)
++    await feed.stop()
++    await task
++
++    # ts_event-merged order: trade, quote, trade — through the SAME normalize path.
++    assert isinstance(events[1], TradeEvent)
++    assert isinstance(events[2], TopOfBookEvent)
++    assert isinstance(events[3], TradeEvent)
++    assert events[1].price_ticks == 80_001  # 20000.25 / 0.25
++    assert events[1].side.value == "sell"  # Databento 'A' = sell aggressor
++    assert events[2].bid_price_ticks == 80_000
++    # After the drain the feed subscribed live WITHOUT a start parameter.
++    assert len(sdk.clients) == 2
++    live_client = sdk.clients[1]
++    assert all(sub.get("start") is None for sub in live_client.subscriptions)
++    assert live_client.started is True
++
++
++def _ohlcv_source(calls: list[tuple[datetime, datetime]]) -> DatabentoHistoricalSource:
++    def ohlcv_fetcher(start: datetime, end: datetime):
++        import pandas as pd
++
++        calls.append((start, end))
++        return pd.DataFrame({"high": [20_100.25, 20_150.50], "low": [19_900.75, 19_850.25]})
++
++    return DatabentoHistoricalSource(
++        api_key=None,
++        dataset="GLBX.MDP3",
++        requested_symbol="NQ.c.0",
++        stype_in="continuous",
++        ohlcv_fetcher=ohlcv_fetcher,
++    )
++
++
++def test_live_start_seeds_prior_day_summary_through_the_runtime_path(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    asyncio.run(_run_prior_day_seed(monkeypatch))
++
++
++async def _run_prior_day_seed(monkeypatch: pytest.MonkeyPatch) -> None:
++    loaded: list[tuple[object, int, int]] = []
++
++    def record_load(self, trading_day, high_ticks, low_ticks):
++        loaded.append((trading_day, high_ticks, low_ticks))
++
++    monkeypatch.setattr(StrategyCoreService, "load_prior_day_summary", record_load)
++    calls: list[tuple[datetime, datetime]] = []
++
++    class _Feed:
++        async def start(self) -> None:
++            pass
++
++        async def stop(self) -> None:
++            pass
++
++        async def events(self) -> AsyncIterator[object]:
++            if False:  # pragma: no cover - intentionally empty feed
++                yield object()
++
++    live = LiveMarketDataService(
++        _runtime(),
++        _live_config(),
++        lambda _config: _Feed(),
++        historical_source=_ohlcv_source(calls),
++        now_provider=lambda: _NOW,
++    )
++    await live.start()
++    await live.stop()
++    # Prior trading day of Thursday 2026-06-11 is Wednesday 2026-06-10:
++    # [Tue 18:00 ET, Wed 18:00 ET) in UTC.
++    assert calls == [
++        (datetime(2026, 6, 9, 22, 0, tzinfo=UTC), datetime(2026, 6, 10, 22, 0, tzinfo=UTC))
++    ]
++    assert loaded == [(datetime(2026, 6, 10).date(), 80_602, 79_401)]
++
++
++def test_live_start_without_historical_access_skips_prior_day_with_warning(
++    caplog: pytest.LogCaptureFixture,
++) -> None:
++    asyncio.run(_run_prior_day_skip(caplog))
++
++
++async def _run_prior_day_skip(caplog: pytest.LogCaptureFixture) -> None:
++    live = LiveMarketDataService(_runtime(), _live_config(), lambda _config: _empty_feed())
++    with caplog.at_level("WARNING"):
++        await live.start()
++        await live.stop()
++    assert any("prior-day summary skipped" in record.message for record in caplog.records)
++
++
++def _empty_feed():
++    class _Feed:
++        async def start(self) -> None:
++            pass
++
++        async def stop(self) -> None:
++            pass
++
++        async def events(self) -> AsyncIterator[object]:
++            if False:  # pragma: no cover - intentionally empty feed
++                yield object()
++
++    return _Feed()
++
++
++def _trade(ts: datetime, price_ticks: int = 80_000) -> TradeEvent:
++    return TradeEvent(ts, None, 1, "NQ.c.0", "NQM6", price_ticks, 1, source_schema="trades")
++
++
++def test_warm_start_marking_counts_replayed_events_then_flips_live() -> None:
++    asyncio.run(_run_warm_marking())
++
++
++async def _run_warm_marking() -> None:
++    class _Feed:
++        def __init__(self, events: list[object]) -> None:
++            self._events = events
++            self.release = asyncio.Event()
++
++        async def start(self) -> None:
++            pass
++
++        async def stop(self) -> None:
++            self.release.set()
++
++        async def events(self) -> AsyncIterator[object]:
++            for event in self._events:
++                yield event
++            await self.release.wait()
++
++    feed = _Feed(
++        [
++            _trade(datetime(2026, 6, 11, 1, 0, tzinfo=UTC)),  # replayed (before _NOW)
++            _trade(datetime(2026, 6, 11, 14, 0, tzinfo=UTC), 80_002),  # replayed
++            _trade(datetime(2026, 6, 11, 15, 0, 1, tzinfo=UTC), 80_004),  # real time
++        ]
++    )
++    live = LiveMarketDataService(
++        _runtime(),
++        _live_config(),
++        lambda _config: feed,
++        now_provider=lambda: _NOW,
++    )
++    await live.start()
++    for _ in range(200):
++        if live.status().warm_start_state == "live":
++            break
++        await asyncio.sleep(0.01)
++    status = live.status()
++    assert status.warm_start_state == "live"
++    assert status.warm_start_events == 2
++    await live.stop()
++
++
++def test_disconnect_reconnects_through_the_full_start_path() -> None:
++    asyncio.run(_run_reconnect())
++
++
++async def _run_reconnect() -> None:
++    factory_calls = 0
++
++    class _DroppingFeed:
++        """Yields one trade then ends (mid-session disconnect)."""
++
++        async def start(self) -> None:
++            pass
++
++        async def stop(self) -> None:
++            pass
++
++        async def events(self) -> AsyncIterator[object]:
++            yield _trade(datetime(2026, 6, 11, 14, 0, tzinfo=UTC))
++
++    class _SteadyFeed:
++        def __init__(self) -> None:
++            self.release = asyncio.Event()
++
++        async def start(self) -> None:
++            pass
++
++        async def stop(self) -> None:
++            self.release.set()
++
++        async def events(self) -> AsyncIterator[object]:
++            yield _trade(datetime(2026, 6, 11, 14, 5, tzinfo=UTC), 80_002)
++            await self.release.wait()
++
++    def factory(_config: LiveConfig):
++        nonlocal factory_calls
++        factory_calls += 1
++        return _DroppingFeed() if factory_calls == 1 else _SteadyFeed()
++
++    runtime = _runtime()
++    live = LiveMarketDataService(
++        runtime,
++        _live_config(),
++        factory,
++        reconnect_delay_seconds=0.02,
++        now_provider=lambda: _NOW,
++    )
++    await live.start()
++    for _ in range(300):
++        if (
++            factory_calls >= 2
++            and live.status().state == LiveState.RUNNING
++            and runtime.snapshot().current_bars
++        ):
++            break
++        await asyncio.sleep(0.01)
++    assert factory_calls == 2
++    assert live.status().state == LiveState.RUNNING
++    # The reconnect re-ran the full start path: the runtime was reset (the second
++    # feed's single trade is the only one the rebuilt engine has seen).
++    assert runtime.snapshot().current_bars[0].trade_count == 1
++    await live.stop()
++    assert live.status().state == LiveState.STOPPED
+diff --git a/backend/tests/test_market_context_retention_w1.py b/backend/tests/test_market_context_retention_w1.py
+index f7b8e00..96ade14 100644
+--- a/backend/tests/test_market_context_retention_w1.py
++++ b/backend/tests/test_market_context_retention_w1.py
+@@ -47,20 +47,18 @@ class _StubEngine:
+         self._approach = approach
+         self._interaction = interaction
+ 
+-    @property
+-    def active_contract(self):  # resolver build path: no contract -> no resolver
+-        return None
+-
+     def active(self):
+         if self._approach is None:
+             return None
+         return SimpleNamespace(
++            # resolver build path: no contract -> no resolver (W2 P2b rebind seam)
++            contract=None,
+             section=SimpleNamespace(
+                 feature_windows=SimpleNamespace(
+                     approach_window_minutes=self._approach,
+                     interaction_window_minutes=self._interaction,
+                 )
+-            )
++            ),
+         )
+ 
+ 
+diff --git a/backend/tests/test_seed.py b/backend/tests/test_seed.py
+deleted file mode 100644
+index 351cae8..0000000
+--- a/backend/tests/test_seed.py
++++ /dev/null
+@@ -1,230 +0,0 @@
+-import asyncio
+-from collections.abc import AsyncIterator
+-from datetime import UTC, datetime
+-
+-import pandas as pd
+-
+-from trade_lab.adapters.databento_historical import DatabentoHistoricalSource
+-from trade_lab.domain.data_quality import DataQualityCode
+-from trade_lab.services.live import LiveConfig, LiveMarketDataService, LiveState
+-from trade_lab.services.runtime import ApplicationRuntime
+-from trade_lab.services.seed import HistoricalSeedService
+-
+-# now() pinned to 2026-01-07 14:00 CT (NY session) -> current trading day 2026-01-07,
+-# so seed bars must come only from completed sessions strictly before it.
+-_FIXED_NOW = datetime(2026, 1, 7, 20, 0, tzinfo=UTC)
+-
+-# (ts_event_iso, price_dollars, size); prices are 0.25-aligned NQ-like values.
+-_SEED_ROWS = [
+-    ("2026-01-05T18:00:00Z", 17000.00, 1),
+-    ("2026-01-05T18:00:01Z", 17000.25, 1),
+-    ("2026-01-05T18:00:02Z", 17000.50, 1),
+-    ("2026-01-06T18:00:00Z", 17001.00, 1),
+-    ("2026-01-06T18:00:01Z", 17001.25, 1),
+-    ("2026-01-06T18:00:02Z", 17001.50, 1),
+-    # 2026-01-07 is the current trading day -> excluded from the seed.
+-    ("2026-01-07T18:00:00Z", 17002.00, 1),
+-    ("2026-01-07T18:00:01Z", 17002.25, 1),
+-]
+-
+-
+-class _FakeFeed:
+-    def __init__(self, events: list[object]) -> None:
+-        self._events = events
+-
+-    async def start(self) -> None:
+-        return None
+-
+-    async def stop(self) -> None:
+-        return None
+-
+-    async def events(self) -> AsyncIterator[object]:
+-        for event in self._events:
+-            yield event
+-
+-
+-def _frame_from_rows(rows: list[tuple[str, float, int]]) -> pd.DataFrame:
+-    return pd.DataFrame(
+-        {
+-            "ts_event": pd.to_datetime([row[0] for row in rows], utc=True),
+-            "price": [float(row[1]) for row in rows],
+-            "size": [int(row[2]) for row in rows],
+-        }
+-    )
+-
+-
+-def _frame_fetcher(rows: list[tuple[str, float, int]]):
+-    def fetcher(start: datetime, end: datetime) -> pd.DataFrame:
+-        return _frame_from_rows(rows)
+-
+-    return fetcher
+-
+-
+-def _source(frame_fetcher=None, *, custom: bool = True) -> DatabentoHistoricalSource:
+-    return DatabentoHistoricalSource(
+-        api_key=None,
+-        dataset="GLBX.MDP3",
+-        requested_symbol="NQ.c.0",
+-        stype_in="continuous",
+-        frame_fetcher=frame_fetcher if custom else None,
+-    )
+-
+-
+-def _seed_service(rows=None, *, enabled: bool = True, custom: bool = True) -> HistoricalSeedService:
+-    return HistoricalSeedService(
+-        _source(_frame_fetcher(rows if rows is not None else _SEED_ROWS), custom=custom),
+-        tick_timeframes=(2,),
+-        lookback_days=2,
+-        max_bars_per_timeframe=100,
+-        enabled=enabled,
+-        now_provider=lambda: _FIXED_NOW,
+-    )
+-
+-
+-def test_build_seed_bars_keeps_only_recent_completed_sessions() -> None:
+-    bars = _seed_service().build_seed_bars()
+-
+-    assert bars  # non-empty warm-up
+-    assert {bar.trading_day.isoformat() for bar in bars} == {"2026-01-05", "2026-01-06"}
+-    assert all(bar.timeframe_ticks == 2 for bar in bars)
+-    assert all(bar.trading_day.isoformat() < "2026-01-07" for bar in bars)
+-
+-
+-def test_seed_is_skipped_when_disabled_or_source_unavailable() -> None:
+-    assert _seed_service(enabled=False).enabled is False
+-    assert _seed_service(enabled=False).build_seed_bars() == ()
+-    # Default fetcher with no api key / no SDK access is treated as unavailable.
+-    unavailable = _seed_service(custom=False)
+-    assert unavailable.enabled is False
+-    assert unavailable.build_seed_bars() == ()
+-
+-
+-def test_runtime_seed_store_is_bounded_per_timeframe_and_served_in_snapshot() -> None:
+-    bars = _seed_service().build_seed_bars()
+-    assert len(bars) >= 3
+-
+-    runtime = ApplicationRuntime(
+-        requested_symbol="NQ.c.0",
+-        tick_timeframes=(2,),
+-        observation_duration_seconds=300,
+-        seed_bar_limit_per_timeframe=2,
+-    )
+-    update = runtime.seed_closed_bars(bars)
+-
+-    snapshot_bars = runtime.snapshot().recent_closed_bars
+-    assert update.closed_bars == bars
+-    assert len(snapshot_bars) == 2  # bounded to newest 2 for the single timeframe
+-    assert snapshot_bars == bars[-2:]
+-
+-
+-def test_runtime_reset_clears_seed_bars() -> None:
+-    bars = _seed_service().build_seed_bars()
+-    runtime = ApplicationRuntime(
+-        requested_symbol="NQ.c.0",
+-        tick_timeframes=(2,),
+-        observation_duration_seconds=300,
+-    )
+-    runtime.seed_closed_bars(bars)
+-    assert runtime.snapshot().recent_closed_bars
+-
+-    runtime.reset(requested_symbol="NQ.c.0")
+-
+-    assert runtime.snapshot().recent_closed_bars == ()
+-
+-
+-def test_live_start_seeds_chart_and_broadcasts_history() -> None:
+-    asyncio.run(_run_live_start_seeds())
+-
+-
+-async def _run_live_start_seeds() -> None:
+-    runtime = ApplicationRuntime(
+-        requested_symbol="NQ.c.0",
+-        tick_timeframes=(2,),
+-        observation_duration_seconds=300,
+-    )
+-    updates: list[object] = []
+-
+-    async def capture(update: object) -> None:
+-        updates.append(update)
+-
+-    live = LiveMarketDataService(
+-        runtime,
+-        LiveConfig(
+-            requested_symbol="NQ.c.0",
+-            dataset="GLBX.MDP3",
+-            trade_schema="trades",
+-            quote_schema="mbp-1",
+-            context_schemas=(),
+-            api_key_configured=True,
+-            enabled=True,
+-        ),
+-        lambda _config: _FakeFeed([]),
+-        on_update=capture,
+-        seed_service=_seed_service(),
+-    )
+-
+-    await live.start()
+-    assert live._seed_task is not None
+-    await live._seed_task
+-    assert live._task is not None
+-    await live._task
+-
+-    snapshot = runtime.snapshot()
+-    assert {bar.trading_day.isoformat() for bar in snapshot.recent_closed_bars} == {
+-        "2026-01-05",
+-        "2026-01-06",
+-    }
+-    assert any(getattr(update, "closed_bars", ()) for update in updates)
+-
+-    await live.stop()
+-    assert live.status().state == LiveState.STOPPED
+-
+-
+-def test_live_start_surfaces_warning_when_seed_unavailable() -> None:
+-    asyncio.run(_run_live_start_seed_failure())
+-
+-
+-async def _run_live_start_seed_failure() -> None:
+-    runtime = ApplicationRuntime(
+-        requested_symbol="NQ.c.0",
+-        tick_timeframes=(2,),
+-        observation_duration_seconds=300,
+-    )
+-    updates: list[object] = []
+-
+-    async def capture(update: object) -> None:
+-        updates.append(update)
+-
+-    def boom(start: datetime, end: datetime) -> pd.DataFrame:
+-        raise RuntimeError("provider unavailable")
+-
+-    live = LiveMarketDataService(
+-        runtime,
+-        LiveConfig(
+-            requested_symbol="NQ.c.0",
+-            dataset="GLBX.MDP3",
+-            trade_schema="trades",
+-            quote_schema="mbp-1",
+-            context_schemas=(),
+-            api_key_configured=True,
+-            enabled=True,
+-        ),
+-        lambda _config: _FakeFeed([]),
+-        on_update=capture,
+-        seed_service=HistoricalSeedService(
+-            _source(boom),
+-            tick_timeframes=(2,),
+-            now_provider=lambda: _FIXED_NOW,
+-        ),
+-    )
+-
+-    await live.start()
+-    assert live._seed_task is not None
+-    await live._seed_task
+-    await live._task
+-
+-    warnings = [w for update in updates for w in getattr(update, "warnings", ())]
+-    assert any(w.code == DataQualityCode.PROVIDER_ERROR and w.source == "seed" for w in warnings)
+-    assert runtime.snapshot().recent_closed_bars == ()
+-
+-    await live.stop()
+diff --git a/backend/tests/test_strategy_core_acceptance.py b/backend/tests/test_strategy_core_acceptance.py
+index 78c1f4c..9e10f06 100644
+--- a/backend/tests/test_strategy_core_acceptance.py
++++ b/backend/tests/test_strategy_core_acceptance.py
+@@ -90,10 +90,10 @@ def test_deleted_shadow_engines_stay_deleted_across_backend_src() -> None:
+     the kept modules to their DTO/display surface.
+ 
+     Documented carve-outs (deliberate, named in PROGRESS):
+-      * ``services/seed.py`` — the vectorized warm-up bar BUILDER stays (display-only
+-        context; its Chicago-clock divergence from Strategy-Core's ET sessions is a
+-        named debt). It may use ``SessionClassifier``/``make_bar_id`` but never the
+-        deleted engines.
++      * ``services/seed.py`` — DELETED in W2 P1e (the Chicago display seed retired;
++        warm-up bars now come from the engine via the live trading-day replay). Its
++        name stays in the subset allowlist below only so the guard reads stably;
++        no surviving file outside ``sessions.py`` touches SessionClassifier.
+       * ``services/strategy_core_service.py`` — display-flag re-derivation
+         (``is_eligible``/``is_developing`` off Strategy-Core ``available_from``) on
+         the DTO seam.
+diff --git a/backend/tests/test_trading_day.py b/backend/tests/test_trading_day.py
+new file mode 100644
+index 0000000..1e84b3f
+--- /dev/null
++++ b/backend/tests/test_trading_day.py
+@@ -0,0 +1,43 @@
++"""W2 P1: ET trading-day clock helpers (18:00 America/New_York roll)."""
++
++from datetime import UTC, date, datetime
++
++from trade_lab.domain.trading_day import (
++    most_recent_session_open_utc,
++    prior_trading_day,
++    trading_day_bounds_utc,
++    trading_day_for,
++    trading_day_start_utc,
++)
++
++# 2026-06-10 is a Wednesday; EDT (UTC-4) applies on every date used here.
++
++
++def test_trading_day_rolls_at_1800_et() -> None:
++    before_roll = datetime(2026, 6, 10, 21, 59, tzinfo=UTC)  # 17:59 ET Wed
++    at_roll = datetime(2026, 6, 10, 22, 0, tzinfo=UTC)  # 18:00 ET Wed
++    assert trading_day_for(before_roll) == date(2026, 6, 10)
++    assert trading_day_for(at_roll) == date(2026, 6, 11)
++
++
++def test_trading_day_start_is_prior_civil_day_1800_et() -> None:
++    assert trading_day_start_utc(date(2026, 6, 11)) == datetime(2026, 6, 10, 22, 0, tzinfo=UTC)
++
++
++def test_most_recent_session_open_spans_the_evening_and_the_next_morning() -> None:
++    evening = datetime(2026, 6, 10, 23, 30, tzinfo=UTC)  # 19:30 ET Wed -> Thu trading day
++    morning = datetime(2026, 6, 11, 14, 30, tzinfo=UTC)  # 10:30 ET Thu -> same trading day
++    expected_open = datetime(2026, 6, 10, 22, 0, tzinfo=UTC)
++    assert most_recent_session_open_utc(evening) == expected_open
++    assert most_recent_session_open_utc(morning) == expected_open
++
++
++def test_prior_trading_day_skips_the_weekend() -> None:
++    assert prior_trading_day(date(2026, 6, 8)) == date(2026, 6, 5)  # Monday -> Friday
++    assert prior_trading_day(date(2026, 6, 9)) == date(2026, 6, 8)  # Tuesday -> Monday
++
++
++def test_trading_day_bounds_are_half_open_1800_to_1800_et() -> None:
++    start, end = trading_day_bounds_utc(date(2026, 6, 8))  # Monday
++    assert start == datetime(2026, 6, 7, 22, 0, tzinfo=UTC)  # Sunday 18:00 ET
++    assert end == datetime(2026, 6, 8, 22, 0, tzinfo=UTC)  # Monday 18:00 ET
+diff --git a/frontend/src/realtime/client.test.ts b/frontend/src/realtime/client.test.ts
+index fda9166..7256c57 100644
+--- a/frontend/src/realtime/client.test.ts
++++ b/frontend/src/realtime/client.test.ts
+@@ -306,13 +306,13 @@ describe('RealtimeClient', () => {
+     expect(predictionStore.getSnapshot().predictions.at(-1)).toMatchObject({ id: 'pred-5' });
+   });
+ 
+-  it('clears predictions and outcomes when a runtime reset feed status arrives', () => {
++  it('clears predictions and outcomes when a typed model.reset frame arrives', () => {
+     client.start();
+     sockets[0].message(envelope('prediction.created', { prediction: prediction() }));
+     sockets[0].message(envelope('prediction.resolved', { outcome: outcome() }));
+     expect(predictionStore.getSnapshot().predictions).toHaveLength(1);
+ 
+-    sockets[0].message(envelope('feed.status', { ...feedStatus('disconnected'), mode: 'idle', last_message: 'runtime reset for live market data' }));
++    sockets[0].message(envelope('model.reset', { reason: 'activation' }));
+ 
+     expect(predictionStore.getSnapshot().predictions).toHaveLength(0);
+     expect(predictionStore.getSnapshot().outcomes).toHaveLength(0);
+@@ -378,7 +378,7 @@ describe('RealtimeClient', () => {
+     expect(marketStore.getSnapshot().recentClosedBars).toHaveLength(1);
+   });
+ 
+-  it('clears stale chart and intelligence data when live runtime reset status arrives', () => {
++  it('clears stale chart and intelligence data when a live model.reset frame arrives', () => {
+     marketStore.setState({ currentBars: [normalizeBar(bar(147, false))], recentClosedBars: [normalizeBar(bar(147, true))] });
+     intelligenceStore.setState({
+       levels: [{ kind: 'pdh', priceTicks: 76000, tradingDay: '2026-05-21', originSession: 'ny', developing: false, eligible: true }],
+@@ -388,14 +388,14 @@ describe('RealtimeClient', () => {
+     });
+     client.start();
+ 
+-    sockets[0].message(envelope('feed.status', { ...feedStatus('disconnected'), mode: 'idle', last_message: 'runtime reset for live market data' }));
++    sockets[0].message(envelope('model.reset', { reason: 'live_reset' }));
+ 
+     expect(marketStore.getSnapshot()).toMatchObject({ currentBars: [], recentClosedBars: [] });
+     expect(intelligenceStore.getSnapshot()).toMatchObject({ levels: [], touches: [], observations: [] });
+     expect(intelligenceStore.getSnapshot().warnings).toHaveLength(1);
+   });
+ 
+-  it('clears stale chart and intelligence data when replay runtime reset status arrives', () => {
++  it('clears stale chart and intelligence data when a replay model.reset frame arrives', () => {
+     marketStore.setState({ currentBars: [normalizeBar(bar(147, false))], recentClosedBars: [normalizeBar(bar(147, true))] });
+     intelligenceStore.setState({
+       levels: [{ kind: 'pdh', priceTicks: 76000, tradingDay: '2026-05-21', originSession: 'ny', developing: false, eligible: true }],
+@@ -405,7 +405,7 @@ describe('RealtimeClient', () => {
+     });
+     client.start();
+ 
+-    sockets[0].message(envelope('feed.status', { ...feedStatus('disconnected'), mode: 'idle', last_message: 'runtime reset for historical replay' }));
++    sockets[0].message(envelope('model.reset', { reason: 'replay_reset' }));
+ 
+     expect(marketStore.getSnapshot()).toMatchObject({ currentBars: [], recentClosedBars: [] });
+     expect(intelligenceStore.getSnapshot()).toMatchObject({ levels: [], touches: [], observations: [] });
+diff --git a/frontend/src/realtime/client.ts b/frontend/src/realtime/client.ts
+index e3db6ef..6961a3d 100644
+--- a/frontend/src/realtime/client.ts
++++ b/frontend/src/realtime/client.ts
+@@ -148,6 +148,20 @@ export class RealtimeClient {
+         setModelStatus(normalizeModelStatus(envelope.payload as ModelStatusDTO));
+         addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'system', severity: 'info', message: 'Model status updated', sequence: envelope.sequence });
+         break;
++      case 'model.reset': {
++        // W2 P2c: typed reset frame replaces the 'runtime reset' feed-message
++        // substring trigger. Activation swaps the model only, so prediction and
++        // outcome panes clear; a runtime reset (replay/live) also clears the
++        // chart and intelligence panes the old substring trigger cleared.
++        const reason = (envelope.payload as { reason?: string }).reason ?? 'unknown';
++        if (reason !== 'activation') {
++          marketStore.setState({ currentBars: [], recentClosedBars: [] });
++          intelligenceStore.setState({ levels: [], touches: [], observations: [] });
++        }
++        clearPredictions();
++        addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'system', severity: 'info', message: `Model reset (${reason})`, sequence: envelope.sequence });
++        break;
++      }
+       default:
+         addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'warning', severity: 'warning', message: `Unhandled WS message type: ${envelope.type}`, sequence: envelope.sequence });
+         break;
+@@ -189,11 +203,6 @@ export class RealtimeClient {
+   }
+ 
+   private applyFeedStatus(status: FeedStatusDTO) {
+-    if ((status.last_message ?? '').toLowerCase().includes('runtime reset')) {
+-      marketStore.setState({ currentBars: [], recentClosedBars: [] });
+-      intelligenceStore.setState({ levels: [], touches: [], observations: [] });
+-      clearPredictions();
+-    }
+     const replayState = replayStateFromFeedMessage(status.last_message, status.state, runtimeStore.getSnapshot().replayState);
+     runtimeStore.setState((current) => ({ ...current, runtimeMode: status.mode, requestedSymbol: status.requested_symbol ?? current.requestedSymbol, feedReady: ['connected', 'replaying'].includes(status.state), feedState: status.state, replayState: status.mode === 'replay' ? replayState : current.replayState }));
+     if (status.mode === 'replay') {
+diff --git a/frontend/src/realtime/types.ts b/frontend/src/realtime/types.ts
+index f13c6ed..c29465d 100644
+--- a/frontend/src/realtime/types.ts
++++ b/frontend/src/realtime/types.ts
+@@ -11,7 +11,8 @@ export type MessageType =
+   | 'prediction.created'
+   | 'prediction.resolved'
+   | 'prediction.dropped'
+-  | 'model.status';
++  | 'model.status'
++  | 'model.reset';
+ 
+ export type BarDTO = {
+   timeframe_ticks: number;

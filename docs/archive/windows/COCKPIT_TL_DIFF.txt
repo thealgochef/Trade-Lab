@@ -1,0 +1,3417 @@
+diff --git a/backend/src/trade_lab/api/dto.py b/backend/src/trade_lab/api/dto.py
+index 6d762b3..dfb6932 100644
+--- a/backend/src/trade_lab/api/dto.py
++++ b/backend/src/trade_lab/api/dto.py
+@@ -99,6 +99,11 @@ class ObservationDTO(ApiModel):
+     session: str
+     level_kind: str
+     level_price_ticks: int
++    # COCKPIT P3c (display only): the AUTHORITATIVE touch direction carried on the
++    # domain observation (audit #NN-1) — clients must never re-derive it from
++    # level_kind, which inverts for mixed-side merged zones. None for legacy
++    # observations that predate direction carry.
++    direction: str | None = None
+ 
+ 
+ class PredictionDTO(ApiModel):
+@@ -204,6 +209,13 @@ class ModelStatusDTO(ApiModel):
+     class_map: dict[int, str] = Field(default_factory=dict)
+     validation_ok: bool = False
+     validation_detail: str | None = None
++    # Serving-gate parameters (display only; the gate is applied server-side and
++    # stamped per-prediction as is_eligible). All three are null when no model is
++    # loaded. eligible_sessions uses the runtime session vocabulary ("ny", not the
++    # contract's raw "ny_rth"), matching the session field on predictions.
++    confidence_gate: float | None = None
++    eligible_class: str | None = None
++    eligible_sessions: list[str] | None = None
+ 
+ 
+ class ModelBundleDTO(ApiModel):
+@@ -346,6 +358,7 @@ def observation_to_dto(observation: Observation) -> ObservationDTO:
+         session=observation.session.value,
+         level_kind=observation.level_kind.value,
+         level_price_ticks=observation.level_price_ticks,
++        direction=None if observation.direction is None else observation.direction.value,
+     )
+ 
+ 
+@@ -459,6 +472,11 @@ def model_status_to_dto(status: ModelStatus) -> ModelStatusDTO:
+         class_map=dict(status.class_map),
+         validation_ok=status.validation_ok,
+         validation_detail=status.validation_detail,
++        confidence_gate=status.confidence_gate,
++        eligible_class=status.eligible_class,
++        eligible_sessions=(
++            None if status.eligible_sessions is None else list(status.eligible_sessions)
++        ),
+     )
+ 
+ 
+diff --git a/backend/src/trade_lab/services/inference/inference_engine.py b/backend/src/trade_lab/services/inference/inference_engine.py
+index 9e4d303..7fcb22b 100644
+--- a/backend/src/trade_lab/services/inference/inference_engine.py
++++ b/backend/src/trade_lab/services/inference/inference_engine.py
+@@ -99,6 +99,17 @@ def _session_matches(observation_session: str, eligible_session: str) -> bool:
+     return eligible.split("_", 1)[0] == obs.split("_", 1)[0]
+ 
+ 
++def eligible_session_tokens(eligible_session: str) -> tuple[str, ...]:
++    """Project the contract's eligible session into the runtime session vocabulary.
++
++    Display-side companion of ``_session_matches``: a contract ``ny_rth`` gates on
++    the leading token, so the runtime-vocabulary form shown to clients is ``ny``.
++    Kept beside the predicate so the two conventions cannot drift apart.
++    """
++
++    return (eligible_session.lower().split("_", 1)[0],)
++
++
+ class InferenceEngine:
+     """Produce predictions from completed observations using the active model."""
+ 
+diff --git a/backend/src/trade_lab/services/runtime.py b/backend/src/trade_lab/services/runtime.py
+index cb1981b..b86d19d 100644
+--- a/backend/src/trade_lab/services/runtime.py
++++ b/backend/src/trade_lab/services/runtime.py
+@@ -31,7 +31,11 @@ from trade_lab.domain.market_context import DEFAULT_RETENTION_MINUTES, MarketCon
+ from trade_lab.domain.observations import Observation, ObservationEngine, ObservationStatus
+ from trade_lab.domain.outcomes import DroppedPrediction, Outcome
+ from trade_lab.services.inference.features import FeatureComputationError
+-from trade_lab.services.inference.inference_engine import InferenceEngine, Prediction
++from trade_lab.services.inference.inference_engine import (
++    InferenceEngine,
++    Prediction,
++    eligible_session_tokens,
++)
+ from trade_lab.services.inference.resolution_adapter import (
+     drop_to_dropped,
+     parse_bar_type,
+@@ -111,6 +115,13 @@ class ModelStatus:
+     )
+     validation_ok: bool = False
+     validation_detail: str | None = None
++    # Serving-gate parameters from the active contract's InferencePolicy, display
++    # only — the gate itself is applied in InferenceEngine.predict_for_observation.
++    # eligible_sessions carries the runtime session vocabulary (see
++    # eligible_session_tokens), not the contract's raw spelling.
++    confidence_gate: float | None = None
++    eligible_class: str | None = None
++    eligible_sessions: tuple[str, ...] | None = None
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -566,6 +577,9 @@ class ApplicationRuntime:
+             # carried on the active bundle — no longer hardcoded True.
+             validation_ok=active.validation_ok,
+             validation_detail=active.validation_detail,
++            confidence_gate=contract.inference.confidence_gate,
++            eligible_class=contract.inference.eligible_class,
++            eligible_sessions=eligible_session_tokens(contract.inference.eligible_session),
+         )
+ 
+     def session_state(self) -> tuple[str | None, date | None]:
+diff --git a/backend/tests/test_api_contract.py b/backend/tests/test_api_contract.py
+index 94beb5b..b4e054a 100644
+--- a/backend/tests/test_api_contract.py
++++ b/backend/tests/test_api_contract.py
+@@ -576,6 +576,9 @@ def test_websocket_snapshot_contract_is_versioned_deterministic_and_safe() -> No
+         "class_map": {},
+         "validation_ok": False,
+         "validation_detail": None,
++        "confidence_gate": None,
++        "eligible_class": None,
++        "eligible_sessions": None,
+     }
+     assert snapshot["payload"]["session"] is None
+     assert snapshot["payload"]["trading_day"] is None
+@@ -667,6 +670,44 @@ def test_empty_snapshot_payload_has_required_shape() -> None:
+     }
+ 
+ 
++def test_observation_dto_carries_authoritative_direction() -> None:
++    """COCKPIT P3c: the observation DTO ships the audit #NN-1 direction.
++
++    Clients must never re-derive direction from level_kind (it inverts for
++    mixed-side merged zones); the DTO passes the domain observation's carried
++    direction through, and stays null-safe for legacy observations.
++    """
++
++    from datetime import date
++
++    from trade_lab.api.dto import observation_to_dto
++    from trade_lab.domain.levels import LevelDirection, LevelKind
++    from trade_lab.domain.observations import Observation, ObservationStatus
++    from trade_lab.domain.sessions import SessionName
++
++    base = Observation(
++        observation_id="obs-1",
++        originating_touch_id="touch-1",
++        start_ts_utc=datetime(2026, 1, 5, 8, 0, tzinfo=UTC),
++        scheduled_end_ts_utc=datetime(2026, 1, 5, 8, 5, tzinfo=UTC),
++        status=ObservationStatus.ACTIVE,
++        trading_day=date(2026, 1, 5),
++        session=SessionName.LONDON,
++        level_kind=LevelKind.ASIA_HIGH,
++        level_price_ticks=68_020,
++        direction=LevelDirection.SHORT,
++    )
++
++    dto = observation_to_dto(base)
++    assert dto.direction == "short"
++    assert dto.scheduled_end_ts_utc == base.scheduled_end_ts_utc
++
++    from dataclasses import replace as dc_replace
++
++    legacy = dc_replace(base, direction=None)
++    assert observation_to_dto(legacy).direction is None
++
++
+ def test_make_envelope_has_required_fields() -> None:
+     envelope = make_envelope("system.heartbeat", 7, {"status": "ok"})
+ 
+diff --git a/backend/tests/test_inference_api.py b/backend/tests/test_inference_api.py
+index ab9522f..9355918 100644
+--- a/backend/tests/test_inference_api.py
++++ b/backend/tests/test_inference_api.py
+@@ -23,6 +23,10 @@ from trade_lab.api.dto import MESSAGE_VERSION
+ from trade_lab.config import Settings
+ from trade_lab.domain.events import TradeEvent
+ from trade_lab.services.broadcaster import WebSocketBroadcaster
++from trade_lab.services.inference.inference_engine import (
++    _session_matches,
++    eligible_session_tokens,
++)
+ from trade_lab.services.replay import HistoricalReplayService
+ from trade_lab.services.runtime import ApplicationRuntime
+ 
+@@ -185,6 +189,52 @@ def test_activate_happy_path_loads_and_reports_status(tmp_path: Path) -> None:
+     _assert_no_temp_path(payload, tmp_path)
+ 
+ 
++def test_active_model_reports_serving_gate_parameters(tmp_path: Path) -> None:
++    """COCKPIT P1: the model-status DTO carries the contract's serving-gate params.
++
++    eligible_sessions is the runtime session vocabulary (contract ``ny_rth`` gates
++    on the leading token → ``ny``), matching the ``session`` field on predictions.
++    All three fields are null when no model is loaded.
++    """
++
++    client = _good_bundle_app(tmp_path)
++
++    unloaded = client.get("/api/v1/models/active").json()
++    assert unloaded["confidence_gate"] is None
++    assert unloaded["eligible_class"] is None
++    assert unloaded["eligible_sessions"] is None
++
++    activated = client.post(
++        "/api/v1/models/activate", json={"model_id": "good-model"}
++    ).json()
++    assert activated["confidence_gate"] == 0.7
++    assert activated["eligible_class"] == "tradeable_reversal"
++    assert activated["eligible_sessions"] == ["ny"]
++
++    deactivated = client.post("/api/v1/models/deactivate").json()
++    assert deactivated["loaded"] is False
++    assert deactivated["confidence_gate"] is None
++    assert deactivated["eligible_class"] is None
++    assert deactivated["eligible_sessions"] is None
++    _assert_no_secret_text(activated)
++    _assert_no_temp_path(activated, tmp_path)
++
++
++def test_eligible_sessions_agree_with_the_gate_predicate() -> None:
++    """The displayed eligible_sessions and _session_matches cannot disagree.
++
++    Every token eligible_session_tokens ships must satisfy _session_matches
++    against the raw contract spelling, and the runtime label the token stands
++    for must actually pass the gate.
++    """
++
++    for raw in ("ny_rth", "ny", "asia", "london", "NY_RTH"):
++        tokens = eligible_session_tokens(raw)
++        assert tokens
++        for token in tokens:
++            assert _session_matches(token, raw)
++
++
+ def test_activate_broadcasts_model_status_over_websocket(tmp_path: Path) -> None:
+     client = _good_bundle_app(tmp_path)
+ 
+diff --git a/frontend/src/App.test.tsx b/frontend/src/App.test.tsx
+index 72b7c44..9961aac 100644
+--- a/frontend/src/App.test.tsx
++++ b/frontend/src/App.test.tsx
+@@ -26,7 +26,7 @@ vi.mock('lightweight-charts', () => ({
+   CandlestickSeries: 'CandlestickSeries',
+   ColorType: { Solid: 'solid' },
+   CrosshairMode: { Normal: 1 },
+-  createChart: vi.fn(() => ({ addSeries: vi.fn(() => ({ setData: mocks.setData, update: mocks.update, createPriceLine: mocks.createPriceLine, removePriceLine: mocks.removePriceLine })), remove: mocks.chartRemove, subscribeCrosshairMove: vi.fn(), unsubscribeCrosshairMove: vi.fn(), timeScale: () => ({ scrollPosition: () => 0, getVisibleRange: () => null, setVisibleRange: () => {}, fitContent: () => {} }) })),
++  createChart: vi.fn(() => ({ addSeries: vi.fn(() => ({ setData: mocks.setData, update: mocks.update, createPriceLine: mocks.createPriceLine, removePriceLine: mocks.removePriceLine, attachPrimitive: vi.fn(), detachPrimitive: vi.fn() })), remove: mocks.chartRemove, subscribeCrosshairMove: vi.fn(), unsubscribeCrosshairMove: vi.fn(), timeScale: () => ({ scrollPosition: () => 0, getVisibleRange: () => null, setVisibleRange: () => {}, fitContent: () => {} }) })),
+   createSeriesMarkers: vi.fn(() => ({ setMarkers: mocks.setMarkers, remove: mocks.removeMarkers })),
+ }));
+ 
+diff --git a/frontend/src/App.tsx b/frontend/src/App.tsx
+index 78ad64e..e0d5845 100644
+--- a/frontend/src/App.tsx
++++ b/frontend/src/App.tsx
+@@ -3,7 +3,7 @@ import { apiClient } from './api/client';
+ import { normalizeLiveStatus, normalizeReplayStatus, normalizeRuntimeStatus } from './domain/normalize';
+ import { realtimeClient } from './realtime/client';
+ import { addBlotterEvent, liveStore, replayStore, runtimeStore } from './state/stores';
+-import { TopStatusBar } from './components/TopStatusBar';
++import { TraderStrip } from './components/TraderStrip';
+ import { ChartWorkspace } from './components/ChartWorkspace';
+ import { ExecutionsPanel } from './components/ExecutionsPanel';
+ import { IntelligencePanel } from './components/IntelligencePanel';
+@@ -44,7 +44,7 @@ export function App() {
+ 
+   return (
+     <main className={view === 'workstation' ? 'workstation-shell' : 'workstation-shell performance-view'}>
+-      <TopStatusBar />
++      <TraderStrip />
+       <nav className="view-tabs" aria-label="Workspace view">
+         <div className="segmented-control">
+           <button className={view === 'workstation' ? 'active' : ''} onClick={() => setView('workstation')}>
+diff --git a/frontend/src/blotter/viewModels.test.ts b/frontend/src/blotter/viewModels.test.ts
+new file mode 100644
+index 0000000..7c09336
+--- /dev/null
++++ b/frontend/src/blotter/viewModels.test.ts
+@@ -0,0 +1,74 @@
++import { describe, expect, it } from 'vitest';
++import type { BlotterEvent, ClosedExecution, TapeRow } from '../domain/models';
++import { formatTapeBracket, matchesTapeFilter, realizedPointsFor } from './viewModels';
++
++const event = (tape?: TapeRow): BlotterEvent => ({
++  id: 'e1',
++  timeUtc: '2026-05-21T14:03:00Z',
++  category: 'observation',
++  severity: 'info',
++  message: 'row',
++  tape,
++});
++
++const closed = (overrides: Partial<ClosedExecution> = {}): ClosedExecution => ({
++  predictionId: 'pred-1',
++  touchId: 'touch-1',
++  direction: 'long',
++  contracts: 1,
++  entryTsUtc: '2026-05-21T14:00:05Z',
++  exitTsUtc: '2026-05-21T14:01:05Z',
++  reason: 'tp_hit',
++  entryPrice: 23000,
++  entryPriceConservative: 23000.25,
++  exitPrice: 23015,
++  exitPriceConservative: 23015,
++  points: 15,
++  pointsConservative: 14.75,
++  dollars: 300,
++  dollarsConservative: 295,
++  pointValue: 20,
++  session: 'ny',
++  levelKind: 'pdl',
++  ...overrides,
++});
++
++describe('matchesTapeFilter', () => {
++  const prediction: TapeRow = { kind: 'prediction', predictionId: 'p', predictedClass: 'up', probability: 0.7, eligible: true, direction: 'long', session: 'ny' };
++  const outcome: TapeRow = { kind: 'outcome', predictionId: 'p', resolutionType: 'tp_hit', correct: true, actualClass: 'up' };
++  const drop: TapeRow = { kind: 'drop', predictionId: 'p', reason: 'no_fill' };
++  const open: TapeRow = { kind: 'position_open', predictionId: 'p', direction: 'long', entryPrice: 1, entryPriceConservative: 1, tpPrice: 2, slPrice: 0 };
++  const close: TapeRow = { kind: 'position_close', predictionId: 'p', direction: 'long', reason: 'tp_hit', points: 1, pointsConservative: 1, exitPrice: 2 };
++
++  it('groups prediction+outcome, open+close, and drops; untyped rows are All-only', () => {
++    expect(matchesTapeFilter(event(prediction), 'predictions')).toBe(true);
++    expect(matchesTapeFilter(event(outcome), 'predictions')).toBe(true);
++    expect(matchesTapeFilter(event(open), 'executions')).toBe(true);
++    expect(matchesTapeFilter(event(close), 'executions')).toBe(true);
++    expect(matchesTapeFilter(event(drop), 'drops')).toBe(true);
++    expect(matchesTapeFilter(event(drop), 'predictions')).toBe(false);
++    expect(matchesTapeFilter(event(prediction), 'executions')).toBe(false);
++    const untyped = event(undefined);
++    expect(matchesTapeFilter(untyped, 'all')).toBe(true);
++    expect(matchesTapeFilter(untyped, 'predictions')).toBe(false);
++    expect(matchesTapeFilter(untyped, 'executions')).toBe(false);
++    expect(matchesTapeFilter(untyped, 'drops')).toBe(false);
++  });
++});
++
++describe('realizedPointsFor', () => {
++  it('joins outcome rows to the executions store by prediction id', () => {
++    const tape: TapeRow = { kind: 'outcome', predictionId: 'pred-1', resolutionType: 'tp_hit', correct: true, actualClass: 'up' };
++    expect(realizedPointsFor(tape, [closed()])).toEqual({ points: 15, pointsConservative: 14.75 });
++    expect(realizedPointsFor(tape, [closed({ predictionId: 'other' })])).toBeNull();
++    expect(realizedPointsFor({ kind: 'drop', predictionId: 'pred-1', reason: 'no_fill' }, [closed()])).toBeNull();
++  });
++});
++
++describe('formatTapeBracket', () => {
++  it('formats both P&L columns with signs', () => {
++    expect(formatTapeBracket(15, 14.75)).toBe('+15.00 / +14.75 pts');
++    expect(formatTapeBracket(-30, -30.5)).toBe('-30.00 / -30.50 pts');
++    expect(formatTapeBracket(0, -0.25)).toBe('0.00 / -0.25 pts');
++  });
++});
+diff --git a/frontend/src/blotter/viewModels.ts b/frontend/src/blotter/viewModels.ts
+new file mode 100644
+index 0000000..b87ee48
+--- /dev/null
++++ b/frontend/src/blotter/viewModels.ts
+@@ -0,0 +1,45 @@
++// COCKPIT P5: pure trade-tape helpers. No React, no IO.
++import type { BlotterEvent, ClosedExecution, TapeRow } from '../domain/models';
++
++export type TapeFilter = 'all' | 'predictions' | 'executions' | 'drops';
++
++export const TAPE_FILTERS: TapeFilter[] = ['all', 'predictions', 'executions', 'drops'];
++
++/**
++ * Chip semantics: predictions = prediction + outcome rows; executions =
++ * position open/close rows; drops = drop rows. Untyped events (system, feed,
++ * warnings, ...) surface under `all` only.
++ */
++export function matchesTapeFilter(event: BlotterEvent, filter: TapeFilter): boolean {
++  if (filter === 'all') return true;
++  const kind = event.tape?.kind;
++  if (kind === undefined) return false;
++  switch (filter) {
++    case 'predictions':
++      return kind === 'prediction' || kind === 'outcome';
++    case 'executions':
++      return kind === 'position_open' || kind === 'position_close';
++    case 'drops':
++      return kind === 'drop';
++  }
++}
++
++export type RealizedPoints = { points: number; pointsConservative: number };
++
++/**
++ * Realized points for an outcome row, joined at render time from the
++ * executions store (the tracker's close for the same prediction). Null while
++ * no matching close exists — ineligible predictions are never tracked, and the
++ * close frame may simply not have arrived yet.
++ */
++export function realizedPointsFor(tape: TapeRow, closed: ClosedExecution[]): RealizedPoints | null {
++  if (tape.kind !== 'outcome') return null;
++  const match = closed.find((execution) => execution.predictionId === tape.predictionId);
++  if (!match) return null;
++  return { points: match.points, pointsConservative: match.pointsConservative };
++}
++
++export const formatTapePoints = (points: number): string => `${points > 0 ? '+' : ''}${points.toFixed(2)}`;
++
++export const formatTapeBracket = (points: number, pointsConservative: number): string =>
++  `${formatTapePoints(points)} / ${formatTapePoints(pointsConservative)} pts`;
+diff --git a/frontend/src/chart/overlayManager.test.ts b/frontend/src/chart/overlayManager.test.ts
+index 3598622..bfa52a1 100644
+--- a/frontend/src/chart/overlayManager.test.ts
++++ b/frontend/src/chart/overlayManager.test.ts
+@@ -18,6 +18,8 @@ vi.mock('lightweight-charts', () => ({
+ const createSeries = () => ({
+   createPriceLine: vi.fn((options: unknown) => ({ options, id: crypto.randomUUID() })),
+   removePriceLine: vi.fn(),
++  attachPrimitive: vi.fn(),
++  detachPrimitive: vi.fn(),
+ });
+ 
+ describe('ChartOverlayManager', () => {
+@@ -62,6 +64,31 @@ describe('ChartOverlayManager', () => {
+     expect(firstPass[3]).toMatchObject({ lineWidth: 1, lineStyle: 2, eligible: false });
+   });
+ 
++  it('keeps TP/SL lines on their own layer, removes them on close, and attaches the session primitive', () => {
++    const series = createSeries();
++    const manager = new ChartOverlayManager(series as never);
++    expect(series.attachPrimitive).toHaveBeenCalledOnce();
++
++    const level: LevelOverlay = { id: 'pdh', price: 19000, title: 'PDH EL', color: '#d7e3ee', lineWidth: 2, lineStyle: 0, eligible: true };
++    manager.syncLevels([level]);
++    manager.syncPositionLines([
++      { id: 'tp:pred-1', price: 23015, title: 'TP long', color: '#36d399', lineWidth: 1, lineStyle: 3 },
++      { id: 'sl:pred-1', price: 22970, title: 'SL long', color: '#ff6b6b', lineWidth: 1, lineStyle: 3 },
++    ]);
++    expect(series.createPriceLine).toHaveBeenCalledTimes(3);
++
++    // Position close: its lines vanish; the level line stays untouched.
++    const tpLine = series.createPriceLine.mock.results[1].value;
++    const slLine = series.createPriceLine.mock.results[2].value;
++    manager.syncPositionLines([]);
++    expect(series.removePriceLine).toHaveBeenCalledWith(tpLine);
++    expect(series.removePriceLine).toHaveBeenCalledWith(slLine);
++    expect(series.removePriceLine).not.toHaveBeenCalledWith(series.createPriceLine.mock.results[0].value);
++
++    manager.destroy();
++    expect(series.detachPrimitive).toHaveBeenCalledOnce();
++  });
++
+   it('replaces marker sets without accumulating duplicates and keeps inline text with an enlarged glyph', () => {
+     const series = createSeries();
+     const manager = new ChartOverlayManager(series as never);
+diff --git a/frontend/src/chart/overlayManager.ts b/frontend/src/chart/overlayManager.ts
+index fc252d2..3a53375 100644
+--- a/frontend/src/chart/overlayManager.ts
++++ b/frontend/src/chart/overlayManager.ts
+@@ -1,6 +1,7 @@
+ import type { IPriceLine, ISeriesApi, SeriesMarker, Time } from 'lightweight-charts';
+ import { createSeriesMarkers } from 'lightweight-charts';
+-import type { LevelOverlay } from './viewModels';
++import { SessionShadingPrimitive } from './sessionShading';
++import type { LevelOverlay, PositionLineOverlay, SessionBand } from './viewModels';
+ 
+ type MarkerApi = { setMarkers: (markers: SeriesMarker<Time>[]) => void; remove?: () => void };
+ 
+@@ -10,12 +11,18 @@ const MARKER_SIZE = 2;
+ 
+ export class ChartOverlayManager {
+   private readonly priceLines = new Map<string, IPriceLine>();
++  // COCKPIT P4a: TP/SL barrier lines keyed by overlay id, own layer so level
++  // syncs can never remove a position line and vice versa.
++  private readonly positionLines = new Map<string, IPriceLine>();
+   private readonly markerApi: MarkerApi;
++  // COCKPIT P4b: translucent session bands behind the candles.
++  private readonly sessionShading = new SessionShadingPrimitive();
+ 
+   constructor(private readonly series: ISeriesApi<'Candlestick'>) {
+     // Overlay layers are generic and data-driven so later phases can add ML or
+     // execution annotations without parents touching chart internals.
+     this.markerApi = createSeriesMarkers(series, []);
++    series.attachPrimitive(this.sessionShading);
+   }
+ 
+   syncLevels(levels: LevelOverlay[]) {
+@@ -42,6 +49,36 @@ export class ChartOverlayManager {
+     }
+   }
+ 
++  // TP/SL lines mirror syncLevels: ids that vanish (position closed / reset)
++  // drop their lines; surviving ids are re-created at the latest price.
++  syncPositionLines(lines: PositionLineOverlay[]) {
++    const nextIds = new Set(lines.map((line) => line.id));
++    for (const [id, line] of this.positionLines) {
++      if (!nextIds.has(id)) {
++        this.series.removePriceLine(line);
++        this.positionLines.delete(id);
++      }
++    }
++
++    for (const overlay of lines) {
++      const current = this.positionLines.get(overlay.id);
++      if (current) this.series.removePriceLine(current);
++      const line = this.series.createPriceLine({
++        price: overlay.price,
++        color: overlay.color,
++        lineWidth: overlay.lineWidth,
++        lineStyle: overlay.lineStyle,
++        title: overlay.title,
++        axisLabelVisible: true,
++      });
++      this.positionLines.set(overlay.id, line);
++    }
++  }
++
++  syncSessionBands(bands: SessionBand[]) {
++    this.sessionShading.setBands(bands);
++  }
++
+   syncMarkers(markers: SeriesMarker<Time>[]) {
+     // Render each marker's inline `text` as an always-on label (plus a larger glyph) so the
+     // touch/prediction/outcome annotations are legible on the chart without hovering. The hover
+@@ -52,6 +89,9 @@ export class ChartOverlayManager {
+   destroy() {
+     for (const line of this.priceLines.values()) this.series.removePriceLine(line);
+     this.priceLines.clear();
++    for (const line of this.positionLines.values()) this.series.removePriceLine(line);
++    this.positionLines.clear();
++    this.series.detachPrimitive(this.sessionShading);
+     this.markerApi.remove?.();
+   }
+ }
+diff --git a/frontend/src/chart/sessionShading.test.ts b/frontend/src/chart/sessionShading.test.ts
+new file mode 100644
+index 0000000..f48a154
+--- /dev/null
++++ b/frontend/src/chart/sessionShading.test.ts
+@@ -0,0 +1,87 @@
++import { describe, expect, it, vi } from 'vitest';
++import type { UTCTimestamp } from 'lightweight-charts';
++import { SessionShadingPrimitive, bandRectsFor } from './sessionShading';
++import type { SessionBand } from './viewModels';
++
++const band = (session: SessionBand['session'], from: number, to: number): SessionBand => ({
++  session,
++  from: from as UTCTimestamp,
++  to: to as UTCTimestamp,
++});
++
++describe('bandRectsFor', () => {
++  const linear = (time: UTCTimestamp) => (time as number) - 1000; // 1 chart-second = 1px, origin at t=1000
++
++  it('converts visible bands to x extents and skips off-screen bands', () => {
++    const rects = bandRectsFor(
++      [band('ny', 1010, 1050), band('asia', 2000, 2100)],
++      { from: 1000, to: 1100 },
++      linear,
++      100,
++    );
++    expect(rects).toEqual([{ x: 10, width: 40, session: 'ny' }]);
++  });
++
++  it('clamps bands that extend past the visible range to the pane edges', () => {
++    const rects = bandRectsFor(
++      [band('london', 900, 1050), band('ny', 1080, 1300)],
++      { from: 1000, to: 1100 },
++      linear,
++      100,
++    );
++    expect(rects[0]).toEqual({ x: 0, width: 50, session: 'london' });
++    expect(rects[1]).toEqual({ x: 80, width: 20, session: 'ny' });
++  });
++
++  it('renders nothing without a visible range or pane width', () => {
++    expect(bandRectsFor([band('ny', 0, 10)], null, linear, 100)).toEqual([]);
++    expect(bandRectsFor([band('ny', 0, 10)], { from: 0, to: 10 }, linear, 0)).toEqual([]);
++  });
++
++  it('gives single-bar bands a minimum 1px width', () => {
++    const rects = bandRectsFor([band('ny', 1050, 1050)], { from: 1000, to: 1100 }, linear, 100);
++    expect(rects).toEqual([{ x: 50, width: 1, session: 'ny' }]);
++  });
++});
++
++describe('SessionShadingPrimitive', () => {
++  it('draws clamped translucent rects behind the pane via drawBackground at z-order bottom', () => {
++    const primitive = new SessionShadingPrimitive();
++    const requestUpdate = vi.fn();
++    const timeScale = {
++      getVisibleRange: () => ({ from: 1000, to: 1100 }),
++      timeToCoordinate: (time: unknown) => (time as number) - 1000,
++      width: () => 100,
++    };
++    primitive.attached({ chart: { timeScale: () => timeScale }, requestUpdate } as never);
++
++    primitive.setBands([band('ny', 1010, 1050)]);
++    expect(requestUpdate).toHaveBeenCalledOnce();
++
++    const view = primitive.paneViews()[0];
++    expect(view.zOrder()).toBe('bottom');
++
++    const fillRect = vi.fn();
++    let fillStyle = '';
++    const context = new Proxy({} as CanvasRenderingContext2D, {
++      set: (_target, prop, value) => {
++        if (prop === 'fillStyle') fillStyle = value as string;
++        return true;
++      },
++      get: (_target, prop) => (prop === 'fillRect' ? fillRect : undefined),
++    });
++    const target = {
++      useBitmapCoordinateSpace: (handler: (scope: unknown) => void) =>
++        handler({ context, bitmapSize: { width: 200, height: 400 }, horizontalPixelRatio: 2, verticalPixelRatio: 2 }),
++    };
++    view.renderer().drawBackground(target as never);
++
++    expect(fillRect).toHaveBeenCalledWith(20, 0, 80, 400);
++    expect(fillStyle).toContain('rgba(54, 211, 153');
++
++    primitive.detached();
++    fillRect.mockClear();
++    view.renderer().drawBackground(target as never);
++    expect(fillRect).not.toHaveBeenCalled();
++  });
++});
+diff --git a/frontend/src/chart/sessionShading.ts b/frontend/src/chart/sessionShading.ts
+new file mode 100644
+index 0000000..120c396
+--- /dev/null
++++ b/frontend/src/chart/sessionShading.ts
+@@ -0,0 +1,112 @@
++// COCKPIT P4b: session shading as a lightweight-charts v5 series primitive.
++// Translucent full-height background bands per session, drawn behind the
++// candles (drawBackground + zOrder bottom — the documented "time areas
++// highlighting" pattern). Band geometry is computed by the pure bandRectsFor
++// so the pixel math is unit-testable without a canvas.
++import type { IChartApi, ISeriesPrimitive, SeriesAttachedParameter, Time, UTCTimestamp } from 'lightweight-charts';
++import type { SessionBand, SessionBandName } from './viewModels';
++
++export const SESSION_FILLS: Record<SessionBandName, string> = {
++  asia: 'rgba(78, 161, 255, 0.05)',
++  london: 'rgba(242, 184, 75, 0.05)',
++  ny: 'rgba(54, 211, 153, 0.06)',
++};
++
++export type BandRect = { x: number; width: number; session: SessionBandName };
++
++/**
++ * Clip bands to the visible time range and convert to pane x-extents.
++ * Band edges are always bar times (they exist on the scale); an edge that sits
++ * off-screen clamps to the pane edge instead of relying on an off-scale lookup.
++ */
++export const bandRectsFor = (
++  bands: SessionBand[],
++  visible: { from: number; to: number } | null,
++  timeToCoordinate: (time: UTCTimestamp) => number | null,
++  paneWidth: number,
++): BandRect[] => {
++  if (visible === null || paneWidth <= 0) return [];
++  const rects: BandRect[] = [];
++  for (const band of bands) {
++    const from = band.from as number;
++    const to = band.to as number;
++    if (to < visible.from || from > visible.to) continue;
++    const x1 = from < visible.from ? 0 : timeToCoordinate(band.from) ?? 0;
++    const x2 = to > visible.to ? paneWidth : timeToCoordinate(band.to) ?? paneWidth;
++    if (x2 < x1) continue;
++    rects.push({ x: x1, width: Math.max(1, x2 - x1), session: band.session });
++  }
++  return rects;
++};
++
++// Structural types for the canvas target (fancy-canvas is a transitive dep of
++// lightweight-charts; declaring the used surface locally keeps our dependency
++// graph explicit).
++type BitmapScope = {
++  context: CanvasRenderingContext2D;
++  bitmapSize: { width: number; height: number };
++  horizontalPixelRatio: number;
++  verticalPixelRatio: number;
++};
++
++type RenderTarget = {
++  useBitmapCoordinateSpace: (handler: (scope: BitmapScope) => void) => void;
++};
++
++export class SessionShadingPrimitive implements ISeriesPrimitive<Time> {
++  private bands: SessionBand[] = [];
++  private chart: IChartApi | null = null;
++  private requestUpdate: (() => void) | null = null;
++
++  private readonly paneView = {
++    zOrder: () => 'bottom' as const,
++    renderer: () => ({
++      draw: () => {},
++      drawBackground: (target: unknown) => this.drawBands(target as RenderTarget),
++    }),
++  };
++
++  attached(param: SeriesAttachedParameter<Time>): void {
++    this.chart = param.chart;
++    this.requestUpdate = param.requestUpdate;
++  }
++
++  detached(): void {
++    this.chart = null;
++    this.requestUpdate = null;
++  }
++
++  paneViews() {
++    return [this.paneView];
++  }
++
++  setBands(bands: SessionBand[]): void {
++    this.bands = bands;
++    this.requestUpdate?.();
++  }
++
++  private drawBands(target: RenderTarget): void {
++    const chart = this.chart;
++    if (chart === null || this.bands.length === 0) return;
++    const timeScale = chart.timeScale();
++    const visible = timeScale.getVisibleRange() as { from: number; to: number } | null;
++    const rects = bandRectsFor(
++      this.bands,
++      visible,
++      (time) => timeScale.timeToCoordinate(time as Time),
++      timeScale.width(),
++    );
++    if (rects.length === 0) return;
++    target.useBitmapCoordinateSpace((scope) => {
++      for (const rect of rects) {
++        scope.context.fillStyle = SESSION_FILLS[rect.session];
++        scope.context.fillRect(
++          Math.round(rect.x * scope.horizontalPixelRatio),
++          0,
++          Math.max(1, Math.round(rect.width * scope.horizontalPixelRatio)),
++          scope.bitmapSize.height,
++        );
++      }
++    });
++  }
++}
+diff --git a/frontend/src/chart/viewModels.test.ts b/frontend/src/chart/viewModels.test.ts
+index 8d33796..e58f15e 100644
+--- a/frontend/src/chart/viewModels.test.ts
++++ b/frontend/src/chart/viewModels.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, expect, it } from 'vitest';
+-import { MAX_BARS_PER_TIMEFRAME, combineMarkers, createChartTimeResolver, normalizeBarsForTimeframe, normalizeExecutionMarkers, normalizeLevels, normalizeObservationMarkers, normalizeOutcomeMarkers, normalizePredictionMarkers, normalizeTouchMarkers } from './viewModels';
++import { MAX_BARS_PER_TIMEFRAME, classifySessionEt, combineMarkers, createChartTimeResolver, normalizeBarsForTimeframe, normalizeExecutionMarkers, normalizeLevels, normalizeObservationMarkers, normalizeOutcomeMarkers, normalizePositionLines, normalizePredictionMarkers, normalizeTouchMarkers, sessionBands } from './viewModels';
+ import type { ClosedExecution, MarketBar, MarketLevel, MarketTouch, Observation, OpenPosition, Outcome, Prediction } from '../domain/models';
+ 
+ const bar = (overrides: Partial<MarketBar>): MarketBar => ({
+@@ -154,8 +154,8 @@ describe('chart view model normalization', () => {
+       { id: 't1', timeUtc: '2026-05-21T14:00:10Z', session: 'ny', levelKind: 'pdh', priceTicks: 76000, createdObservation: true },
+     ];
+     const observations: Observation[] = [
+-      { id: 'o1', status: 'expired', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:00:11Z', scheduledEndUtc: '2026-05-21T14:10:11Z' },
+-      { id: 'o1', status: 'expired', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:00:11Z', scheduledEndUtc: '2026-05-21T14:10:11Z' },
++      { id: 'o1', status: 'expired', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:00:11Z', scheduledEndUtc: '2026-05-21T14:10:11Z', originatingTouchId: null, levelPriceTicks: null, direction: null },
++      { id: 'o1', status: 'expired', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:00:11Z', scheduledEndUtc: '2026-05-21T14:10:11Z', originatingTouchId: null, levelPriceTicks: null, direction: null },
+     ];
+ 
+     const markers = combineMarkers(touches, observations, [], bars);
+@@ -187,7 +187,7 @@ describe('chart view model normalization', () => {
+       { id: 't1', timeUtc: '2026-05-21T14:00:10Z', session: 'ny', levelKind: 'pdh', priceTicks: 76000, createdObservation: true },
+     ];
+     const observations: Observation[] = [
+-      { id: 'o1', status: 'expired', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:00:11Z', scheduledEndUtc: '2026-05-21T14:10:11Z' },
++      { id: 'o1', status: 'expired', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:00:11Z', scheduledEndUtc: '2026-05-21T14:10:11Z', originatingTouchId: null, levelPriceTicks: null, direction: null },
+     ];
+ 
+     expect(combineMarkers(touches, observations, [], [])).toEqual([]);
+@@ -199,7 +199,7 @@ describe('chart view model normalization', () => {
+       bar({ barIndex: 1, barId: '147t:2026-05-21:1', openTimeUtc: '2026-05-21T14:10:00Z', closeTimeUtc: '2026-05-21T14:15:00Z' }),
+     ], 147);
+     const observations: Observation[] = [
+-      { id: 'o1', status: 'completed', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:00:11Z', scheduledEndUtc: '2026-05-21T14:10:11Z' },
++      { id: 'o1', status: 'completed', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:00:11Z', scheduledEndUtc: '2026-05-21T14:10:11Z', originatingTouchId: null, levelPriceTicks: null, direction: null },
+     ];
+ 
+     const markers = normalizeObservationMarkers(observations, createChartTimeResolver(bars));
+@@ -259,9 +259,10 @@ describe('chart view model normalization', () => {
+     ...overrides,
+   });
+ 
+-  it('anchors prediction and outcome markers onto the touch bar with distinct styling', () => {
++  it('anchors the prediction to the touch bar and the outcome to the RESOLUTION bar (COCKPIT P4c)', () => {
+     const bars = normalizeBarsForTimeframe([
+       bar({ barIndex: 42, barId: '147t:2026-05-21:42', openTimeUtc: '2026-05-21T14:00:00Z', closeTimeUtc: '2026-05-21T14:00:20Z' }),
++      bar({ barIndex: 43, barId: '147t:2026-05-21:43', openTimeUtc: '2026-05-21T14:04:00Z', closeTimeUtc: '2026-05-21T14:06:00Z' }),
+     ], 147);
+     const resolve = createChartTimeResolver(bars);
+ 
+@@ -269,9 +270,12 @@ describe('chart view model normalization', () => {
+     expect(predMarkers).toHaveLength(1);
+     expect(predMarkers[0]).toMatchObject({ id: 'prediction:pred-1', time: 1779321642, position: 'aboveBar', shape: 'arrowDown', color: '#36d399' });
+ 
++    // outcome.timeUtc (14:05:00) falls in the SECOND bar — the marker anchors
++    // there, not on the touch bar, while the touch/prediction markers stay put.
+     const outMarkers = normalizeOutcomeMarkers([prediction({ outcome: outcome() })], resolve);
+     expect(outMarkers).toHaveLength(1);
+-    expect(outMarkers[0]).toMatchObject({ id: 'outcome:outcome-1', time: 1779321642, position: 'belowBar', shape: 'arrowUp', color: '#36d399' });
++    expect(outMarkers[0]).toMatchObject({ id: 'outcome:outcome-1', time: 1779321643, position: 'belowBar', shape: 'arrowUp', color: '#36d399' });
++    expect(outMarkers[0].time).not.toBe(predMarkers[0].time);
+   });
+ 
+   it('styles ineligible predictions and incorrect outcomes distinctly', () => {
+@@ -296,7 +300,7 @@ describe('chart view model normalization', () => {
+       { id: 't1', timeUtc: '2026-05-21T14:00:10Z', session: 'ny', levelKind: 'pdh', priceTicks: 76000, createdObservation: true },
+     ];
+     const observations: Observation[] = [
+-      { id: 'o1', status: 'expired', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:00:11Z', scheduledEndUtc: '2026-05-21T14:10:11Z' },
++      { id: 'o1', status: 'expired', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:00:11Z', scheduledEndUtc: '2026-05-21T14:10:11Z', originatingTouchId: null, levelPriceTicks: null, direction: null },
+     ];
+ 
+     const markers = combineMarkers(touches, observations, [prediction({ outcome: outcome() })], bars);
+@@ -331,8 +335,8 @@ describe('chart view model normalization', () => {
+       bar({ barIndex: 0, barId: '147t:2026-05-21:0', openTimeUtc: '2026-05-21T18:00:00Z', closeTimeUtc: '2026-05-21T18:05:00Z' }),
+       bar({ barIndex: 1, barId: '147t:2026-05-21:1', openTimeUtc: '2026-05-21T18:10:00Z', closeTimeUtc: '2026-05-21T18:15:00Z' }),
+     ], 147);
+-    const offWindow = prediction({ id: 'p-old', timeUtc: '2026-05-21T08:10:00Z', eligible: false, outcome: outcome({ id: 'o-old', predictionId: 'p-old' }) });
+-    const inWindow = prediction({ id: 'p-now', timeUtc: '2026-05-21T18:11:00Z', eligible: false, outcome: outcome({ id: 'o-now', predictionId: 'p-now' }) });
++    const offWindow = prediction({ id: 'p-old', timeUtc: '2026-05-21T08:10:00Z', eligible: false, outcome: outcome({ id: 'o-old', predictionId: 'p-old', timeUtc: '2026-05-21T08:15:00Z' }) });
++    const inWindow = prediction({ id: 'p-now', timeUtc: '2026-05-21T18:11:00Z', eligible: false, outcome: outcome({ id: 'o-now', predictionId: 'p-now', timeUtc: '2026-05-21T18:11:30Z' }) });
+ 
+     const markers = combineMarkers([], [], [offWindow, inWindow], bars);
+ 
+@@ -430,3 +434,55 @@ describe('paper-execution markers (EXEC P3b)', () => {
+     expect(ids).toContain('exec-exit:pred-closed');
+   });
+ });
++
++describe('TP/SL position lines (COCKPIT P4a)', () => {
++  it('builds one TP and one SL line per open position with distinct styles', () => {
++    const lines = normalizePositionLines([openPosition(), openPosition({ predictionId: 'pred-2', direction: 'short', tpPrice: 22950, slPrice: 23010 })]);
++
++    expect(lines.map((line) => line.id)).toEqual(['tp:pred-open', 'sl:pred-open', 'tp:pred-2', 'sl:pred-2']);
++    expect(lines[0]).toMatchObject({ price: 23015, title: 'TP long', color: '#36d399', lineWidth: 1, lineStyle: 3 });
++    expect(lines[1]).toMatchObject({ price: 22970, title: 'SL long', color: '#ff6b6b', lineWidth: 1, lineStyle: 3 });
++    expect(lines[2]).toMatchObject({ price: 22950, title: 'TP short' });
++  });
++
++  it('returns no lines when no position is open (close removes them via sync)', () => {
++    expect(normalizePositionLines([])).toEqual([]);
++  });
++});
++
++describe('session shading bands (COCKPIT P4b)', () => {
++  it('classifies ET sessions per the SC v3 scheme, DST-correct', () => {
++    // 2026-05-21 is EDT (UTC-4): 13:30Z = 09:30 ET → ny; 23:30Z = 19:30 ET → asia.
++    expect(classifySessionEt(Date.parse('2026-05-21T13:30:00Z'))).toBe('ny');
++    expect(classifySessionEt(Date.parse('2026-05-21T23:30:00Z'))).toBe('asia');
++    // Asia crosses midnight ET: 06:00Z = 02:00 ET is still asia; 06:50Z = 02:50 ET is a gap.
++    expect(classifySessionEt(Date.parse('2026-05-21T06:00:00Z'))).toBe('asia');
++    expect(classifySessionEt(Date.parse('2026-05-21T06:50:00Z'))).toBeNull();
++    expect(classifySessionEt(Date.parse('2026-05-21T08:00:00Z'))).toBe('london'); // 04:00 ET
++    expect(classifySessionEt(Date.parse('2026-05-21T12:30:00Z'))).toBeNull(); // 08:30 ET gap
++    expect(classifySessionEt(Date.parse('2026-05-21T22:00:00Z'))).toBeNull(); // 18:00 ET gap
++    // 2026-01-15 is EST (UTC-5): 14:30Z = 09:30 ET → ny.
++    expect(classifySessionEt(Date.parse('2026-01-15T14:30:00Z'))).toBe('ny');
++    expect(classifySessionEt(Date.parse('2026-01-15T13:30:00Z'))).toBeNull(); // 08:30 ET gap under EST
++  });
++
++  it('merges contiguous same-session bars and breaks bands on gaps', () => {
++    const bars = normalizeBarsForTimeframe([
++      bar({ barIndex: 0, barId: 'b0', openTimeUtc: '2026-05-21T13:30:00Z' }), // ny
++      bar({ barIndex: 1, barId: 'b1', openTimeUtc: '2026-05-21T14:00:00Z' }), // ny
++      bar({ barIndex: 2, barId: 'b2', openTimeUtc: '2026-05-21T21:30:00Z' }), // 17:30 ET gap
++      bar({ barIndex: 3, barId: 'b3', openTimeUtc: '2026-05-21T23:30:00Z' }), // asia
++      bar({ barIndex: 4, barId: 'b4', openTimeUtc: '2026-05-22T01:00:00Z', tradingDay: '2026-05-22' }), // asia (21:00 ET prev-eve → still asia window)
++    ], 147);
++
++    const bands = sessionBands(bars);
++
++    expect(bands).toHaveLength(2);
++    expect(bands[0]).toMatchObject({ session: 'ny', from: bars[0].time, to: bars[1].time });
++    expect(bands[1]).toMatchObject({ session: 'asia', from: bars[3].time, to: bars[4].time });
++  });
++
++  it('returns no bands without bars', () => {
++    expect(sessionBands([])).toEqual([]);
++  });
++});
+diff --git a/frontend/src/chart/viewModels.ts b/frontend/src/chart/viewModels.ts
+index 1f0791f..02acb57 100644
+--- a/frontend/src/chart/viewModels.ts
++++ b/frontend/src/chart/viewModels.ts
+@@ -1,5 +1,6 @@
+ import type { CandlestickData, SeriesMarker, Time, UTCTimestamp } from 'lightweight-charts';
+ import type { ClosedExecution, MarketBar, MarketLevel, MarketTouch, Observation, OpenPosition, Prediction, Timeframe } from '../domain/models';
++import { etMinutesOfDay } from '../strip/viewModels';
+ 
+ export const PRICE_TICK_SIZE = 0.25;
+ // Sized to hold 2 full trading days (plus the current partial) per timeframe — the live
+@@ -190,8 +191,11 @@ export const normalizePredictionMarkers = (predictions: Prediction[], resolve: (
+     });
+ };
+ 
+-// Outcome markers reuse the touch-bar anchor (resolved from the originating
+-// prediction) so the resolved state lands on the same candle as its prediction.
++// Outcome markers anchor to the RESOLUTION bar (outcome.timeUtc = resolved_ts),
++// not the touch bar — COCKPIT P4c re-anchor per VIZ_RECON §3. The touch and
++// prediction markers stay on the touch bar, so the setup and its resolution
++// read as two distinct instants; a resolution ts is never older than its touch,
++// so this can only gain resolvability under the drop-if-older-than-bars[0] rule.
+ export const normalizeOutcomeMarkers = (predictions: Prediction[], resolve: (iso: string) => UTCTimestamp | null): MarkerOverlay[] => {
+   const deduped = new Map<string, Prediction>();
+   for (const prediction of predictions) if (prediction.outcome) deduped.set(prediction.outcome.id, prediction);
+@@ -200,7 +204,7 @@ export const normalizeOutcomeMarkers = (predictions: Prediction[], resolve: (iso
+     .flatMap((prediction) => {
+       const outcome = prediction.outcome;
+       if (!outcome) return [];
+-      const time = resolve(prediction.timeUtc);
++      const time = resolve(outcome.timeUtc);
+       if (time === null) return [];
+       return [{
+         id: `outcome:${outcome.id}`,
+@@ -265,6 +269,84 @@ export const normalizeExecutionMarkers = (
+   return markers;
+ };
+ 
++// COCKPIT P4a: TP/SL barrier lines for open paper positions. Large-dashed and
++// 1px so they read differently from level lines (eligible = solid 2px,
++// display-only = dashed grey). Removed by the overlay sync when the position
++// closes (its id disappears from the set).
++export type PositionLineOverlay = {
++  id: string;
++  price: number;
++  title: string;
++  color: string;
++  lineWidth: 1 | 2;
++  lineStyle: 0 | 1 | 2 | 3 | 4;
++};
++
++export const normalizePositionLines = (openPositions: OpenPosition[]): PositionLineOverlay[] =>
++  openPositions.flatMap((position) => [
++    {
++      id: `tp:${position.predictionId}`,
++      price: position.tpPrice,
++      title: `TP ${position.direction}`,
++      color: '#36d399',
++      lineWidth: 1 as const,
++      lineStyle: 3 as const,
++    },
++    {
++      id: `sl:${position.predictionId}`,
++      price: position.slPrice,
++      title: `SL ${position.direction}`,
++      color: '#ff6b6b',
++      lineWidth: 1 as const,
++      lineStyle: 3 as const,
++    },
++  ]);
++
++// COCKPIT P4b: session shading bands. Sessions are classified from each bar's
++// open wall-clock instant in America/New_York (SC engine-v3 scheme: asia
++// 19:00–02:45 crossing midnight, london 03:00–08:00, ny 09:00–17:00 ET; the
++// 18:00–19:00 / 02:45–03:00 / 08:00–09:00 / 17:00–18:00 gaps are unsessioned)
++// and contiguous same-session bars merge into one band on the synthetic chart
++// time axis.
++export type SessionBandName = 'asia' | 'london' | 'ny';
++
++export type SessionBand = {
++  session: SessionBandName;
++  from: UTCTimestamp;
++  to: UTCTimestamp;
++};
++
++export const classifySessionEt = (epochMs: number): SessionBandName | null => {
++  const minutes = etMinutesOfDay(epochMs);
++  if (minutes >= 19 * 60 || minutes < 2 * 60 + 45) return 'asia';
++  if (minutes >= 3 * 60 && minutes < 8 * 60) return 'london';
++  if (minutes >= 9 * 60 && minutes < 17 * 60) return 'ny';
++  return null;
++};
++
++export const sessionBands = (bars: ChartBar[]): SessionBand[] => {
++  const bands: SessionBand[] = [];
++  let current: { session: SessionBandName; from: UTCTimestamp; to: UTCTimestamp } | null = null;
++  for (const bar of bars) {
++    const at = Date.parse(bar.openTimeUtc);
++    if (!Number.isFinite(at)) continue;
++    const session = classifySessionEt(at);
++    if (session === null) {
++      if (current) bands.push(current);
++      current = null;
++      continue;
++    }
++    if (current && current.session === session) {
++      current.to = bar.time as UTCTimestamp;
++    } else {
++      if (current) bands.push(current);
++      current = { session, from: bar.time as UTCTimestamp, to: bar.time as UTCTimestamp };
++    }
++  }
++  if (current) bands.push(current);
++  return bands;
++};
++
+ export const combineMarkers = (touches: MarketTouch[], observations: Observation[], predictions: Prediction[], bars: ChartBar[], openPositions: OpenPosition[] = [], closedExecutions: ClosedExecution[] = []): MarkerOverlay[] => {
+   const resolve = createChartTimeResolver(bars);
+   const deduped = new Map<string, MarkerOverlay>();
+diff --git a/frontend/src/components/ChartWorkspace.test.tsx b/frontend/src/components/ChartWorkspace.test.tsx
+index 38aaac3..f9f238a 100644
+--- a/frontend/src/components/ChartWorkspace.test.tsx
++++ b/frontend/src/components/ChartWorkspace.test.tsx
+@@ -1,8 +1,8 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+-import { act, cleanup, render } from '@testing-library/react';
++import { act, cleanup, render, screen } from '@testing-library/react';
+ import { ChartWorkspace } from './ChartWorkspace';
+ import { RealtimeClient } from '../realtime/client';
+-import { blotterStore, connectionStore, intelligenceStore, marketStore, predictionStore, runtimeStore } from '../state/stores';
++import { addOpenPosition, blotterStore, connectionStore, executionStore, intelligenceStore, marketStore, predictionStore, runtimeStore } from '../state/stores';
+ import type { BarDTO, DisplayLevelDTO, Envelope, FeedStatusDTO, ObservationDTO, OutcomeDTO, PredictionDTO, TouchDTO } from '../realtime/types';
+ import type { TradingChart } from './TradingChart';
+ 
+@@ -34,6 +34,7 @@ const resetStores = () => {
+   intelligenceStore.reset();
+   blotterStore.reset();
+   predictionStore.reset();
++  executionStore.reset();
+ };
+ 
+ const bar = (timeframe = 147, complete = false, overrides: Partial<BarDTO> = {}): BarDTO => ({
+@@ -225,6 +226,42 @@ describe('ChartWorkspace realtime chart dataflow', () => {
+     expect(ids).toContain('outcome:outcome-1');
+   });
+ 
++  it('badges the decision timeframe tab and passes TP/SL lines for open positions (COCKPIT P4a/P4d)', () => {
++    render(<ChartWorkspace />);
++
++    // Decision timeframe = min(supportedTimeframes) — the backend's own rule.
++    expect(screen.getByRole('button', { name: '147t · decision' })).toBeInTheDocument();
++    expect(screen.getByRole('button', { name: '987t' })).toBeInTheDocument();
++    expect(screen.getByRole('button', { name: '2000t' })).toBeInTheDocument();
++
++    act(() =>
++      addOpenPosition({
++        predictionId: 'pred-1',
++        touchId: 'touch-1',
++        direction: 'long',
++        contracts: 1,
++        entryTsUtc: '2026-05-21T14:00:05Z',
++        entryPrice: 23000,
++        entryPriceConservative: 23000.25,
++        tpPrice: 23015,
++        slPrice: 22970,
++        session: 'ny',
++        levelKind: 'pdl',
++        bundleId: 'bundle-a',
++        mode: 'replay',
++        pointValue: 20,
++        lastPrice: null,
++        unrealizedPoints: null,
++        unrealizedPointsConservative: null,
++      }),
++    );
++
++    expect(lastChartProps().positionLines?.map((line) => line.id)).toEqual(['tp:pred-1', 'sl:pred-1']);
++
++    act(() => executionStore.setState({ openPositions: [], closed: [] }));
++    expect(lastChartProps().positionLines).toEqual([]);
++  });
++
+   it('does not change chart bars or overlays on heartbeat and feed-status messages', () => {
+     render(<ChartWorkspace />);
+     act(() => client.start());
+diff --git a/frontend/src/components/ChartWorkspace.tsx b/frontend/src/components/ChartWorkspace.tsx
+index 958d408..1183d99 100644
+--- a/frontend/src/components/ChartWorkspace.tsx
++++ b/frontend/src/components/ChartWorkspace.tsx
+@@ -1,5 +1,5 @@
+ import { useMemo } from 'react';
+-import { combineMarkers, normalizeBarsForTimeframe, normalizeLevels } from '../chart/viewModels';
++import { combineMarkers, normalizeBarsForTimeframe, normalizeLevels, normalizePositionLines } from '../chart/viewModels';
+ import { TradingChart } from './TradingChart';
+ import { marketStore, useConnection, useExecutions, useIntelligence, useMarket, usePredictions, useRuntime } from '../state/stores';
+ import type { Timeframe } from '../domain/models';
+@@ -20,11 +20,16 @@ export function ChartWorkspace() {
+   const closedExecutions = useExecutions((state) => state.closed);
+   const feedReady = useRuntime((state) => state.feedReady);
+   const apiOnline = useRuntime((state) => state.apiOnline);
++  const supportedTimeframes = useRuntime((state) => state.supportedTimeframes);
+   const wsStatus = useConnection((state) => state.wsStatus);
+ 
+   const bars = useMemo(() => normalizeBarsForTimeframe([...currentBars, ...recentClosedBars], selectedTimeframe), [currentBars, recentClosedBars, selectedTimeframe]);
+   const levelOverlays = useMemo(() => normalizeLevels(levels), [levels]);
+   const markerOverlays = useMemo(() => combineMarkers(touches, observations, predictions, bars, openPositions, closedExecutions), [touches, observations, predictions, bars, openPositions, closedExecutions]);
++  const positionLines = useMemo(() => normalizePositionLines(openPositions), [openPositions]);
++  // COCKPIT P4d: the decision timeframe is the smallest served timeframe — the
++  // same min(...) rule the backend uses for ServingCapabilities (app.py:278).
++  const decisionTimeframe = supportedTimeframes.length > 0 ? Math.min(...supportedTimeframes) : null;
+ 
+   return (
+     <section className="panel chart-panel">
+@@ -36,7 +41,7 @@ export function ChartWorkspace() {
+         <div className="segmented-control" aria-label="Tick timeframe">
+           {TIMEFRAMES.map((timeframe) => (
+             <button key={timeframe} className={selectedTimeframe === timeframe ? 'active' : ''} onClick={() => marketStore.setState({ selectedTimeframe: timeframe })}>
+-              {timeframe}t
++              {timeframe}t{timeframe === decisionTimeframe ? ' · decision' : ''}
+             </button>
+           ))}
+         </div>
+@@ -46,6 +51,7 @@ export function ChartWorkspace() {
+         bars={bars}
+         levels={levelOverlays}
+         markers={markerOverlays}
++        positionLines={positionLines}
+         emptyTitle={feedReady ? `Awaiting ${selectedTimeframe}t tick bars` : 'Runtime snapshot idle'}
+         emptySubtitle={`Backend ${apiOnline ? 'reachable' : 'offline'} · WebSocket ${wsStatus}`}
+       />
+diff --git a/frontend/src/components/EventBlotter.test.tsx b/frontend/src/components/EventBlotter.test.tsx
+index 73487d6..10dfa50 100644
+--- a/frontend/src/components/EventBlotter.test.tsx
++++ b/frontend/src/components/EventBlotter.test.tsx
+@@ -1,16 +1,56 @@
+ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+ import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+ import { EventBlotter } from './EventBlotter';
+-import { blotterStore } from '../state/stores';
++import { addBlotterEvent, blotterStore, executionStore } from '../state/stores';
++import type { BlotterEvent, ClosedExecution } from '../domain/models';
++
++let eventCounter = 0;
++
++const tapeEvent = (tape: NonNullable<BlotterEvent['tape']>, overrides: Partial<BlotterEvent> = {}): BlotterEvent => {
++  eventCounter += 1;
++  return {
++    id: `event-${eventCounter}`,
++    timeUtc: '2026-05-21T14:03:00Z',
++    category: 'observation',
++    severity: 'info',
++    message: 'typed row',
++    tape,
++    ...overrides,
++  };
++};
++
++const closedExecution = (overrides: Partial<ClosedExecution> = {}): ClosedExecution => ({
++  predictionId: 'pred-1',
++  touchId: 'touch-1',
++  direction: 'long',
++  contracts: 1,
++  entryTsUtc: '2026-05-21T14:00:05Z',
++  exitTsUtc: '2026-05-21T14:01:05Z',
++  reason: 'tp_hit',
++  entryPrice: 23000,
++  entryPriceConservative: 23000.25,
++  exitPrice: 23015,
++  exitPriceConservative: 23015,
++  points: 15,
++  pointsConservative: 14.75,
++  dollars: 300,
++  dollarsConservative: 295,
++  pointValue: 20,
++  session: 'ny',
++  levelKind: 'pdl',
++  ...overrides,
++});
+ 
+ describe('EventBlotter', () => {
+   beforeEach(() => {
+     blotterStore.reset();
++    executionStore.reset();
+   });
+ 
+   afterEach(() => {
+     cleanup();
+     blotterStore.reset();
++    executionStore.reset();
+   });
+ 
+   it('renders compact warning rows with expandable safe provider details only', () => {
+@@ -56,4 +96,91 @@ describe('EventBlotter', () => {
+     expect(row as HTMLElement).not.toHaveTextContent('db-secret');
+     expect(row as HTMLElement).not.toHaveTextContent('[object Object]');
+   });
++
++  it('renders typed tape rows: prediction, outcome with executed points, drop, open, close', () => {
++    executionStore.setState({ openPositions: [], closed: [closedExecution()] });
++    blotterStore.setState({
++      events: [
++        tapeEvent({ kind: 'position_close', predictionId: 'pred-1', direction: 'long', reason: 'tp_hit', points: 15, pointsConservative: 14.75, exitPrice: 23015 }),
++        tapeEvent({ kind: 'position_open', predictionId: 'pred-1', direction: 'long', entryPrice: 23000, entryPriceConservative: 23000.25, tpPrice: 23015, slPrice: 22970 }),
++        tapeEvent({ kind: 'outcome', predictionId: 'pred-1', resolutionType: 'tp_hit', correct: true, actualClass: 'up' }),
++        tapeEvent({ kind: 'drop', predictionId: 'pred-2', reason: 'no_fill' }),
++        tapeEvent({ kind: 'prediction', predictionId: 'pred-1', predictedClass: 'up', probability: 0.72, eligible: true, direction: 'long', session: 'ny' }),
++      ],
++    });
++
++    render(<EventBlotter />);
++
++    // Prediction: class, probability, gate verdict.
++    expect(screen.getByText('pred')).toBeInTheDocument();
++    expect(screen.getByText('up')).toBeInTheDocument();
++    expect(screen.getByText('p 0.72')).toBeInTheDocument();
++    expect(screen.getByText('eligible')).toBeInTheDocument();
++    // Outcome: resolution + realized points joined from the executions store.
++    expect(screen.getByText('outcome')).toBeInTheDocument();
++    expect(screen.getByText('correct')).toBeInTheDocument();
++    expect(screen.getAllByText('+15.00 / +14.75 pts').length).toBe(2); // outcome row + close row
++    // Drop: reason.
++    expect(screen.getByText('drop')).toBeInTheDocument();
++    expect(screen.getByText('no fill')).toBeInTheDocument();
++    // Open: both entry columns + barriers; close: reason + both point columns.
++    expect(screen.getByText('long @ 23000.00 / 23000.25')).toBeInTheDocument();
++    expect(screen.getByText('tp 23015.00 · sl 22970.00')).toBeInTheDocument();
++    expect(screen.getByText('close')).toBeInTheDocument();
++  });
++
++  it('leaves outcome points blank when no execution close exists for the prediction', () => {
++    blotterStore.setState({
++      events: [tapeEvent({ kind: 'outcome', predictionId: 'pred-untracked', resolutionType: 'sl_hit', correct: false, actualClass: 'down' })],
++    });
++
++    render(<EventBlotter />);
++
++    expect(screen.getByText('miss')).toBeInTheDocument();
++    expect(screen.getByText('sl hit')).toBeInTheDocument();
++    expect(screen.queryByText(/pts/)).not.toBeInTheDocument();
++  });
++
++  it('filters the tape with chips and keeps untyped rows under All only', () => {
++    blotterStore.setState({
++      events: [
++        tapeEvent({ kind: 'prediction', predictionId: 'pred-1', predictedClass: 'up', probability: 0.72, eligible: true, direction: 'long', session: 'ny' }),
++        tapeEvent({ kind: 'drop', predictionId: 'pred-2', reason: 'no_fill' }),
++        tapeEvent({ kind: 'position_open', predictionId: 'pred-1', direction: 'long', entryPrice: 23000, entryPriceConservative: 23000.25, tpPrice: 23015, slPrice: 22970 }),
++        { id: 'plain-1', timeUtc: '2026-05-21T14:03:00Z', category: 'system', severity: 'info', message: 'Heartbeat' },
++      ],
++    });
++
++    render(<EventBlotter />);
++    expect(screen.getByText('Heartbeat')).toBeInTheDocument();
++
++    fireEvent.click(screen.getByRole('button', { name: 'Predictions' }));
++    expect(screen.getByText('pred')).toBeInTheDocument();
++    expect(screen.queryByText('Heartbeat')).not.toBeInTheDocument();
++    expect(screen.queryByText('drop')).not.toBeInTheDocument();
++
++    fireEvent.click(screen.getByRole('button', { name: 'Drops' }));
++    expect(screen.getByText('no fill')).toBeInTheDocument();
++    expect(screen.queryByText('pred')).not.toBeInTheDocument();
++
++    fireEvent.click(screen.getByRole('button', { name: 'Executions' }));
++    expect(screen.getByText('open')).toBeInTheDocument();
++
++    fireEvent.click(screen.getByRole('button', { name: 'All' }));
++    expect(screen.getByText('Heartbeat')).toBeInTheDocument();
++  });
++
++  it('flashes the newest row and keeps the render bounded at 80 rows', () => {
++    for (let index = 0; index < 90; index += 1) {
++      addBlotterEvent({ timeUtc: '2026-05-21T14:03:00Z', category: 'system', severity: 'info', message: `row ${index}` });
++    }
++
++    render(<EventBlotter />);
++
++    const rows = document.querySelectorAll('.blotter-row');
++    expect(rows).toHaveLength(80);
++    expect(rows[0].className).toContain('tape-newest');
++    expect(rows[0]).toHaveTextContent('row 89'); // newest-first
++    expect(rows[1].className).not.toContain('tape-newest');
++  });
+ });
+diff --git a/frontend/src/components/EventBlotter.tsx b/frontend/src/components/EventBlotter.tsx
+index 25f0a1c..a6cfff3 100644
+--- a/frontend/src/components/EventBlotter.tsx
++++ b/frontend/src/components/EventBlotter.tsx
+@@ -1,4 +1,10 @@
+-import { useBlotter } from '../state/stores';
++// COCKPIT P5: the Runtime Events blotter is a trade tape — typed rows for
++// predictions, outcomes, drops, and position open/close, with filter chips and
++// a newest-row flash. Untyped runtime events keep their plain rows under All.
++import { useState } from 'react';
++import { useBlotter, useExecutions } from '../state/stores';
++import type { ClosedExecution, TapeRow } from '../domain/models';
++import { TAPE_FILTERS, formatTapeBracket, matchesTapeFilter, realizedPointsFor, type TapeFilter } from '../blotter/viewModels';
+ 
+ const numericDetailLabels: Record<string, string> = {
+   dropped: 'Dropped',
+@@ -7,33 +13,113 @@ const numericDetailLabels: Record<string, string> = {
+   total_dropped_messages: 'Total dropped messages',
+ };
+ 
++const FILTER_LABELS: Record<TapeFilter, string> = {
++  all: 'All',
++  predictions: 'Predictions',
++  executions: 'Executions',
++  drops: 'Drops',
++};
++
+ export function EventBlotter() {
+   const { events } = useBlotter();
++  const closed = useExecutions((state) => state.closed);
++  const [filter, setFilter] = useState<TapeFilter>('all');
++  const visible = events.filter((event) => matchesTapeFilter(event, filter)).slice(0, 80);
++
+   return (
+     <section className="panel blotter-panel">
+-      <div className="panel-header compact"><span className="eyebrow">Event blotter</span><h2>Runtime Events</h2></div>
++      <div className="panel-header compact">
++        <span className="eyebrow">Trade tape</span>
++        <h2>Runtime Events</h2>
++        <div className="segmented-control blotter-filters" role="group" aria-label="Trade tape filter">
++          {TAPE_FILTERS.map((entry) => (
++            <button key={entry} className={filter === entry ? 'active' : ''} onClick={() => setFilter(entry)}>
++              {FILTER_LABELS[entry]}
++            </button>
++          ))}
++        </div>
++      </div>
+       <div className="blotter-table">
+-        {events.length === 0 ? <p className="empty-text">Waiting for API status and WebSocket events.</p> : events.slice(0, 80).map((event) => (
+-          <details className="blotter-row" key={event.id}>
+-            <summary>
+-              <time>{new Date(event.timeUtc).toLocaleTimeString()}</time>
+-              <span className={`category ${event.severity}`}>{event.category}</span>
+-              <strong>{event.message}</strong>
+-              {event.code ? <span className="code-badge">{event.code}</span> : null}
+-            </summary>
+-            <dl className="blotter-details">
+-              <div><dt>Timestamp</dt><dd>{event.timeUtc}</dd></div>
+-              {event.code ? <div><dt>Code</dt><dd>{event.code}</dd></div> : null}
+-              {event.source ? <div><dt>Source</dt><dd>{event.source}</dd></div> : null}
+-              {event.details?.schema ? <div><dt>Schema</dt><dd>{event.details.schema}</dd></div> : null}
+-              {event.details?.detail ? <div><dt>Detail</dt><dd>{event.details.detail}</dd></div> : null}
+-              {Object.entries(numericDetailLabels).filter(([key]) => typeof event.details?.[key as keyof typeof event.details] === 'number').map(([key, label]) => (
+-                <div key={key}><dt>{label}</dt><dd>{String(event.details?.[key as keyof typeof event.details])}</dd></div>
+-              ))}
+-            </dl>
+-          </details>
+-        ))}
++        {visible.length === 0 ? (
++          <p className="empty-text">
++            {events.length === 0 ? 'Waiting for API status and WebSocket events.' : `No ${filter} rows in the retained tape.`}
++          </p>
++        ) : (
++          visible.map((event, index) => (
++            <details className={`blotter-row${index === 0 ? ' tape-newest' : ''}`} key={event.id}>
++              <summary>
++                <time>{new Date(event.timeUtc).toLocaleTimeString()}</time>
++                <span className={`category ${event.severity}`}>{event.category}</span>
++                {event.tape ? <TapeSummary tape={event.tape} closed={closed} /> : <strong>{event.message}</strong>}
++                {event.code ? <span className="code-badge">{event.code}</span> : null}
++              </summary>
++              <dl className="blotter-details">
++                <div><dt>Timestamp</dt><dd>{event.timeUtc}</dd></div>
++                {event.code ? <div><dt>Code</dt><dd>{event.code}</dd></div> : null}
++                {event.source ? <div><dt>Source</dt><dd>{event.source}</dd></div> : null}
++                {event.details?.schema ? <div><dt>Schema</dt><dd>{event.details.schema}</dd></div> : null}
++                {event.details?.detail ? <div><dt>Detail</dt><dd>{event.details.detail}</dd></div> : null}
++                {Object.entries(numericDetailLabels).filter(([key]) => typeof event.details?.[key as keyof typeof event.details] === 'number').map(([key, label]) => (
++                  <div key={key}><dt>{label}</dt><dd>{String(event.details?.[key as keyof typeof event.details])}</dd></div>
++                ))}
++              </dl>
++            </details>
++          ))
++        )}
+       </div>
+     </section>
+   );
+ }
++
++function TapeSummary({ tape, closed }: { tape: TapeRow; closed: ClosedExecution[] }) {
++  switch (tape.kind) {
++    case 'prediction':
++      return (
++        <span className="tape-summary">
++          <span className="tape-kind prediction">pred</span>
++          <strong>{tape.predictedClass}</strong>
++          <span className="tape-meta">{tape.probability === null ? 'p —' : `p ${tape.probability.toFixed(2)}`}</span>
++          <span className={`intel-badge ${tape.eligible ? 'eligible' : 'ineligible'}`}>{tape.eligible ? 'eligible' : 'ineligible'}</span>
++          <span className="tape-meta">{tape.direction} · {tape.session}</span>
++        </span>
++      );
++    case 'outcome': {
++      const realized = realizedPointsFor(tape, closed);
++      return (
++        <span className="tape-summary">
++          <span className="tape-kind outcome">outcome</span>
++          <span className={`intel-badge ${tape.correct ? 'correct' : 'incorrect'}`}>{tape.correct ? 'correct' : 'miss'}</span>
++          <strong>{tape.resolutionType.replaceAll('_', ' ')}</strong>
++          <span className="tape-meta">actual {tape.actualClass}</span>
++          {realized ? (
++            <span className={`tape-points ${realized.points >= 0 ? 'pos' : 'neg'}`}>{formatTapeBracket(realized.points, realized.pointsConservative)}</span>
++          ) : null}
++        </span>
++      );
++    }
++    case 'drop':
++      return (
++        <span className="tape-summary">
++          <span className="tape-kind drop">drop</span>
++          <strong>{tape.reason.replaceAll('_', ' ')}</strong>
++        </span>
++      );
++    case 'position_open':
++      return (
++        <span className="tape-summary">
++          <span className="tape-kind open">open</span>
++          <strong>{tape.direction} @ {tape.entryPrice.toFixed(2)} / {tape.entryPriceConservative.toFixed(2)}</strong>
++          <span className="tape-meta">tp {tape.tpPrice.toFixed(2)} · sl {tape.slPrice.toFixed(2)}</span>
++        </span>
++      );
++    case 'position_close':
++      return (
++        <span className="tape-summary">
++          <span className="tape-kind close">close</span>
++          <strong>{tape.reason.replaceAll('_', ' ')}</strong>
++          <span className={`tape-points ${tape.points >= 0 ? 'pos' : 'neg'}`}>{formatTapeBracket(tape.points, tape.pointsConservative)}</span>
++          <span className="tape-meta">{tape.direction} exit {tape.exitPrice.toFixed(2)}</span>
++        </span>
++      );
++  }
++}
+diff --git a/frontend/src/components/IntelligencePanel.test.tsx b/frontend/src/components/IntelligencePanel.test.tsx
+index d649093..17bf597 100644
+--- a/frontend/src/components/IntelligencePanel.test.tsx
++++ b/frontend/src/components/IntelligencePanel.test.tsx
+@@ -1,8 +1,8 @@
+ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+ import { cleanup, render, screen } from '@testing-library/react';
+ import { IntelligencePanel } from './IntelligencePanel';
+-import { intelligenceStore, predictionStore, runtimeStore } from '../state/stores';
+-import type { Outcome, Prediction } from '../domain/models';
++import { intelligenceStore, marketStore, predictionStore, runtimeStore } from '../state/stores';
++import type { MarketBar, MarketLevel, ModelStatus, Observation, Outcome, Prediction } from '../domain/models';
+ 
+ const prediction = (overrides: Partial<Prediction> = {}): Prediction => ({
+   id: 'pred-1',
+@@ -40,15 +40,173 @@ const outcome = (overrides: Partial<Outcome> = {}): Outcome => ({
+   ...overrides,
+ });
+ 
++const level = (overrides: Partial<MarketLevel>): MarketLevel => ({
++  kind: 'pdh',
++  priceTicks: 76_000,
++  tradingDay: '2026-05-21',
++  originSession: null,
++  developing: false,
++  eligible: true,
++  ...overrides,
++});
++
++const marketBar = (overrides: Partial<MarketBar>): MarketBar => ({
++  timeframe: 147,
++  tradingDay: '2026-05-21',
++  barIndex: 3,
++  barId: null,
++  openTimeUtc: '2026-05-21T14:00:00Z',
++  closeTimeUtc: '2026-05-21T14:00:10Z',
++  openTicks: 75_990,
++  highTicks: 76_012,
++  lowTicks: 75_988,
++  closeTicks: 76_000,
++  volume: 5,
++  tradeCount: 5,
++  complete: false,
++  ...overrides,
++});
++
++const activeModelStatus = (overrides: Partial<ModelStatus> = {}): ModelStatus => ({
++  loaded: true,
++  modelId: 'model-alpha',
++  strategyId: 'strategy-1',
++  trainingMode: 'mae_first',
++  instrument: 'NQ',
++  featureNames: [],
++  classMap: {},
++  validationOk: true,
++  validationDetail: null,
++  confidenceGate: 0.7,
++  eligibleClass: 'up',
++  eligibleSessions: ['ny'],
++  ...overrides,
++});
++
++const activeObservation = (overrides: Partial<Observation> = {}): Observation => ({
++  id: 'obs-1',
++  status: 'active',
++  session: 'ny',
++  levelKind: 'pdh',
++  startUtc: '2026-05-21T14:00:00Z',
++  scheduledEndUtc: '2026-05-21T14:05:00Z',
++  originatingTouchId: 'touch-1',
++  levelPriceTicks: 76_000,
++  direction: 'short',
++  ...overrides,
++});
++
+ describe('IntelligencePanel', () => {
+   beforeEach(() => {
+     intelligenceStore.reset();
+     predictionStore.reset();
+     runtimeStore.reset();
++    marketStore.reset();
+   });
+ 
+   afterEach(() => cleanup());
+ 
++  it('sorts levels by distance from the last print with the nearest highlighted', () => {
++    marketStore.setState({ currentBars: [marketBar({})], recentClosedBars: [] });
++    intelligenceStore.setState({
++      levels: [
++        level({ kind: 'asia_low', priceTicks: 75_600 }),
++        level({ kind: 'pdh', priceTicks: 76_020 }),
++        level({ kind: 'pdl', priceTicks: 75_900 }),
++      ],
++    });
++    render(<IntelligencePanel />);
++
++    const rows = document.querySelectorAll('.level-row');
++    expect([...rows].map((row) => row.querySelector('span')?.textContent)).toEqual(['pdh', 'pdl', 'asia low']);
++    expect(rows[0].className).toContain('nearest');
++    expect(rows[0]).toHaveTextContent('+5.00 pts (+20t)');
++    expect(rows[0]).toHaveTextContent('19005.00');
++    expect(rows[1]).toHaveTextContent('−25.00 pts (−100t)');
++  });
++
++  it('labels the nearest PDH/PDL level origin as prior day, not unknown', () => {
++    marketStore.setState({ currentBars: [marketBar({})], recentClosedBars: [] });
++    intelligenceStore.setState({ levels: [level({ kind: 'pdh', originSession: null })] });
++    render(<IntelligencePanel />);
++
++    expect(screen.getByText('Level origin').closest('.key-value')).toHaveTextContent('prior day');
++  });
++
++  it('renders the gate math with a fill bar and no reason for an eligible prediction', () => {
++    predictionStore.setState({
++      predictions: [prediction({ probabilities: { up: 0.82, hold: 0.18 } })],
++      modelStatus: activeModelStatus(),
++      outcomes: [],
++      dropped: [],
++      bundles: [],
++    });
++    render(<IntelligencePanel />);
++
++    expect(screen.getByTestId('gate-math')).toHaveTextContent('up 0.82 / 0.70');
++    expect(screen.queryByText(/why:/)).not.toBeInTheDocument();
++  });
++
++  it('states WHY an ineligible prediction failed, in priority order', () => {
++    predictionStore.setState({
++      predictions: [prediction({ eligible: false, probabilities: { up: 0.69, hold: 0.31 } })],
++      modelStatus: activeModelStatus(),
++      outcomes: [],
++      dropped: [],
++      bundles: [],
++    });
++    render(<IntelligencePanel />);
++    expect(screen.getByText('why: gate — 0.69 below 0.70')).toBeInTheDocument();
++
++    cleanup();
++    predictionStore.setState({
++      predictions: [prediction({ eligible: false, predictedClass: 'hold', session: 'asia' })],
++      modelStatus: activeModelStatus(),
++      outcomes: [],
++      dropped: [],
++      bundles: [],
++    });
++    render(<IntelligencePanel />);
++    expect(screen.getByText('why: class — predicted hold, eligible up')).toBeInTheDocument();
++  });
++
++  it('hides the gate math when the prediction predates the active model', () => {
++    predictionStore.setState({
++      predictions: [prediction({ modelId: 'older-model' })],
++      modelStatus: activeModelStatus(),
++      outcomes: [],
++      dropped: [],
++      bundles: [],
++    });
++    render(<IntelligencePanel />);
++
++    expect(screen.queryByTestId('gate-math')).not.toBeInTheDocument();
++  });
++
++  it('shows an active-setup card with level, touch price, direction, and event-clock countdown', () => {
++    marketStore.setState({ currentBars: [marketBar({})], recentClosedBars: [] });
++    intelligenceStore.setState({
++      observations: [activeObservation()],
++      touches: [{ id: 'touch-1', timeUtc: '2026-05-21T14:00:00Z', session: 'ny', levelKind: 'pdh', priceTicks: 76_004, createdObservation: true }],
++    });
++    render(<IntelligencePanel />);
++
++    const card = screen.getByTestId('active-setup-card');
++    expect(card).toHaveTextContent('pdh');
++    expect(card).toHaveTextContent('@ 19000.00');
++    expect(card).toHaveTextContent('short');
++    expect(card).toHaveTextContent('Touch 19001.00');
++    // Event clock = latest bar close 14:00:10; window ends 14:05:00 → 4:50.
++    expect(card).toHaveTextContent('ends in 4:50');
++  });
++
++  it('renders no setup card when no observation is active', () => {
++    intelligenceStore.setState({ observations: [activeObservation({ status: 'expired' })] });
++    render(<IntelligencePanel />);
++
++    expect(screen.queryByTestId('active-setup-card')).not.toBeInTheDocument();
++  });
++
+   it('renders the real runtime session and trading day from the store', () => {
+     runtimeStore.setState({ session: 'ny', tradingDay: '2026-05-21', engineReady: true });
+     render(<IntelligencePanel />);
+diff --git a/frontend/src/components/IntelligencePanel.tsx b/frontend/src/components/IntelligencePanel.tsx
+index 890a984..56921ee 100644
+--- a/frontend/src/components/IntelligencePanel.tsx
++++ b/frontend/src/components/IntelligencePanel.tsx
+@@ -1,7 +1,17 @@
+-import { useIntelligence, usePredictions, useRuntime } from '../state/stores';
+-import type { Prediction } from '../domain/models';
++import { useIntelligence, useMarket, useModelStatus, usePredictions, useRuntime } from '../state/stores';
++import type { ModelStatus, Prediction } from '../domain/models';
++import { latestPrice } from '../execution/viewModels';
++import {
++  activeSetup,
++  describeGateReason,
++  formatLevelDistance,
++  formatSetupCountdown,
++  gateMath,
++  levelOriginLabel,
++  observationSecondsRemaining,
++  sortLevelsByDistance,
++} from '../intel/viewModels';
+ 
+-const LEVEL_ORDER = ['pdh', 'pdl', 'asia_high', 'asia_low', 'london_high', 'london_low', 'ny_high', 'ny_low'];
+ const price = (ticks: number) => (ticks / 4).toFixed(2);
+ const pct = (value: number) => `${(value * 100).toFixed(0)}%`;
+ 
+@@ -9,28 +19,58 @@ export function IntelligencePanel() {
+   const runtime = useRuntime();
+   const { levels, touches, observations, warnings } = useIntelligence();
+   const predictions = usePredictions();
+-  const orderedLevels = [...levels].sort((a, b) => LEVEL_ORDER.indexOf(a.kind) - LEVEL_ORDER.indexOf(b.kind));
++  const modelStatus = useModelStatus();
++  const currentBars = useMarket((state) => state.currentBars);
++  const recentClosedBars = useMarket((state) => state.recentClosedBars);
++
++  // COCKPIT P3a: levels sort by absolute distance from the last print; the
++  // event clock (latest bar close) also drives the setup-card countdown.
++  const last = latestPrice(currentBars, recentClosedBars);
++  const lastPriceTicks = last === null ? null : Math.round(last.price * 4);
++  const levelRows = sortLevelsByDistance(levels, lastPriceTicks);
++  const setup = activeSetup(observations, touches);
+ 
+   return (
+     <aside className="panel intelligence-panel">
+       <div className="panel-header compact"><span className="eyebrow">Intelligence</span><h2>Market Structure</h2></div>
++      {setup && (
++        <Section title={`Active Setup${setup.activeCount > 1 ? ` (${setup.activeCount} open)` : ''}`}>
++          <div className="setup-card" data-testid="active-setup-card">
++            <div className="setup-card-head">
++              <strong>{setup.observation.levelKind.replaceAll('_', ' ')}</strong>
++              {setup.observation.levelPriceTicks !== null && <span className="setup-level-price">@ {price(setup.observation.levelPriceTicks)}</span>}
++              <span className={`intel-badge ${setup.observation.direction ?? ''}`}>{setup.observation.direction ?? 'direction —'}</span>
++            </div>
++            <div className="setup-card-meta">
++              <span>Touch {setup.touchPriceTicks !== null ? price(setup.touchPriceTicks) : '—'}</span>
++              <span>{setup.observation.session}</span>
++              <span className="setup-countdown">
++                ends in {formatSetupCountdown(observationSecondsRemaining(setup.observation.scheduledEndUtc, last?.timeUtc ?? null))}
++              </span>
++            </div>
++          </div>
++        </Section>
++      )}
+       <Section title="Runtime">
+         <KeyValue label="Session" value={runtime.session ?? 'unavailable'} />
+-        <KeyValue label="Level origin" value={levels[0]?.originSession ?? 'unknown'} />
+-        <KeyValue label="Trading day" value={runtime.tradingDay ?? levels[0]?.tradingDay ?? '—'} />
++        <KeyValue label="Level origin" value={levelOriginLabel(levelRows[0]?.level)} />
++        <KeyValue label="Trading day" value={runtime.tradingDay ?? levelRows[0]?.level.tradingDay ?? '—'} />
+         <KeyValue label="Eligibility" value={runtime.engineReady ? 'engine ready' : 'engine offline'} />
+       </Section>
+       <Section title="Levels">
+-        {orderedLevels.length === 0 ? <Empty text="No display levels in snapshot." /> : orderedLevels.map((level) => (
+-          <div className="level-row" key={`${level.kind}-${level.priceTicks}`}>
++        {levelRows.length === 0 ? <Empty text="No display levels in snapshot." /> : levelRows.map(({ level, distanceTicks, nearest }) => (
++          <div className={`level-row${nearest ? ' nearest' : ''}`} key={`${level.kind}-${level.priceTicks}`}>
+             <span>{level.kind.replaceAll('_', ' ')}</span>
+-            <strong>{price(level.priceTicks)}</strong>
++            <strong className={distanceTicks === null ? '' : distanceTicks >= 0 ? 'dist-above' : 'dist-below'}>
++              {formatLevelDistance(distanceTicks)}
++            </strong>
++            <small className="level-price">{price(level.priceTicks)}</small>
+             <em className={level.eligible ? 'eligible' : ''}>{level.eligible ? 'eligible' : 'display'}</em>
+           </div>
+         ))}
+       </Section>
+       <Section title="Predictions">
+-        {predictions.length === 0 ? <Empty text="No predictions yet." /> : predictions.slice(0, 8).map((prediction) => <PredictionRow key={prediction.id} prediction={prediction} />)}
++        {predictions.length === 0 ? <Empty text="No predictions yet." /> : predictions.slice(0, 8).map((prediction) => <PredictionRow key={prediction.id} prediction={prediction} modelStatus={modelStatus} />)}
+       </Section>
+       <Section title="Touches">
+         {touches.length === 0 ? <Empty text="No touches detected." /> : touches.slice(0, 6).map((touch) => <KeyValue key={touch.id} label={touch.levelKind} value={`${price(touch.priceTicks)} · ${touch.session}`} />)}
+@@ -45,10 +85,13 @@ export function IntelligencePanel() {
+   );
+ }
+ 
+-function PredictionRow({ prediction }: { prediction: Prediction }) {
++function PredictionRow({ prediction, modelStatus }: { prediction: Prediction; modelStatus: ModelStatus | null }) {
+   const probEntries = Object.entries(prediction.probabilities).sort(([, a], [, b]) => b - a);
+   const outcome = prediction.outcome;
+   const dropped = prediction.dropped;
++  // COCKPIT P3b: the gate math — eligible-class probability vs confidence gate.
++  const math = gateMath(prediction, modelStatus);
++  const reason = math === null ? null : describeGateReason(math, prediction, modelStatus);
+   return (
+     <div className="intel-prediction">
+       <div className="intel-prediction-head">
+@@ -56,6 +99,18 @@ function PredictionRow({ prediction }: { prediction: Prediction }) {
+         <span className={`intel-badge ${prediction.eligible ? 'eligible' : 'ineligible'}`}>{prediction.eligible ? 'eligible' : 'ineligible'}</span>
+         <span className="intel-badge">{prediction.direction}</span>
+       </div>
++      {math !== null && (
++        <div className="gate-math" data-testid="gate-math">
++          <span className="gate-figures">
++            {math.eligibleClass} {math.probability.toFixed(2)} / {math.gate.toFixed(2)}
++          </span>
++          <div className="gate-bar" role="presentation">
++            <div className={`gate-fill ${math.passes ? 'pass' : 'fail'}`} style={{ width: `${Math.min(100, math.probability * 100).toFixed(1)}%` }} />
++            <div className="gate-threshold" style={{ left: `${Math.min(100, math.gate * 100).toFixed(1)}%` }} />
++          </div>
++          {reason !== null && <span className="gate-reason">why: {reason}</span>}
++        </div>
++      )}
+       <div className="intel-probs">
+         {probEntries.length === 0 ? <span>no probabilities</span> : probEntries.map(([label, value]) => <span key={label}>{label} {pct(value)}</span>)}
+       </div>
+diff --git a/frontend/src/components/LiveDataPanel.test.tsx b/frontend/src/components/LiveDataPanel.test.tsx
+index 311213d..5e22190 100644
+--- a/frontend/src/components/LiveDataPanel.test.tsx
++++ b/frontend/src/components/LiveDataPanel.test.tsx
+@@ -92,10 +92,28 @@ describe('LiveDataPanel', () => {
+     expect(liveStore.getSnapshot().status.state).toBe('running');
+     expect(blotterStore.getSnapshot().events[0].message).toContain('Live start accepted');
+ 
++    // COCKPIT P2: RUNNING collapses the panel; expand to reach the controls.
++    await waitFor(() => expect(screen.getByRole('button', { name: 'Expand' })).toBeInTheDocument());
++    fireEvent.click(screen.getByRole('button', { name: 'Expand' }));
+     fireEvent.click(screen.getByRole('button', { name: 'Stop Live' }));
+     await waitFor(() => expect(mocks.stopLive).toHaveBeenCalledOnce());
+   });
+ 
++  it('collapses to one status line once running and expands on demand', async () => {
++    mocks.liveStatus.mockResolvedValueOnce({ ok: true, data: liveStatus('running') });
++    render(<LiveDataPanel />);
++
++    await waitFor(() => expect(screen.getByRole('button', { name: 'Expand' })).toBeInTheDocument());
++    expect(screen.queryByRole('heading', { name: 'Databento Market Data' })).not.toBeInTheDocument();
++    expect(screen.getByText(/7 events/)).toBeInTheDocument();
++
++    fireEvent.click(screen.getByRole('button', { name: 'Expand' }));
++    expect(screen.getByRole('heading', { name: 'Databento Market Data' })).toBeInTheDocument();
++
++    fireEvent.click(screen.getByRole('button', { name: 'Collapse' }));
++    expect(screen.queryByRole('heading', { name: 'Databento Market Data' })).not.toBeInTheDocument();
++  });
++
+   it('disables stop unless feed is connecting or running', async () => {
+     mocks.liveStatus.mockResolvedValueOnce({ ok: true, data: liveStatus('stopped', true, true) });
+ 
+diff --git a/frontend/src/components/LiveDataPanel.tsx b/frontend/src/components/LiveDataPanel.tsx
+index 236d431..d6d2b9c 100644
+--- a/frontend/src/components/LiveDataPanel.tsx
++++ b/frontend/src/components/LiveDataPanel.tsx
+@@ -1,4 +1,4 @@
+-import { useEffect } from 'react';
++import { useEffect, useState } from 'react';
+ import { apiClient } from '../api/client';
+ import { normalizeLiveStatus } from '../domain/normalize';
+ import { addBlotterEvent, liveStore, useLive, useRuntime } from '../state/stores';
+@@ -8,6 +8,8 @@ const BUSY_STATES = new Set(['connecting', 'running']);
+ export function LiveDataPanel() {
+   const live = useLive();
+   const apiOnline = useRuntime((state) => state.apiOnline);
++  // COCKPIT P2: once RUNNING the panel collapses to one status line (expandable).
++  const [expanded, setExpanded] = useState(false);
+   const status = live.status;
+   const canStart = apiOnline && status.subscriptionReady && !live.loading && !BUSY_STATES.has(status.state);
+   const canStop = apiOnline && !live.loading && BUSY_STATES.has(status.state);
+@@ -16,12 +18,34 @@ export function LiveDataPanel() {
+     void refreshLiveStatus();
+   }, []);
+ 
++  if (status.state === 'running' && !expanded) {
++    return (
++      <section className="panel live-panel collapsed" aria-label="Opt-in live market data controls">
++        <div className="panel-status-line">
++          <span className="eyebrow">Opt-in live data</span>
++          <div className={`replay-state ${status.state}`}>{status.state}</div>
++          <span className="status-line-meta">
++            {status.eventsProcessed.toLocaleString('en-US')} events · last {formatTime(status.lastEventUtc)}
++          </span>
++          <button className="expand-toggle" aria-expanded={false} onClick={() => setExpanded(true)}>
++            Expand
++          </button>
++        </div>
++      </section>
++    );
++  }
++
+   return (
+     <section className="panel live-panel" aria-label="Opt-in live market data controls">
+       <div className="live-heading">
+         <span className="eyebrow">Opt-in live data</span>
+         <h2>Databento Market Data</h2>
+         <div className={`replay-state ${status.state}`}>{status.state}</div>
++        {status.state === 'running' && (
++          <button className="expand-toggle" aria-expanded={true} onClick={() => setExpanded(false)}>
++            Collapse
++          </button>
++        )}
+       </div>
+       <div className="live-grid">
+         <Metric label="Dataset" value={status.dataset} />
+diff --git a/frontend/src/components/ReplayControls.test.tsx b/frontend/src/components/ReplayControls.test.tsx
+index a6b9db3..d31920e 100644
+--- a/frontend/src/components/ReplayControls.test.tsx
++++ b/frontend/src/components/ReplayControls.test.tsx
+@@ -67,10 +67,29 @@ describe('ReplayControls', () => {
+     expect(blotterStore.getSnapshot().events[0].message).toContain('Replay start accepted');
+   });
+ 
++  it('collapses to one status line once running and expands on demand', async () => {
++    mocks.replayStatus.mockResolvedValueOnce({ ok: true, data: replayStatus('running') });
++    render(<ReplayControls />);
++
++    // COCKPIT P2: RUNNING collapses the panel to a single status line.
++    await waitFor(() => expect(screen.getByRole('button', { name: 'Expand' })).toBeInTheDocument());
++    expect(screen.queryByRole('heading', { name: 'Safe Market Replay' })).not.toBeInTheDocument();
++    expect(screen.getByText(/12 events/)).toBeInTheDocument();
++
++    fireEvent.click(screen.getByRole('button', { name: 'Expand' }));
++    expect(screen.getByRole('heading', { name: 'Safe Market Replay' })).toBeInTheDocument();
++    expect(screen.getByRole('button', { name: 'Pause' })).toBeEnabled();
++
++    fireEvent.click(screen.getByRole('button', { name: 'Collapse' }));
++    expect(screen.queryByRole('heading', { name: 'Safe Market Replay' })).not.toBeInTheDocument();
++  });
++
+   it('enables pause resume and stop according to replay state', async () => {
+     mocks.replayStatus.mockResolvedValueOnce({ ok: true, data: replayStatus('running') });
+     render(<ReplayControls />);
+ 
++    await waitFor(() => expect(screen.getByRole('button', { name: 'Expand' })).toBeInTheDocument());
++    fireEvent.click(screen.getByRole('button', { name: 'Expand' }));
+     await waitFor(() => expect(screen.getByRole('button', { name: 'Pause' })).toBeEnabled());
+     expect(screen.getByRole('button', { name: 'Start' })).toBeDisabled();
+     expect(screen.getByRole('button', { name: 'Resume' })).toBeDisabled();
+diff --git a/frontend/src/components/ReplayControls.tsx b/frontend/src/components/ReplayControls.tsx
+index 3c93295..dcc74e3 100644
+--- a/frontend/src/components/ReplayControls.tsx
++++ b/frontend/src/components/ReplayControls.tsx
+@@ -1,4 +1,4 @@
+-import { useEffect } from 'react';
++import { useEffect, useState } from 'react';
+ import { apiClient } from '../api/client';
+ import { normalizeReplaySource, normalizeReplayStatus } from '../domain/normalize';
+ import { addBlotterEvent, replayStore, runtimeStore, useReplay, useRuntime } from '../state/stores';
+@@ -8,6 +8,8 @@ const BUSY_STATES = new Set(['loading', 'ready', 'running']);
+ export function ReplayControls() {
+   const replay = useReplay();
+   const apiOnline = useRuntime((state) => state.apiOnline);
++  // COCKPIT P2: once RUNNING the panel collapses to one status line (expandable).
++  const [expanded, setExpanded] = useState(false);
+   const state = replay.status.state;
+   const hasSelectedSource = replay.sources.some((source) => source.id === replay.selectedSourceId);
+   const canStart = apiOnline && hasSelectedSource && !replay.loading && !BUSY_STATES.has(state);
+@@ -19,6 +21,23 @@ export function ReplayControls() {
+     void refreshReplayData();
+   }, []);
+ 
++  if (state === 'running' && !expanded) {
++    return (
++      <section className="panel replay-panel collapsed" aria-label="Safe replay controls">
++        <div className="panel-status-line">
++          <span className="eyebrow">Safe replay</span>
++          <div className={`replay-state ${state}`}>{state}</div>
++          <span className="status-line-meta">
++            {replay.status.eventsProcessed.toLocaleString('en-US')} events · last {formatTime(replay.status.lastEventUtc)}
++          </span>
++          <button className="expand-toggle" aria-expanded={false} onClick={() => setExpanded(true)}>
++            Expand
++          </button>
++        </div>
++      </section>
++    );
++  }
++
+   return (
+     <section className="panel replay-panel" aria-label="Safe replay controls">
+       <div className="replay-heading">
+@@ -27,6 +46,11 @@ export function ReplayControls() {
+           <h2>Safe Market Replay</h2>
+         </div>
+         <div className={`replay-state ${state}`}>{state}</div>
++        {state === 'running' && (
++          <button className="expand-toggle" aria-expanded={true} onClick={() => setExpanded(false)}>
++            Collapse
++          </button>
++        )}
+       </div>
+       <div className="replay-controls-grid">
+         <label className="replay-source-select">
+diff --git a/frontend/src/components/TopStatusBar.test.tsx b/frontend/src/components/TopStatusBar.test.tsx
+deleted file mode 100644
+index 43f8bba..0000000
+--- a/frontend/src/components/TopStatusBar.test.tsx
++++ /dev/null
+@@ -1,29 +0,0 @@
+-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+-import { cleanup, render, screen } from '@testing-library/react';
+-import { TopStatusBar } from './TopStatusBar';
+-import { connectionStore, marketStore, runtimeStore } from '../state/stores';
+-
+-describe('TopStatusBar', () => {
+-  beforeEach(() => {
+-    runtimeStore.reset();
+-    connectionStore.reset();
+-    marketStore.reset();
+-  });
+-
+-  afterEach(() => cleanup());
+-
+-  it('shows the real runtime session and trading day when present', () => {
+-    runtimeStore.setState({ session: 'london', tradingDay: '2026-05-21' });
+-    render(<TopStatusBar />);
+-
+-    expect(screen.getByText('london')).toBeInTheDocument();
+-    expect(screen.getByText('2026-05-21')).toBeInTheDocument();
+-  });
+-
+-  it('falls back to placeholders when session and trading day are absent', () => {
+-    render(<TopStatusBar />);
+-
+-    expect(screen.getByText('unavailable')).toBeInTheDocument();
+-    expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(1);
+-  });
+-});
+diff --git a/frontend/src/components/TopStatusBar.tsx b/frontend/src/components/TopStatusBar.tsx
+deleted file mode 100644
+index e5e8329..0000000
+--- a/frontend/src/components/TopStatusBar.tsx
++++ /dev/null
+@@ -1,37 +0,0 @@
+-import { useConnection, useMarket, useRuntime } from '../state/stores';
+-
+-const fmt = (value: string | null) => (value ? new Date(value).toLocaleTimeString() : '—');
+-
+-export function TopStatusBar() {
+-  const runtime = useRuntime();
+-  const connection = useConnection();
+-  const market = useMarket();
+-  const tradingDay = runtime.tradingDay ?? '—';
+-  const session = runtime.session ?? 'unavailable';
+-
+-  return (
+-    <header className="top-bar">
+-      <div className="brand-block">
+-        <span className="eyebrow">Trade-Lab</span>
+-        <strong>NQ / {runtime.requestedSymbol}</strong>
+-      </div>
+-      <StatusPill label="Mode" value={runtime.runtimeMode} tone={runtime.runtimeMode === 'replay' ? 'amber' : 'blue'} />
+-      <StatusPill label="Session" value={session} tone={runtime.session ? 'blue' : 'neutral'} />
+-      <StatusPill label="Trading Day" value={tradingDay} />
+-      <StatusPill label="Feed" value={runtime.feedState} tone={runtime.feedReady ? 'green' : 'red'} />
+-      <StatusPill label="API" value={runtime.apiOnline ? 'online' : 'offline'} tone={runtime.apiOnline ? 'green' : 'red'} />
+-      <StatusPill label="WS" value={connection.wsStatus} tone={connection.wsStatus === 'connected' ? 'green' : 'amber'} />
+-      <StatusPill label="Heartbeat" value={fmt(connection.lastHeartbeatUtc)} />
+-      <StatusPill label="Timeframe" value={`${market.selectedTimeframe}t`} tone="blue" />
+-    </header>
+-  );
+-}
+-
+-function StatusPill({ label, value, tone = 'neutral' }: { label: string; value: string; tone?: 'neutral' | 'green' | 'red' | 'amber' | 'blue' }) {
+-  return (
+-    <div className={`status-pill ${tone}`}>
+-      <span>{label}</span>
+-      <strong>{value}</strong>
+-    </div>
+-  );
+-}
+diff --git a/frontend/src/components/TraderStrip.test.tsx b/frontend/src/components/TraderStrip.test.tsx
+new file mode 100644
+index 0000000..afb8f67
+--- /dev/null
++++ b/frontend/src/components/TraderStrip.test.tsx
+@@ -0,0 +1,134 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++import { act, cleanup, render, screen } from '@testing-library/react';
++import { TraderStrip } from './TraderStrip';
++import { connectionStore, marketStore, runtimeStore } from '../state/stores';
++import type { MarketBar } from '../domain/models';
++
++const bar = (overrides: Partial<MarketBar>): MarketBar => ({
++  timeframe: 147,
++  tradingDay: '2026-07-10',
++  barIndex: 1,
++  barId: null,
++  openTimeUtc: '2026-07-10T13:30:00Z',
++  closeTimeUtc: '2026-07-10T13:31:00Z',
++  openTicks: 96_000,
++  highTicks: 96_040,
++  lowTicks: 95_980,
++  closeTicks: 96_020,
++  volume: 10,
++  tradeCount: 10,
++  complete: true,
++  ...overrides,
++});
++
++describe('TraderStrip', () => {
++  beforeEach(() => {
++    runtimeStore.reset();
++    connectionStore.reset();
++    marketStore.reset();
++    vi.useFakeTimers();
++    vi.setSystemTime(new Date('2026-07-10T13:00:00Z')); // 09:00 EDT
++  });
++
++  afterEach(() => {
++    cleanup();
++    vi.useRealTimers();
++  });
++
++  it('shows the runtime session and trading day pills when present', () => {
++    runtimeStore.setState({ session: 'london', tradingDay: '2026-05-21' });
++    render(<TraderStrip />);
++
++    expect(screen.getByText('london')).toBeInTheDocument();
++    expect(screen.getByText('2026-05-21')).toBeInTheDocument();
++  });
++
++  it('renders em-dashes before any warm bars exist', () => {
++    render(<TraderStrip />);
++
++    expect(screen.getByText('unavailable')).toBeInTheDocument();
++    expect(screen.getByTestId('strip-last-price')).toHaveTextContent('—');
++    expect(screen.getByTestId('strip-net-change')).toHaveTextContent('—');
++    expect(screen.getByTestId('strip-day-high-low')).toHaveTextContent('—');
++  });
++
++  it('derives price, net change, and day range from the bar streams', () => {
++    runtimeStore.setState({ tradingDay: '2026-07-10' });
++    marketStore.setState({
++      currentBars: [bar({ complete: false, closeTicks: 96_100, closeTimeUtc: '2026-07-10T14:00:05Z', highTicks: 96_120 })],
++      recentClosedBars: [
++        bar({ barIndex: 0, openTicks: 95_900, closeTimeUtc: '2026-07-10T13:32:00Z' }),
++        bar({ barIndex: 1, highTicks: 96_200, lowTicks: 95_800, closeTimeUtc: '2026-07-10T13:40:00Z' }),
++      ],
++    });
++    render(<TraderStrip />);
++
++    expect(screen.getByTestId('strip-last-price')).toHaveTextContent('24,025.00');
++    // (96_100 - 95_900) ticks * 0.25 = +50.00 points
++    expect(screen.getByTestId('strip-net-change')).toHaveTextContent('+50.00');
++    expect(screen.getByTestId('strip-day-high-low')).toHaveTextContent('24,050.00 / 23,950.00');
++  });
++
++  it('keeps net change an em-dash when the day first bar is truncated away', () => {
++    runtimeStore.setState({ tradingDay: '2026-07-10' });
++    marketStore.setState({
++      currentBars: [],
++      recentClosedBars: [bar({ barIndex: 7, closeTicks: 96_100 })],
++    });
++    render(<TraderStrip />);
++
++    expect(screen.getByTestId('strip-last-price')).toHaveTextContent('24,025.00');
++    expect(screen.getByTestId('strip-net-change')).toHaveTextContent('—');
++  });
++
++  it('flashes tick direction on price changes', () => {
++    runtimeStore.setState({ tradingDay: '2026-07-10' });
++    marketStore.setState({
++      currentBars: [bar({ complete: false, closeTicks: 96_000, closeTimeUtc: '2026-07-10T14:00:05Z' })],
++      recentClosedBars: [],
++    });
++    render(<TraderStrip />);
++    expect(screen.getByTestId('strip-last-price').className).not.toMatch(/flash/);
++
++    act(() => {
++      marketStore.setState({
++        currentBars: [bar({ complete: false, closeTicks: 96_004, closeTimeUtc: '2026-07-10T14:00:06Z' })],
++        recentClosedBars: [],
++      });
++    });
++    expect(screen.getByTestId('strip-last-price').className).toMatch(/\bup\b/);
++    expect(screen.getByTestId('strip-last-price').className).toMatch(/flash-up/);
++
++    act(() => {
++      marketStore.setState({
++        currentBars: [bar({ complete: false, closeTicks: 95_996, closeTimeUtc: '2026-07-10T14:00:07Z' })],
++        recentClosedBars: [],
++      });
++    });
++    expect(screen.getByTestId('strip-last-price').className).toMatch(/\bdown\b/);
++    expect(screen.getByTestId('strip-last-price').className).toMatch(/flash-down/);
++  });
++
++  it('counts down to the NY open and flatten on America/New_York wall time', () => {
++    render(<TraderStrip />);
++
++    // 09:00 EDT → 30 minutes to the 09:30 open, 7h40m to the 16:40 flatten.
++    expect(screen.getByText('NY open 09:30')).toBeInTheDocument();
++    expect(screen.getByText(/in 0:30:00/)).toBeInTheDocument();
++    expect(screen.getByText('Flatten 16:40')).toBeInTheDocument();
++    expect(screen.getByText(/in 7:40:00/)).toBeInTheDocument();
++  });
++
++  it('switches to since after a target passes and ticks with the clock', () => {
++    vi.setSystemTime(new Date('2026-07-10T21:00:00Z')); // 17:00 EDT
++    render(<TraderStrip />);
++
++    expect(screen.getByText(/since 7:30:00/)).toBeInTheDocument(); // NY open
++    expect(screen.getByText(/since 0:20:00/)).toBeInTheDocument(); // flatten
++
++    act(() => {
++      vi.advanceTimersByTime(60_000);
++    });
++    expect(screen.getByText(/since 0:21:00/)).toBeInTheDocument();
++  });
++});
+diff --git a/frontend/src/components/TraderStrip.tsx b/frontend/src/components/TraderStrip.tsx
+new file mode 100644
+index 0000000..5cd8a88
+--- /dev/null
++++ b/frontend/src/components/TraderStrip.tsx
+@@ -0,0 +1,139 @@
++// COCKPIT P2: the persistent trader strip. Price first — large last print with
++// tick-direction flash, session net change, day high/low, NY-open and flatten
++// countdowns on America/New_York wall time — with the ops pills compacted to
++// the right.
++import { useEffect, useRef, useState } from 'react';
++import { useConnection, useMarket, useRuntime } from '../state/stores';
++import {
++  NY_FLATTEN,
++  NY_OPEN,
++  dayFirstOpenTicks,
++  dayHighLowTicks,
++  formatCountdown,
++  formatSignedPoints,
++  formatStripPrice,
++  latestPrint,
++  nyCountdown,
++  stripTicksToPrice,
++} from '../strip/viewModels';
++
++const EM_DASH = '—';
++
++const fmt = (value: string | null) => (value ? new Date(value).toLocaleTimeString() : EM_DASH);
++
++export function TraderStrip() {
++  const runtime = useRuntime();
++  const connection = useConnection();
++  const currentBars = useMarket((state) => state.currentBars);
++  const recentClosedBars = useMarket((state) => state.recentClosedBars);
++  const selectedTimeframe = useMarket((state) => state.selectedTimeframe);
++  const [nowMs, setNowMs] = useState(() => Date.now());
++
++  useEffect(() => {
++    const interval = window.setInterval(() => setNowMs(Date.now()), 1_000);
++    return () => window.clearInterval(interval);
++  }, []);
++
++  const print = latestPrint(currentBars, recentClosedBars);
++  const firstOpenTicks = dayFirstOpenTicks(currentBars, recentClosedBars, runtime.tradingDay);
++  const highLow = dayHighLowTicks(currentBars, recentClosedBars, runtime.tradingDay);
++
++  // Tick direction: compare successive rendered prints; remount the price node
++  // (via key) so the flash animation restarts on every change.
++  const prevTicksRef = useRef<number | null>(null);
++  const flashSeqRef = useRef(0);
++  const directionRef = useRef<'up' | 'down' | null>(null);
++  if (print !== null && prevTicksRef.current !== null && print.priceTicks !== prevTicksRef.current) {
++    directionRef.current = print.priceTicks > prevTicksRef.current ? 'up' : 'down';
++    flashSeqRef.current += 1;
++  }
++  if (print !== null) prevTicksRef.current = print.priceTicks;
++  const direction = directionRef.current;
++
++  const netChange =
++    print !== null && firstOpenTicks !== null
++      ? stripTicksToPrice(print.priceTicks - firstOpenTicks)
++      : null;
++
++  const open = nyCountdown(nowMs, NY_OPEN);
++  const flatten = nyCountdown(nowMs, NY_FLATTEN);
++
++  const tradingDay = runtime.tradingDay ?? EM_DASH;
++  const session = runtime.session ?? 'unavailable';
++
++  return (
++    <header className="top-bar trader-strip">
++      <div className="brand-block">
++        <span className="eyebrow">Trade-Lab</span>
++        <strong>NQ / {runtime.requestedSymbol}</strong>
++      </div>
++      <div className="strip-price-block" aria-label="Last price">
++        <span
++          key={flashSeqRef.current}
++          className={`strip-price${direction ? ` ${direction} flash-${direction}` : ''}`}
++          data-testid="strip-last-price"
++        >
++          {print !== null ? formatStripPrice(print.priceTicks) : EM_DASH}
++        </span>
++        <div className="strip-metric" aria-label="Session net change">
++          <span>Net</span>
++          <strong className={netChange === null ? '' : netChange >= 0 ? 'pos' : 'neg'} data-testid="strip-net-change">
++            {netChange === null ? EM_DASH : formatSignedPoints(netChange)}
++          </strong>
++        </div>
++        <div className="strip-metric" aria-label="Day high and low">
++          <span>Day H / L</span>
++          <strong data-testid="strip-day-high-low">
++            {highLow
++              ? `${formatStripPrice(highLow.highTicks)} / ${formatStripPrice(highLow.lowTicks)}`
++              : EM_DASH}
++          </strong>
++        </div>
++      </div>
++      <div className="strip-countdowns">
++        <StripCountdown label="NY open 09:30" countdown={open} />
++        <StripCountdown label="Flatten 16:40" countdown={flatten} sinceTone="red" />
++      </div>
++      <div className="strip-pills">
++        <StatusPill label="Mode" value={runtime.runtimeMode} tone={runtime.runtimeMode === 'replay' ? 'amber' : 'blue'} />
++        <StatusPill label="Session" value={session} tone={runtime.session ? 'blue' : 'neutral'} />
++        <StatusPill label="Trading Day" value={tradingDay} />
++        <StatusPill label="Feed" value={runtime.feedState} tone={runtime.feedReady ? 'green' : 'red'} />
++        <StatusPill label="API" value={runtime.apiOnline ? 'online' : 'offline'} tone={runtime.apiOnline ? 'green' : 'red'} />
++        <StatusPill label="WS" value={connection.wsStatus} tone={connection.wsStatus === 'connected' ? 'green' : 'amber'} />
++        <StatusPill label="Heartbeat" value={fmt(connection.lastHeartbeatUtc)} />
++        <StatusPill label="Timeframe" value={`${selectedTimeframe}t`} tone="blue" />
++      </div>
++    </header>
++  );
++}
++
++function StripCountdown({
++  label,
++  countdown,
++  sinceTone = 'amber',
++}: {
++  label: string;
++  countdown: { mode: 'until' | 'since'; seconds: number };
++  sinceTone?: 'amber' | 'red';
++}) {
++  const tone = countdown.mode === 'until' ? 'until' : sinceTone;
++  return (
++    <div className={`strip-countdown ${tone}`}>
++      <span>{label}</span>
++      <strong>
++        {countdown.mode === 'until' ? 'in ' : 'since '}
++        {formatCountdown(countdown.seconds)}
++      </strong>
++    </div>
++  );
++}
++
++function StatusPill({ label, value, tone = 'neutral' }: { label: string; value: string; tone?: 'neutral' | 'green' | 'red' | 'amber' | 'blue' }) {
++  return (
++    <div className={`status-pill ${tone}`}>
++      <span>{label}</span>
++      <strong>{value}</strong>
++    </div>
++  );
++}
+diff --git a/frontend/src/components/TradingChart.test.tsx b/frontend/src/components/TradingChart.test.tsx
+index 1b1339e..979a890 100644
+--- a/frontend/src/components/TradingChart.test.tsx
++++ b/frontend/src/components/TradingChart.test.tsx
+@@ -41,7 +41,7 @@ describe('TradingChart', () => {
+     mocks.addSeries.mockReset();
+     mocks.createChart.mockReset();
+     mocks.createSeriesMarkers.mockReset();
+-    mocks.addSeries.mockReturnValue({ setData: mocks.setData, update: mocks.update, createPriceLine: mocks.createPriceLine, removePriceLine: mocks.removePriceLine });
++    mocks.addSeries.mockReturnValue({ setData: mocks.setData, update: mocks.update, createPriceLine: mocks.createPriceLine, removePriceLine: mocks.removePriceLine, attachPrimitive: vi.fn(), detachPrimitive: vi.fn() });
+     mocks.scrollPosition.mockReturnValue(0);
+     mocks.getVisibleRange.mockReturnValue(null);
+     mocks.timeScale.mockReturnValue({ scrollPosition: mocks.scrollPosition, getVisibleRange: mocks.getVisibleRange, setVisibleRange: mocks.setVisibleRange, fitContent: mocks.fitContent });
+diff --git a/frontend/src/components/TradingChart.tsx b/frontend/src/components/TradingChart.tsx
+index b604e51..5a734c2 100644
+--- a/frontend/src/components/TradingChart.tsx
++++ b/frontend/src/components/TradingChart.tsx
+@@ -1,7 +1,7 @@
+ import { useEffect, useMemo, useRef } from 'react';
+ import { CandlestickSeries, ColorType, CrosshairMode, createChart, type IChartApi, type ISeriesApi, type MouseEventParams } from 'lightweight-charts';
+ import { ChartOverlayManager } from '../chart/overlayManager';
+-import type { ChartBar, LevelOverlay, MarkerOverlay } from '../chart/viewModels';
++import { sessionBands, type ChartBar, type LevelOverlay, type MarkerOverlay, type PositionLineOverlay } from '../chart/viewModels';
+ import type { Timeframe } from '../domain/models';
+ 
+ // Treat the viewport as "parked at the live edge" while its right edge sits within this many
+@@ -19,11 +19,15 @@ type TradingChartProps = {
+   bars: ChartBar[];
+   levels: LevelOverlay[];
+   markers: MarkerOverlay[];
++  // COCKPIT P4a: TP/SL barrier lines for open paper positions.
++  positionLines?: PositionLineOverlay[];
+   emptyTitle: string;
+   emptySubtitle: string;
+ };
+ 
+-export function TradingChart({ timeframe, bars, levels, markers, emptyTitle, emptySubtitle }: TradingChartProps) {
++const NO_POSITION_LINES: PositionLineOverlay[] = [];
++
++export function TradingChart({ timeframe, bars, levels, markers, positionLines = NO_POSITION_LINES, emptyTitle, emptySubtitle }: TradingChartProps) {
+   const containerRef = useRef<HTMLDivElement | null>(null);
+   const chartRef = useRef<IChartApi | null>(null);
+   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
+@@ -155,6 +159,11 @@ export function TradingChart({ timeframe, bars, levels, markers, emptyTitle, emp
+   }, [timeframe, bars]);
+ 
+   useEffect(() => overlaysRef.current?.syncLevels(levels), [levels]);
++  useEffect(() => overlaysRef.current?.syncPositionLines(positionLines), [positionLines]);
++  // COCKPIT P4b: session shading bands recompute with the bar set (ET
++  // classification is cached per UTC hour, so this is arithmetic per bar).
++  const bands = useMemo(() => sessionBands(bars), [bars]);
++  useEffect(() => overlaysRef.current?.syncSessionBands(bands), [bands]);
+   useEffect(() => {
+     overlaysRef.current?.syncMarkers(markers);
+     const labels = new Map<string, string>();
+diff --git a/frontend/src/domain/models.ts b/frontend/src/domain/models.ts
+index 0ca6aa0..24fabc3 100644
+--- a/frontend/src/domain/models.ts
++++ b/frontend/src/domain/models.ts
+@@ -57,6 +57,13 @@ export type Observation = {
+   levelKind: string;
+   startUtc: string;
+   scheduledEndUtc: string;
++  // COCKPIT P3c: fields for the active-setup card. originatingTouchId joins the
++  // touches stream for the touch price; levelPriceTicks anchors the setup;
++  // direction is the AUTHORITATIVE carried touch direction (audit #NN-1 — never
++  // re-derived from levelKind), null for legacy observations.
++  originatingTouchId: string | null;
++  levelPriceTicks: number | null;
++  direction: string | null;
+ };
+ 
+ export type Warning = {
+@@ -77,6 +84,18 @@ export type WarningMetadata = {
+   total_dropped_messages?: number;
+ };
+ 
++// COCKPIT P5: typed trade-tape payloads attached to blotter events at WS
++// ingestion, so the tape renders structured rows instead of re-parsing message
++// strings. predictionId enables render-time joins (realized points for outcome
++// rows come from the executions store when the tracker closed that setup).
++// Position rows carry BOTH P&L columns (optimistic / conservative bracket).
++export type TapeRow =
++  | { kind: 'prediction'; predictionId: string; predictedClass: string; probability: number | null; eligible: boolean; direction: string; session: string }
++  | { kind: 'outcome'; predictionId: string; resolutionType: string; correct: boolean; actualClass: string }
++  | { kind: 'drop'; predictionId: string; reason: string }
++  | { kind: 'position_open'; predictionId: string; direction: string; entryPrice: number; entryPriceConservative: number; tpPrice: number; slPrice: number }
++  | { kind: 'position_close'; predictionId: string; direction: string; reason: string; points: number; pointsConservative: number; exitPrice: number };
++
+ export type BlotterEvent = {
+   id: string;
+   timeUtc: string;
+@@ -86,6 +105,7 @@ export type BlotterEvent = {
+   code?: string;
+   source?: string | null;
+   details?: WarningMetadata;
++  tape?: TapeRow;
+ };
+ 
+ export type LiveStatus = {
+@@ -210,6 +230,12 @@ export type ModelStatus = {
+   classMap: Record<string, string>;
+   validationOk: boolean;
+   validationDetail: string | null;
++  // COCKPIT P1/P3: serving-gate parameters for the gate-math card. Null when no
++  // model is loaded (or an older backend omits them). eligibleSessions is the
++  // runtime session vocabulary, comparable to prediction.session directly.
++  confidenceGate: number | null;
++  eligibleClass: string | null;
++  eligibleSessions: string[] | null;
+ };
+ 
+ export type ModelBundle = {
+diff --git a/frontend/src/domain/normalize.test.ts b/frontend/src/domain/normalize.test.ts
+index 3cb6deb..b1d6112 100644
+--- a/frontend/src/domain/normalize.test.ts
++++ b/frontend/src/domain/normalize.test.ts
+@@ -174,6 +174,9 @@ describe('inference DTO normalization', () => {
+       class_map: { '0': 'continuation', '1': 'reversal' },
+       validation_ok: true,
+       validation_detail: 'ok',
++      confidence_gate: 0.7,
++      eligible_class: 'reversal',
++      eligible_sessions: ['ny'],
+     };
+ 
+     expect(normalizeModelStatus(dto)).toEqual({
+@@ -186,6 +189,20 @@ describe('inference DTO normalization', () => {
+       classMap: { '0': 'continuation', '1': 'reversal' },
+       validationOk: true,
+       validationDetail: 'ok',
++      confidenceGate: 0.7,
++      eligibleClass: 'reversal',
++      eligibleSessions: ['ny'],
++    });
++
++    // An older backend that omits the gate fields normalizes them to null.
++    const legacy = { ...dto };
++    delete legacy.confidence_gate;
++    delete legacy.eligible_class;
++    delete legacy.eligible_sessions;
++    expect(normalizeModelStatus(legacy)).toMatchObject({
++      confidenceGate: null,
++      eligibleClass: null,
++      eligibleSessions: null,
+     });
+   });
+ 
+diff --git a/frontend/src/domain/normalize.ts b/frontend/src/domain/normalize.ts
+index d606912..ee18258 100644
+--- a/frontend/src/domain/normalize.ts
++++ b/frontend/src/domain/normalize.ts
+@@ -100,6 +100,9 @@ export const normalizeObservation = (dto: ObservationDTO): Observation => ({
+   levelKind: dto.level_kind,
+   startUtc: dto.start_ts_utc,
+   scheduledEndUtc: dto.scheduled_end_ts_utc,
++  originatingTouchId: typeof dto.originating_touch_id === 'string' ? dto.originating_touch_id : null,
++  levelPriceTicks: typeof dto.level_price_ticks === 'number' && Number.isFinite(dto.level_price_ticks) ? dto.level_price_ticks : null,
++  direction: dto.direction === 'long' || dto.direction === 'short' ? dto.direction : null,
+ });
+ 
+ export const normalizeWarning = (dto: DataQualityWarningDTO): Warning => ({
+@@ -206,6 +209,11 @@ export const normalizeModelStatus = (dto: ModelStatusDTO): ModelStatus => ({
+   classMap: safeStringRecord(dto.class_map),
+   validationOk: dto.validation_ok,
+   validationDetail: dto.validation_detail ?? null,
++  confidenceGate: typeof dto.confidence_gate === 'number' && Number.isFinite(dto.confidence_gate) ? dto.confidence_gate : null,
++  eligibleClass: typeof dto.eligible_class === 'string' ? dto.eligible_class : null,
++  eligibleSessions: Array.isArray(dto.eligible_sessions)
++    ? dto.eligible_sessions.filter((session): session is string => typeof session === 'string')
++    : null,
+ });
+ 
+ export const normalizeModelBundle = (dto: ModelBundleDTO): ModelBundle => ({
+diff --git a/frontend/src/intel/viewModels.test.ts b/frontend/src/intel/viewModels.test.ts
+new file mode 100644
+index 0000000..36553a2
+--- /dev/null
++++ b/frontend/src/intel/viewModels.test.ts
+@@ -0,0 +1,199 @@
++import { describe, expect, it } from 'vitest';
++import type { MarketLevel, MarketTouch, ModelStatus, Observation, Prediction } from '../domain/models';
++import {
++  activeSetup,
++  describeGateReason,
++  formatLevelDistance,
++  formatSetupCountdown,
++  gateMath,
++  levelOriginLabel,
++  observationSecondsRemaining,
++  sortLevelsByDistance,
++} from './viewModels';
++
++const level = (overrides: Partial<MarketLevel>): MarketLevel => ({
++  kind: 'pdh',
++  priceTicks: 76_000,
++  tradingDay: '2026-05-21',
++  originSession: null,
++  developing: false,
++  eligible: true,
++  ...overrides,
++});
++
++const prediction = (overrides: Partial<Prediction> = {}): Prediction => ({
++  id: 'pred-1',
++  touchId: 'touch-1',
++  observationId: 'obs-1',
++  timeUtc: '2026-05-21T14:00:10Z',
++  predictedClass: 'up',
++  probabilities: { down: 0.1, hold: 0.3, up: 0.6 },
++  levelKind: 'pdh',
++  levelPriceTicks: 76_000,
++  direction: 'long',
++  session: 'ny',
++  eligible: true,
++  modelId: 'model-alpha',
++  contractId: 'contract-1',
++  nanCount: 0,
++  outcome: null,
++  dropped: null,
++  ...overrides,
++});
++
++const modelStatus = (overrides: Partial<ModelStatus> = {}): ModelStatus => ({
++  loaded: true,
++  modelId: 'model-alpha',
++  strategyId: 'strategy-1',
++  trainingMode: 'mae_first',
++  instrument: 'NQ',
++  featureNames: [],
++  classMap: {},
++  validationOk: true,
++  validationDetail: null,
++  confidenceGate: 0.7,
++  eligibleClass: 'up',
++  eligibleSessions: ['ny'],
++  ...overrides,
++});
++
++const observation = (overrides: Partial<Observation> = {}): Observation => ({
++  id: 'obs-1',
++  status: 'active',
++  session: 'ny',
++  levelKind: 'pdh',
++  startUtc: '2026-05-21T14:00:00Z',
++  scheduledEndUtc: '2026-05-21T14:05:00Z',
++  originatingTouchId: 'touch-1',
++  levelPriceTicks: 76_000,
++  direction: 'short',
++  ...overrides,
++});
++
++const touch = (overrides: Partial<MarketTouch> = {}): MarketTouch => ({
++  id: 'touch-1',
++  timeUtc: '2026-05-21T14:00:00Z',
++  session: 'ny',
++  levelKind: 'pdh',
++  priceTicks: 76_004,
++  createdObservation: true,
++  ...overrides,
++});
++
++describe('sortLevelsByDistance', () => {
++  it('sorts by absolute distance and flags the nearest row', () => {
++    const levels = [
++      level({ kind: 'asia_low', priceTicks: 75_600 }),
++      level({ kind: 'pdh', priceTicks: 76_020 }),
++      level({ kind: 'pdl', priceTicks: 75_900 }),
++    ];
++    const rows = sortLevelsByDistance(levels, 76_000);
++    expect(rows.map((row) => row.level.kind)).toEqual(['pdh', 'pdl', 'asia_low']);
++    expect(rows[0].nearest).toBe(true);
++    expect(rows[0].distanceTicks).toBe(20);
++    expect(rows[1].nearest).toBe(false);
++    expect(rows[1].distanceTicks).toBe(-100);
++  });
++
++  it('falls back to the fixed kind order without a last price', () => {
++    const levels = [
++      level({ kind: 'asia_high', priceTicks: 75_600 }),
++      level({ kind: 'pdh', priceTicks: 76_020 }),
++    ];
++    const rows = sortLevelsByDistance(levels, null);
++    expect(rows.map((row) => row.level.kind)).toEqual(['pdh', 'asia_high']);
++    expect(rows.every((row) => row.distanceTicks === null && !row.nearest)).toBe(true);
++  });
++
++  it('formats signed distances in points and ticks', () => {
++    expect(formatLevelDistance(50)).toBe('+12.50 pts (+50t)');
++    expect(formatLevelDistance(-13)).toBe('−3.25 pts (−13t)');
++    expect(formatLevelDistance(0)).toBe('0.00 pts (0t)');
++    expect(formatLevelDistance(null)).toBe('—');
++  });
++});
++
++describe('levelOriginLabel', () => {
++  it('prefers the carried origin session, calls PDH/PDL prior day, else unknown', () => {
++    expect(levelOriginLabel(level({ kind: 'asia_high', originSession: 'asia' }))).toBe('asia');
++    expect(levelOriginLabel(level({ kind: 'pdh', originSession: null }))).toBe('prior day');
++    expect(levelOriginLabel(level({ kind: 'pdl', originSession: null }))).toBe('prior day');
++    expect(levelOriginLabel(level({ kind: 'asia_high', originSession: null }))).toBe('unknown');
++    expect(levelOriginLabel(undefined)).toBe('unknown');
++  });
++});
++
++describe('gateMath', () => {
++  it('reports the eligible-class probability against the gate for a pass', () => {
++    const math = gateMath(prediction({ probabilities: { up: 0.82, hold: 0.18 } }), modelStatus());
++    expect(math).toEqual({ eligibleClass: 'up', gate: 0.7, probability: 0.82, passes: true, reason: null });
++  });
++
++  it('derives WHY in priority order: class before session before gate', () => {
++    const status = modelStatus();
++    const classWhy = gateMath(
++      prediction({ eligible: false, predictedClass: 'hold', session: 'asia', probabilities: { up: 0.1, hold: 0.9 } }),
++      status,
++    );
++    expect(classWhy?.reason).toBe('class');
++
++    const sessionWhy = gateMath(
++      prediction({ eligible: false, session: 'asia', probabilities: { up: 0.9 } }),
++      status,
++    );
++    expect(sessionWhy?.reason).toBe('session');
++
++    const gateWhy = gateMath(prediction({ eligible: false, probabilities: { up: 0.69 } }), status);
++    expect(gateWhy?.reason).toBe('gate');
++    expect(gateWhy?.probability).toBeCloseTo(0.69);
++  });
++
++  it('returns null without gate parameters, unloaded status, or a model mismatch', () => {
++    expect(gateMath(prediction(), null)).toBeNull();
++    expect(gateMath(prediction(), modelStatus({ loaded: false }))).toBeNull();
++    expect(gateMath(prediction(), modelStatus({ confidenceGate: null }))).toBeNull();
++    expect(gateMath(prediction({ modelId: 'older-model' }), modelStatus())).toBeNull();
++  });
++
++  it('describes each reason for the card', () => {
++    const status = modelStatus();
++    const classWhy = gateMath(prediction({ eligible: false, predictedClass: 'hold' }), status);
++    expect(describeGateReason(classWhy!, prediction({ predictedClass: 'hold' }), status)).toBe(
++      'class — predicted hold, eligible up',
++    );
++    const sessionWhy = gateMath(prediction({ eligible: false, session: 'asia', probabilities: { up: 0.9 } }), status);
++    expect(describeGateReason(sessionWhy!, prediction({ session: 'asia' }), status)).toBe('session — asia not in [ny]');
++    const gateWhy = gateMath(prediction({ eligible: false, probabilities: { up: 0.69 } }), status);
++    expect(describeGateReason(gateWhy!, prediction(), status)).toBe('gate — 0.69 below 0.70');
++  });
++});
++
++describe('activeSetup', () => {
++  it('joins the newest active observation to its originating touch', () => {
++    const older = observation({ id: 'obs-old', startUtc: '2026-05-21T13:00:00Z', originatingTouchId: 'touch-old' });
++    const setup = activeSetup([older, observation()], [touch()]);
++    expect(setup?.observation.id).toBe('obs-1');
++    expect(setup?.touchPriceTicks).toBe(76_004);
++    expect(setup?.activeCount).toBe(2);
++  });
++
++  it('returns null with no active observation and survives a missed touch join', () => {
++    expect(activeSetup([observation({ status: 'expired' })], [touch()])).toBeNull();
++    const setup = activeSetup([observation({ originatingTouchId: 'gone' })], [touch()]);
++    expect(setup?.touchPriceTicks).toBeNull();
++  });
++});
++
++describe('observation countdown (event clock)', () => {
++  it('measures remaining seconds on the event clock and clamps at zero', () => {
++    expect(observationSecondsRemaining('2026-05-21T14:05:00Z', '2026-05-21T14:00:10Z')).toBe(290);
++    expect(observationSecondsRemaining('2026-05-21T14:05:00Z', '2026-05-21T14:06:00Z')).toBe(0);
++    expect(observationSecondsRemaining('2026-05-21T14:05:00Z', null)).toBeNull();
++  });
++
++  it('formats as m:ss', () => {
++    expect(formatSetupCountdown(290)).toBe('4:50');
++    expect(formatSetupCountdown(0)).toBe('0:00');
++    expect(formatSetupCountdown(null)).toBe('—');
++  });
++});
+diff --git a/frontend/src/intel/viewModels.ts b/frontend/src/intel/viewModels.ts
+new file mode 100644
+index 0000000..fcb69f8
+--- /dev/null
++++ b/frontend/src/intel/viewModels.ts
+@@ -0,0 +1,161 @@
++// COCKPIT P3: pure view-model math for the decision surfaces — distance-sorted
++// levels, the prediction gate math, and the active-setup card. No React, no IO.
++import type { MarketLevel, MarketTouch, ModelStatus, Observation, Prediction } from '../domain/models';
++
++const TICKS_PER_POINT = 4;
++
++// Fallback presentation order when no last price exists yet (the pre-COCKPIT
++// fixed ordering).
++const LEVEL_ORDER = ['pdh', 'pdl', 'asia_high', 'asia_low', 'london_high', 'london_low', 'ny_high', 'ny_low'];
++
++export type LevelDistanceRow = {
++  level: MarketLevel;
++  /** Signed ticks from last price to the level (positive = level above). */
++  distanceTicks: number | null;
++  nearest: boolean;
++};
++
++/**
++ * Levels sorted by absolute distance from the last price (nearest first, the
++ * nearest row flagged). Without a last price, falls back to the fixed kind
++ * order with null distances.
++ */
++export function sortLevelsByDistance(levels: MarketLevel[], lastPriceTicks: number | null): LevelDistanceRow[] {
++  if (lastPriceTicks === null) {
++    return [...levels]
++      .sort((a, b) => LEVEL_ORDER.indexOf(a.kind) - LEVEL_ORDER.indexOf(b.kind))
++      .map((level) => ({ level, distanceTicks: null, nearest: false }));
++  }
++  const rows = levels.map((level) => ({
++    level,
++    distanceTicks: level.priceTicks - lastPriceTicks,
++    nearest: false,
++  }));
++  rows.sort((a, b) => {
++    const byDistance = Math.abs(a.distanceTicks as number) - Math.abs(b.distanceTicks as number);
++    if (byDistance !== 0) return byDistance;
++    return LEVEL_ORDER.indexOf(a.level.kind) - LEVEL_ORDER.indexOf(b.level.kind);
++  });
++  if (rows.length > 0) rows[0] = { ...rows[0], nearest: true };
++  return rows;
++}
++
++/** Signed distance as "+12.50 pts (+50t)"; em-dash without a last price. */
++export function formatLevelDistance(distanceTicks: number | null): string {
++  if (distanceTicks === null) return '—';
++  const points = distanceTicks / TICKS_PER_POINT;
++  const sign = distanceTicks > 0 ? '+' : distanceTicks < 0 ? '−' : '';
++  return `${sign}${Math.abs(points).toFixed(2)} pts (${sign}${Math.abs(distanceTicks)}t)`;
++}
++
++/**
++ * Honest origin label for a level: the carried origin session when present;
++ * PDH/PDL are prior-day levels by definition (the adapter maps them to a null
++ * origin_session — see COCKPIT P1b); anything else is genuinely unknown.
++ */
++export function levelOriginLabel(level: MarketLevel | undefined): string {
++  if (!level) return 'unknown';
++  if (level.originSession) return level.originSession;
++  return level.kind === 'pdh' || level.kind === 'pdl' ? 'prior day' : 'unknown';
++}
++
++export type GateMath = {
++  eligibleClass: string;
++  gate: number;
++  /** Probability the model assigned to the eligible class (0 when absent). */
++  probability: number;
++  passes: boolean;
++  /**
++   * WHY the prediction is ineligible, in priority order: class (predicted the
++   * wrong class), session (outside the eligible sessions), gate (eligible-class
++   * probability below the confidence gate). Null when eligible or unexplainable
++   * from the shipped parameters (trust the backend verdict either way).
++   */
++  reason: 'class' | 'session' | 'gate' | null;
++};
++
++/**
++ * The serving-gate math for one prediction against the ACTIVE model's gate
++ * parameters. Returns null when the parameters are unavailable or the
++ * prediction came from a different model than the one now active (a hot-swap
++ * makes old rows unjudgeable against the current gate).
++ */
++export function gateMath(prediction: Prediction, modelStatus: ModelStatus | null): GateMath | null {
++  if (!modelStatus || !modelStatus.loaded) return null;
++  if (modelStatus.confidenceGate === null || modelStatus.eligibleClass === null) return null;
++  if (modelStatus.modelId !== null && prediction.modelId !== modelStatus.modelId) return null;
++  const gate = modelStatus.confidenceGate;
++  const eligibleClass = modelStatus.eligibleClass;
++  const probability = prediction.probabilities[eligibleClass] ?? 0;
++  let reason: GateMath['reason'] = null;
++  if (!prediction.eligible) {
++    if (prediction.predictedClass !== eligibleClass) {
++      reason = 'class';
++    } else if (modelStatus.eligibleSessions !== null && !modelStatus.eligibleSessions.includes(prediction.session)) {
++      reason = 'session';
++    } else if (probability < gate) {
++      reason = 'gate';
++    }
++  }
++  return { eligibleClass, gate, probability, passes: prediction.eligible, reason };
++}
++
++export function describeGateReason(math: GateMath, prediction: Prediction, modelStatus: ModelStatus | null): string | null {
++  switch (math.reason) {
++    case 'class':
++      return `class — predicted ${prediction.predictedClass}, eligible ${math.eligibleClass}`;
++    case 'session': {
++      const sessions = modelStatus?.eligibleSessions?.join(', ') ?? '';
++      return `session — ${prediction.session} not in [${sessions}]`;
++    }
++    case 'gate':
++      return `gate — ${math.probability.toFixed(2)} below ${math.gate.toFixed(2)}`;
++    default:
++      return null;
++  }
++}
++
++export type ActiveSetup = {
++  observation: Observation;
++  /** Touch (trade) price in ticks from the originating touch, if still buffered. */
++  touchPriceTicks: number | null;
++  activeCount: number;
++};
++
++/**
++ * The newest ACTIVE observation joined to its originating touch. The touches
++ * ring is bounded and absent from reconnect snapshots, so the join may miss —
++ * the touch price is then null, never guessed.
++ */
++export function activeSetup(observations: Observation[], touches: MarketTouch[]): ActiveSetup | null {
++  const active = observations.filter((obs) => obs.status === 'active');
++  if (active.length === 0) return null;
++  const newest = [...active].sort((a, b) => Date.parse(b.startUtc) - Date.parse(a.startUtc))[0];
++  const touch = newest.originatingTouchId === null ? undefined : touches.find((entry) => entry.id === newest.originatingTouchId);
++  return {
++    observation: newest,
++    touchPriceTicks: touch?.priceTicks ?? null,
++    activeCount: active.length,
++  };
++}
++
++/**
++ * Seconds until the observation window ends on the EVENT clock (the latest
++ * observed print's timestamp — replay countdowns run at replay speed and a
++ * paused feed freezes). Null without an event clock; clamps at 0 once the end
++ * has been reached (the observation expires on the next processed trade).
++ */
++export function observationSecondsRemaining(scheduledEndUtc: string, eventClockUtc: string | null): number | null {
++  if (!eventClockUtc) return null;
++  const end = Date.parse(scheduledEndUtc);
++  const now = Date.parse(eventClockUtc);
++  if (!Number.isFinite(end) || !Number.isFinite(now)) return null;
++  return Math.max(0, Math.round((end - now) / 1000));
++}
++
++export function formatSetupCountdown(seconds: number | null): string {
++  if (seconds === null) return '—';
++  const m = Math.floor(seconds / 60);
++  const s = seconds % 60;
++  return `${m}:${String(s).padStart(2, '0')}`;
++}
+diff --git a/frontend/src/realtime/client.test.ts b/frontend/src/realtime/client.test.ts
+index 2022db1..1d55c9c 100644
+--- a/frontend/src/realtime/client.test.ts
++++ b/frontend/src/realtime/client.test.ts
+@@ -468,7 +468,7 @@ describe('RealtimeClient', () => {
+     intelligenceStore.setState({
+       levels: [{ kind: 'pdh', priceTicks: 76000, tradingDay: '2026-05-21', originSession: 'ny', developing: false, eligible: true }],
+       touches: [{ id: 'touch-1', timeUtc: '2026-05-21T14:02:00Z', session: 'ny', levelKind: 'pdh', priceTicks: 76000, createdObservation: true }],
+-      observations: [{ id: 'obs-1', status: 'active', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:02:00Z', scheduledEndUtc: '2026-05-21T14:17:00Z' }],
++      observations: [{ id: 'obs-1', status: 'active', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:02:00Z', scheduledEndUtc: '2026-05-21T14:17:00Z', originatingTouchId: null, levelPriceTicks: null, direction: null }],
+       warnings: [normalizeWarning(warning(1))],
+     });
+     client.start();
+@@ -485,7 +485,7 @@ describe('RealtimeClient', () => {
+     intelligenceStore.setState({
+       levels: [{ kind: 'pdh', priceTicks: 76000, tradingDay: '2026-05-21', originSession: 'ny', developing: false, eligible: true }],
+       touches: [{ id: 'touch-1', timeUtc: '2026-05-21T14:02:00Z', session: 'ny', levelKind: 'pdh', priceTicks: 76000, createdObservation: true }],
+-      observations: [{ id: 'obs-1', status: 'active', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:02:00Z', scheduledEndUtc: '2026-05-21T14:17:00Z' }],
++      observations: [{ id: 'obs-1', status: 'active', session: 'ny', levelKind: 'pdh', startUtc: '2026-05-21T14:02:00Z', scheduledEndUtc: '2026-05-21T14:17:00Z', originatingTouchId: null, levelPriceTicks: null, direction: null }],
+       warnings: [normalizeWarning(warning(1))],
+     });
+     client.start();
+diff --git a/frontend/src/realtime/client.ts b/frontend/src/realtime/client.ts
+index 1dd44ec..0a96848 100644
+--- a/frontend/src/realtime/client.ts
++++ b/frontend/src/realtime/client.ts
+@@ -130,30 +130,100 @@ export class RealtimeClient {
+         intelligenceStore.setState((current) => ({ ...current, observations: upsertById(current.observations, normalizeObservation(envelope.payload as ObservationDTO), 'id') }));
+         addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'observation', severity: 'info', message: 'Observation updated', sequence: envelope.sequence });
+         break;
+-      case 'prediction.created':
+-        addPrediction(normalizePrediction((envelope.payload as { prediction: PredictionDTO }).prediction));
+-        addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'observation', severity: 'info', message: 'Prediction created', sequence: envelope.sequence });
++      case 'prediction.created': {
++        const prediction = normalizePrediction((envelope.payload as { prediction: PredictionDTO }).prediction);
++        addPrediction(prediction);
++        // COCKPIT P5: typed tape payload rides the blotter event.
++        addBlotterEvent({
++          timeUtc: envelope.server_time_utc,
++          category: 'observation',
++          severity: 'info',
++          message: 'Prediction created',
++          sequence: envelope.sequence,
++          tape: {
++            kind: 'prediction',
++            predictionId: prediction.id,
++            predictedClass: prediction.predictedClass,
++            probability: prediction.probabilities[prediction.predictedClass] ?? null,
++            eligible: prediction.eligible,
++            direction: prediction.direction,
++            session: prediction.session,
++          },
++        });
+         break;
+-      case 'prediction.resolved':
+-        addOutcome(normalizeOutcome((envelope.payload as { outcome: OutcomeDTO }).outcome));
+-        addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'observation', severity: 'info', message: 'Prediction resolved', sequence: envelope.sequence });
++      }
++      case 'prediction.resolved': {
++        const outcome = normalizeOutcome((envelope.payload as { outcome: OutcomeDTO }).outcome);
++        addOutcome(outcome);
++        addBlotterEvent({
++          timeUtc: envelope.server_time_utc,
++          category: 'observation',
++          severity: 'info',
++          message: 'Prediction resolved',
++          sequence: envelope.sequence,
++          tape: {
++            kind: 'outcome',
++            predictionId: outcome.predictionId,
++            resolutionType: outcome.resolutionType,
++            correct: outcome.correct,
++            actualClass: outcome.actualClass,
++          },
++        });
+         break;
++      }
+       case 'prediction.dropped': {
+         const dropped = normalizeDropped((envelope.payload as { dropped: DroppedPredictionDTO }).dropped);
+         addDropped(dropped);
+-        addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'observation', severity: 'info', message: `Prediction dropped (${dropped.reason})`, sequence: envelope.sequence });
++        addBlotterEvent({
++          timeUtc: envelope.server_time_utc,
++          category: 'observation',
++          severity: 'info',
++          message: `Prediction dropped (${dropped.reason})`,
++          sequence: envelope.sequence,
++          tape: { kind: 'drop', predictionId: dropped.predictionId, reason: dropped.reason },
++        });
+         break;
+       }
+       case 'position.opened': {
+         const position = normalizeOpenPosition((envelope.payload as { position: OpenPositionDTO }).position);
+         addOpenPosition(position);
+-        addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'execution', severity: 'info', message: `Paper position opened (${position.direction} @ ${position.entryPrice.toFixed(2)})`, sequence: envelope.sequence });
++        addBlotterEvent({
++          timeUtc: envelope.server_time_utc,
++          category: 'execution',
++          severity: 'info',
++          message: `Paper position opened (${position.direction} @ ${position.entryPrice.toFixed(2)})`,
++          sequence: envelope.sequence,
++          tape: {
++            kind: 'position_open',
++            predictionId: position.predictionId,
++            direction: position.direction,
++            entryPrice: position.entryPrice,
++            entryPriceConservative: position.entryPriceConservative,
++            tpPrice: position.tpPrice,
++            slPrice: position.slPrice,
++          },
++        });
+         break;
+       }
+       case 'position.closed': {
+         const execution = normalizeClosedExecution((envelope.payload as { execution: ClosedExecutionDTO }).execution);
+         closeOpenPosition(execution);
+-        addBlotterEvent({ timeUtc: envelope.server_time_utc, category: 'execution', severity: 'info', message: `Paper position closed (${execution.reason}, ${execution.points >= 0 ? '+' : ''}${execution.points.toFixed(2)} pts)`, sequence: envelope.sequence });
++        addBlotterEvent({
++          timeUtc: envelope.server_time_utc,
++          category: 'execution',
++          severity: 'info',
++          message: `Paper position closed (${execution.reason}, ${execution.points >= 0 ? '+' : ''}${execution.points.toFixed(2)} pts)`,
++          sequence: envelope.sequence,
++          tape: {
++            kind: 'position_close',
++            predictionId: execution.predictionId,
++            direction: execution.direction,
++            reason: execution.reason,
++            points: execution.points,
++            pointsConservative: execution.pointsConservative,
++            exitPrice: execution.exitPrice,
++          },
++        });
+         break;
+       }
+       case 'model.status':
+diff --git a/frontend/src/realtime/types.ts b/frontend/src/realtime/types.ts
+index d2b1713..8ee5e40 100644
+--- a/frontend/src/realtime/types.ts
++++ b/frontend/src/realtime/types.ts
+@@ -89,6 +89,9 @@ export type ObservationDTO = {
+   session: string;
+   level_kind: string;
+   level_price_ticks: number;
++  // COCKPIT P3c: authoritative touch direction (audit #NN-1) — never re-derive
++  // from level_kind client-side; null for legacy observations.
++  direction?: string | null;
+ };
+ 
+ export type PredictionDTO = {
+@@ -183,6 +186,13 @@ export type ModelStatusDTO = {
+   class_map: Record<string, string>;
+   validation_ok: boolean;
+   validation_detail: string | null;
++  // COCKPIT P1: serving-gate parameters from the active contract (display only;
++  // the gate verdict itself is is_eligible on each prediction). All null when no
++  // model is loaded. eligible_sessions uses the runtime session vocabulary
++  // ("ny"), matching the session field on predictions.
++  confidence_gate?: number | null;
++  eligible_class?: string | null;
++  eligible_sessions?: string[] | null;
+ };
+ 
+ export type SnapshotPayloadDTO = {
+diff --git a/frontend/src/state/stores.test.ts b/frontend/src/state/stores.test.ts
+index e1a513b..29386fa 100644
+--- a/frontend/src/state/stores.test.ts
++++ b/frontend/src/state/stores.test.ts
+@@ -168,7 +168,7 @@ describe('workstation stores', () => {
+     addPrediction(makePrediction('pred-1'));
+     addOutcome(makeOutcome('pred-1'));
+     addDropped(makeDropped('pred-2'));
+-    setModelStatus({ loaded: true, modelId: 'model-a', strategyId: null, trainingMode: null, instrument: null, featureNames: [], classMap: {}, validationOk: true, validationDetail: null });
++    setModelStatus({ loaded: true, modelId: 'model-a', strategyId: null, trainingMode: null, instrument: null, featureNames: [], classMap: {}, validationOk: true, validationDetail: null, confidenceGate: null, eligibleClass: null, eligibleSessions: null });
+ 
+     clearPredictions();
+ 
+diff --git a/frontend/src/strip/viewModels.test.ts b/frontend/src/strip/viewModels.test.ts
+new file mode 100644
+index 0000000..c12329e
+--- /dev/null
++++ b/frontend/src/strip/viewModels.test.ts
+@@ -0,0 +1,121 @@
++import { describe, expect, it } from 'vitest';
++import type { MarketBar } from '../domain/models';
++import {
++  NY_FLATTEN,
++  NY_OPEN,
++  dayFirstOpenTicks,
++  dayHighLowTicks,
++  etWallTimeToEpochMs,
++  formatCountdown,
++  formatSignedPoints,
++  formatStripPrice,
++  latestPrint,
++  nyCountdown,
++} from './viewModels';
++
++const bar = (overrides: Partial<MarketBar>): MarketBar => ({
++  timeframe: 147,
++  tradingDay: '2026-07-10',
++  barIndex: 1,
++  barId: null,
++  openTimeUtc: '2026-07-10T13:30:00Z',
++  closeTimeUtc: '2026-07-10T13:31:00Z',
++  openTicks: 96_000,
++  highTicks: 96_040,
++  lowTicks: 95_980,
++  closeTicks: 96_020,
++  volume: 10,
++  tradeCount: 10,
++  complete: true,
++  ...overrides,
++});
++
++describe('latestPrint', () => {
++  it('returns null with no bars', () => {
++    expect(latestPrint([], [])).toBeNull();
++  });
++
++  it('picks the newest close across forming and closed bars', () => {
++    const forming = bar({ complete: false, closeTicks: 96_100, closeTimeUtc: '2026-07-10T14:00:05Z' });
++    const closed = bar({ closeTicks: 96_050, closeTimeUtc: '2026-07-10T13:59:00Z' });
++    expect(latestPrint([forming], [closed])?.priceTicks).toBe(96_100);
++  });
++
++  it('prefers the forming bar on wall-clock ties', () => {
++    const forming = bar({ complete: false, closeTicks: 96_100, closeTimeUtc: '2026-07-10T14:00:00Z' });
++    const closed = bar({ closeTicks: 96_050, closeTimeUtc: '2026-07-10T14:00:00Z' });
++    const print = latestPrint([forming], [closed]);
++    expect(print?.priceTicks).toBe(96_100);
++    expect(print?.forming).toBe(true);
++  });
++});
++
++describe('dayFirstOpenTicks', () => {
++  it('requires bar_index 0 of the current trading day (exact-or-nothing)', () => {
++    const first = bar({ barIndex: 0, openTicks: 95_900 });
++    const later = bar({ barIndex: 5, openTicks: 96_000 });
++    expect(dayFirstOpenTicks([], [first, later], '2026-07-10')).toBe(95_900);
++    // Bar 0 truncated out of retention: honestly unavailable.
++    expect(dayFirstOpenTicks([], [later], '2026-07-10')).toBeNull();
++  });
++
++  it('ignores other trading days and null trading day', () => {
++    const otherDay = bar({ barIndex: 0, tradingDay: '2026-07-09', openTicks: 95_000 });
++    expect(dayFirstOpenTicks([], [otherDay], '2026-07-10')).toBeNull();
++    expect(dayFirstOpenTicks([], [otherDay], null)).toBeNull();
++  });
++});
++
++describe('dayHighLowTicks', () => {
++  it('spans forming and closed bars of the trading day only', () => {
++    const closed = bar({ highTicks: 96_200, lowTicks: 95_800 });
++    const forming = bar({ complete: false, highTicks: 96_260, lowTicks: 95_900 });
++    const stale = bar({ tradingDay: '2026-07-09', highTicks: 99_000, lowTicks: 90_000 });
++    expect(dayHighLowTicks([forming], [closed, stale], '2026-07-10')).toEqual({
++      highTicks: 96_260,
++      lowTicks: 95_800,
++    });
++    expect(dayHighLowTicks([], [], '2026-07-10')).toBeNull();
++  });
++});
++
++describe('ET wall-clock math (Intl-backed, DST-safe)', () => {
++  it('maps 09:30 ET to 13:30Z under EDT and 14:30Z under EST', () => {
++    expect(etWallTimeToEpochMs({ year: 2026, month: 7, day: 10, hour: 9, minute: 30 })).toBe(
++      Date.parse('2026-07-10T13:30:00Z'),
++    );
++    expect(etWallTimeToEpochMs({ year: 2026, month: 1, day: 15, hour: 9, minute: 30 })).toBe(
++      Date.parse('2026-01-15T14:30:00Z'),
++    );
++  });
++
++  it('spring-forward day: 01:30 EST to the 09:30 EDT open is 7 real hours', () => {
++    // 2026-03-08 is the US spring-forward date; 02:00-03:00 ET does not exist.
++    const now = Date.parse('2026-03-08T06:30:00Z'); // 01:30 EST
++    expect(nyCountdown(now, NY_OPEN)).toEqual({ mode: 'until', seconds: 7 * 3600 });
++  });
++
++  it('fall-back day: 01:30 EDT to the 09:30 EST open is 9 real hours', () => {
++    // 2026-11-01 is the US fall-back date; the 01:00-02:00 ET hour repeats.
++    const now = Date.parse('2026-11-01T05:30:00Z'); // 01:30 EDT
++    expect(nyCountdown(now, NY_OPEN)).toEqual({ mode: 'until', seconds: 9 * 3600 });
++  });
++
++  it('switches to since after the target passes, day-scoped', () => {
++    const after = Date.parse('2026-07-10T21:00:00Z'); // 17:00 EDT
++    expect(nyCountdown(after, NY_FLATTEN)).toEqual({ mode: 'since', seconds: 20 * 60 });
++    const before = Date.parse('2026-07-10T20:00:00Z'); // 16:00 EDT
++    expect(nyCountdown(before, NY_FLATTEN)).toEqual({ mode: 'until', seconds: 40 * 60 });
++  });
++});
++
++describe('formatting', () => {
++  it('formats prices, signed points, and countdowns', () => {
++    expect(formatStripPrice(96_020)).toBe('24,005.00');
++    expect(formatSignedPoints(12.5)).toBe('+12.50');
++    expect(formatSignedPoints(-3.25)).toBe('−3.25');
++    expect(formatSignedPoints(0)).toBe('0.00');
++    expect(formatCountdown(7 * 3600 + 5 * 60 + 9)).toBe('7:05:09');
++    expect(formatCountdown(59)).toBe('0:00:59');
++  });
++});
+diff --git a/frontend/src/strip/viewModels.ts b/frontend/src/strip/viewModels.ts
+new file mode 100644
+index 0000000..6c4d8f0
+--- /dev/null
++++ b/frontend/src/strip/viewModels.ts
+@@ -0,0 +1,213 @@
++// COCKPIT P2: pure view-model helpers for the trader strip.
++//
++// Price/day math works on the bars already held by the market store (forming +
++// recent closed, all timeframes mixed). Clock math is America/New_York wall time
++// derived through the Intl timezone database — never a fixed UTC offset — so DST
++// transitions (spring-forward / fall-back) produce real elapsed-time countdowns.
++import type { MarketBar } from '../domain/models';
++
++export const NY_TIME_ZONE = 'America/New_York';
++export const NY_OPEN = { hour: 9, minute: 30 } as const;
++export const NY_FLATTEN = { hour: 16, minute: 40 } as const;
++
++const STRIP_TICK_SIZE = 0.25;
++
++export type LatestPrint = {
++  priceTicks: number;
++  closeTimeUtc: string;
++  /** True when the print came from a forming (incomplete) bar. */
++  forming: boolean;
++};
++
++/**
++ * The newest print visible in the bar streams: the close of the most recent
++ * forming or closed bar across every timeframe (every timeframe's forming bar
++ * closes on the same latest trade, so any winner carries the same price).
++ */
++export function latestPrint(currentBars: MarketBar[], closedBars: MarketBar[]): LatestPrint | null {
++  let best: LatestPrint | null = null;
++  const consider = (bar: MarketBar, forming: boolean) => {
++    const at = Date.parse(bar.closeTimeUtc);
++    if (!Number.isFinite(at) || !Number.isFinite(bar.closeTicks)) return;
++    if (best === null) {
++      best = { priceTicks: bar.closeTicks, closeTimeUtc: bar.closeTimeUtc, forming };
++      return;
++    }
++    const bestAt = Date.parse(best.closeTimeUtc);
++    // Prefer the forming bar on wall-clock ties: it is the live print.
++    if (at > bestAt || (at === bestAt && forming && !best.forming)) {
++      best = { priceTicks: bar.closeTicks, closeTimeUtc: bar.closeTimeUtc, forming };
++    }
++  };
++  for (const bar of currentBars) consider(bar, !bar.complete);
++  for (const bar of closedBars) consider(bar, false);
++  return best;
++}
++
++/**
++ * The trading day's first bar open, in ticks. Exact-or-nothing: only a bar with
++ * backend bar_index 0 for the given trading day qualifies (every timeframe's bar
++ * 0 opens on the day's first trade, so any timeframe works). When bar 0 has been
++ * truncated out of the retained window — or bars carry no bar_index at all — the
++ * session net change is honestly unavailable and the caller renders an em-dash.
++ */
++export function dayFirstOpenTicks(
++  currentBars: MarketBar[],
++  closedBars: MarketBar[],
++  tradingDay: string | null,
++): number | null {
++  if (!tradingDay) return null;
++  for (const bars of [closedBars, currentBars]) {
++    for (const bar of bars) {
++      if (bar.tradingDay === tradingDay && bar.barIndex === 0 && Number.isFinite(bar.openTicks)) {
++        return bar.openTicks;
++      }
++    }
++  }
++  return null;
++}
++
++/** Day high/low in ticks across every retained bar of the given trading day. */
++export function dayHighLowTicks(
++  currentBars: MarketBar[],
++  closedBars: MarketBar[],
++  tradingDay: string | null,
++): { highTicks: number; lowTicks: number } | null {
++  if (!tradingDay) return null;
++  let high = Number.NEGATIVE_INFINITY;
++  let low = Number.POSITIVE_INFINITY;
++  for (const bars of [currentBars, closedBars]) {
++    for (const bar of bars) {
++      if (bar.tradingDay !== tradingDay) continue;
++      if (Number.isFinite(bar.highTicks) && bar.highTicks > high) high = bar.highTicks;
++      if (Number.isFinite(bar.lowTicks) && bar.lowTicks < low) low = bar.lowTicks;
++    }
++  }
++  if (!Number.isFinite(high) || !Number.isFinite(low)) return null;
++  return { highTicks: high, lowTicks: low };
++}
++
++export const stripTicksToPrice = (ticks: number): number => ticks * STRIP_TICK_SIZE;
++
++export const formatStripPrice = (ticks: number): string =>
++  stripTicksToPrice(ticks).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
++
++export const formatSignedPoints = (points: number): string =>
++  `${points > 0 ? '+' : points < 0 ? '−' : ''}${Math.abs(points).toFixed(2)}`;
++
++// --------------------------------------------------------------------------- //
++// America/New_York wall-clock math (Intl-backed; DST-safe by construction)
++// --------------------------------------------------------------------------- //
++
++export type EtParts = {
++  year: number;
++  month: number;
++  day: number;
++  hour: number;
++  minute: number;
++  second: number;
++};
++
++const ET_FORMATTER = new Intl.DateTimeFormat('en-US', {
++  timeZone: NY_TIME_ZONE,
++  hourCycle: 'h23',
++  year: 'numeric',
++  month: '2-digit',
++  day: '2-digit',
++  hour: '2-digit',
++  minute: '2-digit',
++  second: '2-digit',
++});
++
++/** Read the ET wall-clock fields for an epoch instant via the Intl tz database. */
++export function etParts(epochMs: number): EtParts {
++  const parts: Record<string, number> = {};
++  for (const part of ET_FORMATTER.formatToParts(epochMs)) {
++    if (part.type !== 'literal') parts[part.type] = Number(part.value);
++  }
++  return {
++    year: parts.year,
++    month: parts.month,
++    day: parts.day,
++    hour: parts.hour,
++    minute: parts.minute,
++    second: parts.second,
++  };
++}
++
++const partsAsUtcMs = (p: EtParts): number =>
++  Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
++
++/**
++ * The epoch instant at which the ET wall clock reads the given fields.
++ *
++ * Inverse timezone lookup by successive correction: start from the UTC guess,
++ * measure how the guess actually renders in ET, and shift by the difference.
++ * Two rounds converge for every real NY offset; 09:30/16:40 are never inside
++ * the 02:00 transition hole, so the result is exact on DST-transition days.
++ */
++export function etWallTimeToEpochMs(target: Omit<EtParts, 'second'> & { second?: number }): number {
++  const desired = partsAsUtcMs({ ...target, second: target.second ?? 0 });
++  let guess = desired;
++  for (let i = 0; i < 2; i += 1) {
++    const rendered = partsAsUtcMs(etParts(guess));
++    const diff = rendered - desired;
++    if (diff === 0) break;
++    guess -= diff;
++  }
++  return guess;
++}
++
++// Per-UTC-hour offset cache: the ET offset is constant within any UTC hour (US
++// DST transitions land on exact UTC hour boundaries), so one Intl lookup per
++// distinct hour makes bulk per-bar classification cheap (COCKPIT P4b).
++const ET_OFFSET_CACHE = new Map<number, number>();
++
++/** ET wall-clock minutes-of-day (0..1439) for an epoch instant, DST-correct. */
++export function etMinutesOfDay(epochMs: number): number {
++  const hourKey = Math.floor(epochMs / 3_600_000);
++  let offsetMs = ET_OFFSET_CACHE.get(hourKey);
++  if (offsetMs === undefined) {
++    const hourStart = hourKey * 3_600_000;
++    offsetMs = partsAsUtcMs(etParts(hourStart)) - hourStart;
++    if (ET_OFFSET_CACHE.size > 20_000) ET_OFFSET_CACHE.clear();
++    ET_OFFSET_CACHE.set(hourKey, offsetMs);
++  }
++  const shifted = new Date(epochMs + offsetMs);
++  return shifted.getUTCHours() * 60 + shifted.getUTCMinutes();
++}
++
++export type Countdown = {
++  mode: 'until' | 'since';
++  seconds: number;
++};
++
++/**
++ * Real elapsed seconds between now and today's (ET calendar day's) target wall
++ * time. `until` before the target, `since` after — day-scoped, so past midnight
++ * ET the countdown flips back to `until` for the new day.
++ */
++export function nyCountdown(nowMs: number, target: { hour: number; minute: number }): Countdown {
++  const today = etParts(nowMs);
++  const targetMs = etWallTimeToEpochMs({
++    year: today.year,
++    month: today.month,
++    day: today.day,
++    hour: target.hour,
++    minute: target.minute,
++  });
++  const deltaSeconds = Math.round((targetMs - nowMs) / 1000);
++  return deltaSeconds >= 0
++    ? { mode: 'until', seconds: deltaSeconds }
++    : { mode: 'since', seconds: -deltaSeconds };
++}
++
++/** h:mm:ss with unbounded hours. */
++export function formatCountdown(seconds: number): string {
++  const total = Math.max(0, Math.floor(seconds));
++  const h = Math.floor(total / 3600);
++  const m = Math.floor((total % 3600) / 60);
++  const s = total % 60;
++  const two = (value: number) => String(value).padStart(2, '0');
++  return `${h}:${two(m)}:${two(s)}`;
++}
+diff --git a/frontend/src/styles.css b/frontend/src/styles.css
+index 63dd402..7a79127 100644
+--- a/frontend/src/styles.css
++++ b/frontend/src/styles.css
+@@ -178,6 +178,72 @@ button { font: inherit; }
+ .perf-quality-row { display: flex; flex-wrap: wrap; gap: 8px 16px; color: var(--muted); font-size: 11px; }
+ .perf-quality-row .quality-flag { color: var(--amber); }
+ 
++/* --- Trader strip + collapsed ops panels (COCKPIT P2) --- */
++.trader-strip { gap: 14px; }
++.strip-price-block { display: flex; align-items: center; gap: 16px; padding: 0 14px; border-right: 1px solid var(--line); }
++.strip-price { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: .01em; padding: 2px 8px; border-radius: 8px; white-space: nowrap; }
++.strip-price.up { color: var(--green); }
++.strip-price.down { color: var(--red); }
++@keyframes strip-flash-up { 0% { background: rgba(54,211,153,.35); } 100% { background: transparent; } }
++@keyframes strip-flash-down { 0% { background: rgba(255,107,107,.35); } 100% { background: transparent; } }
++.strip-price.flash-up { animation: strip-flash-up .6s ease-out; }
++.strip-price.flash-down { animation: strip-flash-down .6s ease-out; }
++.strip-metric span { display: block; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
++.strip-metric strong { font-size: 15px; font-variant-numeric: tabular-nums; white-space: nowrap; }
++.strip-metric strong.pos { color: var(--green); }
++.strip-metric strong.neg { color: var(--red); }
++.strip-countdowns { display: flex; gap: 12px; padding: 0 14px 0 0; border-right: 1px solid var(--line); }
++.strip-countdown span { display: block; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
++.strip-countdown strong { font-size: 14px; font-variant-numeric: tabular-nums; white-space: nowrap; }
++.strip-countdown.until strong { color: var(--blue); }
++.strip-countdown.amber strong { color: var(--amber); }
++.strip-countdown.red strong { color: var(--red); }
++.strip-pills { display: flex; gap: 8px; margin-left: auto; }
++.strip-pills .status-pill { min-width: 0; padding: 5px 8px; }
++.strip-pills .status-pill strong { font-size: 11px; }
++.panel-status-line { display: flex; align-items: center; gap: 12px; min-height: 28px; }
++.status-line-meta { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
++.expand-toggle { border: 1px solid var(--line); border-radius: 8px; background: #071017; color: var(--muted); padding: 4px 10px; cursor: pointer; margin-left: auto; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
++.replay-heading .expand-toggle { margin-left: 0; }
++
++/* --- Decision surfaces (COCKPIT P3): distance levels, gate math, setup card --- */
++.level-row { grid-template-columns: 1fr auto auto 64px; }
++.level-row.nearest { background: rgba(78,161,255,.08); border-radius: 8px; padding-left: 6px; padding-right: 6px; margin: 0 -6px; }
++.level-row strong.dist-above { color: var(--green); }
++.level-row strong.dist-below { color: var(--red); }
++.level-row .level-price { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 11px; text-align: right; }
++.gate-math { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
++.gate-figures { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--text); }
++.gate-bar { position: relative; height: 6px; border-radius: 999px; background: rgba(255,255,255,.06); overflow: visible; }
++.gate-fill { height: 100%; border-radius: 999px; }
++.gate-fill.pass { background: var(--green); }
++.gate-fill.fail { background: var(--amber); }
++.gate-threshold { position: absolute; top: -2px; width: 2px; height: 10px; background: var(--text); opacity: .8; }
++.gate-reason { color: var(--amber); font-size: 11px; }
++.setup-card { border: 1px solid rgba(78,161,255,.45); border-radius: 10px; padding: 10px 12px; background: rgba(78,161,255,.06); display: flex; flex-direction: column; gap: 6px; }
++.setup-card-head { display: flex; align-items: center; gap: 8px; font-size: 13px; }
++.setup-level-price { color: var(--muted); font-variant-numeric: tabular-nums; }
++.setup-card-meta { display: flex; flex-wrap: wrap; gap: 8px 14px; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
++.setup-countdown { color: var(--blue); font-weight: 600; }
++.intel-badge.long { color: var(--green); border-color: rgba(54,211,153,.45); }
++.intel-badge.short { color: var(--red); border-color: rgba(255,107,107,.45); }
++
++/* --- Trade tape (COCKPIT P5) --- */
++.blotter-filters { margin-left: auto; }
++.tape-summary { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
++.tape-kind { border-radius: 999px; padding: 1px 8px; font-size: 10px; text-transform: uppercase; letter-spacing: .06em; border: 1px solid var(--line); color: var(--muted); }
++.tape-kind.prediction { color: var(--blue); border-color: rgba(78,161,255,.45); background: rgba(78,161,255,.08); }
++.tape-kind.outcome { color: var(--text); background: rgba(255,255,255,.04); }
++.tape-kind.drop { color: var(--amber); border-color: rgba(242,184,75,.45); background: rgba(242,184,75,.08); }
++.tape-kind.open { color: var(--green); border-color: rgba(54,211,153,.45); background: rgba(54,211,153,.08); }
++.tape-kind.close { color: var(--red); border-color: rgba(255,107,107,.45); background: rgba(255,107,107,.08); }
++.tape-meta { color: var(--muted); font-size: 11px; }
++.tape-points { font-variant-numeric: tabular-nums; font-weight: 600; font-size: 12px; }
++.tape-points.pos { color: var(--green); }
++.tape-points.neg { color: var(--red); }
++@keyframes tape-flash { 0% { background: rgba(78,161,255,.16); } 100% { background: transparent; } }
++.blotter-row.tape-newest { animation: tape-flash .8s ease-out; }
++
+ /* EXEC P3c: paper-execution panel (open-position cards + closed table). */
+ .executions-panel { display: flex; flex-direction: column; }
+ .exec-note { margin-left: auto; color: var(--muted); font-size: 11px; }
